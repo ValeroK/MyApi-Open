@@ -45,9 +45,9 @@ MyApi-Open solves that by giving agents a single, structured surface for:
 
 A focused landing page built around secure agent workflows, connected services, and unified control.
 
-### Login panel
+### Dashboard
 
-![MyApi-Open login panel](docs/screenshots/login-panel.png)
+![MyApi-Open login panel](docs/screenshots/dashboard.png)
 
 OAuth-first sign-in flow with a clean public entry point for workspace access.
 
