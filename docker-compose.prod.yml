@@ -1,0 +1,95 @@
+# ============================================================================
+# MyApi - Production Docker Compose
+# ============================================================================
+# Runs the MyApi monolith (backend + built frontend) in a single container.
+# The frontend is compiled into static assets during the Docker build and
+# served by the Express backend at /dashboard/.
+#
+# QUICK START:
+#   1. cp .env.docker .env
+#   2. Edit .env with your real secrets
+#   3. docker-compose up -d
+#   4. Access: http://localhost:4500
+#
+# For development (hot-reload): use docker-compose.dev.yml instead
+#   docker-compose -f docker-compose.dev.yml up
+#
+# PORTS:
+#   - 4500  → MyApi (backend API + built dashboard)
+#
+# VOLUMES:
+#   - myapi-data  → SQLite database & uploads (persistent)
+#   - myapi-logs  → Application logs (persistent)
+#
+# ============================================================================
+
+services:
+  myapi:
+    build:
+      context: .
+      dockerfile: src/Dockerfile
+    image: myapi:latest
+    container_name: myapi
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_PATH: /app/data/myapi.db
+
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
+    ports:
+      - "${PORT:-4500}:${PORT:-4500}"
+
+    volumes:
+      # SQLite database — bind-mounted from host so data persists across rebuilds
+      - ./data:/app/data
+      # Application logs
+      - myapi-logs:/app/logs
+      # Claude Code skills — read-only; lets MyApi serve SKILL.md files from disk
+      # without requiring them to be stored in the database first.
+      - /root/.claude/skills:/app/claude-skills:ro
+      # Connectors — OpenAPI specs, ChatGPT action schemas, privacy policies
+      - ./connectors:/app/connectors:ro
+
+    networks:
+      - myapi-network
+
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:${PORT:-4500}/health', r => { if (r.statusCode !== 200) throw new Error(r.statusCode) })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ============================================================================
+  # Optional: Cloudflare Tunnel (for public HTTPS access without opening ports)
+  # ============================================================================
+  # Uncomment and set CLOUDFLARE_TUNNEL_TOKEN in .env to enable.
+  #
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: myapi-tunnel
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+  #   networks:
+  #     - myapi-network
+  #   depends_on:
+  #     - myapi
+
+volumes:
+  myapi-logs:
+    driver: local
+
+networks:
+  myapi-network:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: "fd00:db8::/64"
