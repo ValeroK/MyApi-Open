@@ -745,6 +745,8 @@ app.use(helmet({
       baseUri: ["'self'"],
       formAction: ["'self'", "https://chat.openai.com", "https://chatgpt.com"],
       frameAncestors: ["'self'"],
+      upgradeInsecureRequests: [],
+      reportUri: ['/api/v1/security/csp-report'],
     },
   },
   crossOriginEmbedderPolicy: false,
@@ -1754,6 +1756,23 @@ app.put('/api/v1/privacy/cookies', authenticate, rateLimit(60000, 20, 'cookies-w
   }
 
   res.json({ ok: true, data: data[ownerId] });
+});
+
+// CSP violation reports (public endpoint for browser to send CSP violations)
+app.post('/api/v1/security/csp-report', express.json({ limit: '1kb' }), (req, res) => {
+  const report = req.body || {};
+  console.warn('[CSP Violation]', {
+    documentURI: report['document-uri'],
+    violatedDirective: report['violated-directive'],
+    blockedURI: report['blocked-uri'],
+    sourceFile: report['source-file'],
+    lineNumber: report['line-number'],
+    columnNumber: report['column-number'],
+    originalPolicy: report['original-policy'],
+    userAgent: req.get('user-agent'),
+    ipAddress: req.ip,
+  });
+  res.status(204).send();
 });
 
 // Privacy settings (data sharing, API logging)
@@ -3007,6 +3026,9 @@ const discoveryJson = (req, res) => {
 };
 
 // OpenAPI spec at every path AIs look for
+// SECURITY: These endpoints are intentionally public for AI agent bootstrap and API discovery.
+// The spec reveals endpoint structure but not secrets. All mutating operations (POST/PUT/DELETE)
+// require Bearer token authentication, so exposure of the schema is acceptable.
 ['/openapi.yaml', '/swagger.json', '/swagger.yaml',
  '/api/openapi.json', '/api/openapi.yaml', '/api/swagger.json',
  '/api/v1/openapi.json', '/api/v1/openapi.yaml',
