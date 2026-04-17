@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import PersonaPreview from './PersonaPreview';
 
@@ -8,14 +8,7 @@ function PersonaDetailModal({ persona, onClose, onEdit, onSetActive, onDelete })
   const [loadingDocs, setLoadingDocs] = useState(false);
   const [selectedDoc, setSelectedDoc] = useState(null);
 
-  useEffect(() => {
-    if (persona?.id) {
-      fetchAttachedDocuments();
-      fetchAttachedSkills();
-    }
-  }, [persona?.id]);
-
-  const fetchAttachedDocuments = async () => {
+  const fetchAttachedDocuments = useCallback(async () => {
     setLoadingDocs(true);
     try {
       const token = useAuthStore.getState().masterToken;
@@ -32,9 +25,9 @@ function PersonaDetailModal({ persona, onClose, onEdit, onSetActive, onDelete })
     } finally {
       setLoadingDocs(false);
     }
-  };
+  }, [persona?.id]);
 
-  const fetchAttachedSkills = async () => {
+  const fetchAttachedSkills = useCallback(async () => {
     try {
       const token = useAuthStore.getState().masterToken;
       const response = await fetch(`/api/v1/personas/${persona.id}/skills`, {
@@ -48,7 +41,14 @@ function PersonaDetailModal({ persona, onClose, onEdit, onSetActive, onDelete })
     } catch (err) {
       console.error('Failed to fetch skills:', err);
     }
-  };
+  }, [persona?.id]);
+
+  useEffect(() => {
+    if (persona?.id) {
+      fetchAttachedDocuments();
+      fetchAttachedSkills();
+    }
+  }, [persona?.id, fetchAttachedDocuments, fetchAttachedSkills]);
 
   if (!persona) return null;
 

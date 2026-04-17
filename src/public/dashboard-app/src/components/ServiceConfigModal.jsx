@@ -9,6 +9,8 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
   const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
 
+  const masterToken = useAuthStore((state) => state.masterToken);
+
   const fetchPreferences = useCallback(async () => {
     setIsLoading(true);
     setError(null);
@@ -37,7 +39,7 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
     } finally {
       setIsLoading(false);
     }
-  }, [service]);
+  }, [service, masterToken]);
 
   useEffect(() => {
     if (isOpen && service) {
