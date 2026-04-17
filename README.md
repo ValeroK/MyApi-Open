@@ -6,11 +6,15 @@
 [![Docker](https://img.shields.io/badge/docker-supported-2496ed)](https://docs.docker.com)
 [![Discord](https://img.shields.io/badge/discord-join-5865f2)](https://discord.gg/WPp4sCN4xB)
 
-Connect your services once. Issue scoped tokens to AI agents. Keep full control over who accesses what — with a full audit trail of every action.
+## 🚀 Managed Cloud Version: [myapiai.com](https://www.myapiai.com)
 
-> **Managed cloud version →** [**myapiai.com**](https://www.myapiai.com) — no server required. Sign up for free and skip the setup entirely.
+**Don't want to self-host?** The official managed version at **[myapiai.com](https://www.myapiai.com)** offers cloud hosting with automatic backups, SSL, email, and always-up-to-date features. Paid plans only — no free tier.
+
+👉 **[Visit myapiai.com](https://www.myapiai.com)** to get started instantly.
 
 ---
+
+Connect your services once. Issue scoped tokens to AI agents. Keep full control over who accesses what — with a full audit trail of every action.
 
 ## Why MyApi?
 
@@ -109,28 +113,31 @@ npm install
 cp src/.env.example src/.env
 # Edit src/.env — fill in your secrets (see Configuration below)
 
-# 4. Initialize the database
-node src/scripts/init-db.js
-
-# 5. Start the server
+# 4. Start the backend server
 node src/index.js
+# The database initializes automatically on startup
 # API  →  http://localhost:4500
+# 👀 Watch console output for the master token!
 
-# 6. Frontend (development)
+# 5. Frontend — in a separate terminal
 cd src/public/dashboard-app
 npm install
 npm run dev
 # Dashboard  →  http://localhost:5173
 
-# 7. Frontend (production build — served by Express at /dashboard/)
+# 6. Production build (optional)
+# Build the frontend to be served by Express at /dashboard/
 npm run build    # output → src/public/dist/
+# Then restart the server to serve from the built files
 ```
 
 ---
 
 ## First Run
 
-On first startup, the server generates a **master token** and prints it to the console logs:
+### Getting Your Master Token
+
+On first startup, the server generates a **master token** printed to console logs:
 
 ```
 ╔═══════════════════════════════════════════════════════════════╗
@@ -142,21 +149,48 @@ On first startup, the server generates a **master token** and prints it to the c
 Token: myapi_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-1. **Copy the token** — you need it to log in to the dashboard and make API calls.
-2. **Open the dashboard** at `http://localhost:4500/dashboard/` (production) or `http://localhost:5173` (development).
-3. **Paste the token** to authenticate.
+**This token is your admin password.** Store it securely — it provides full access to your MyApi instance.
 
-> **Missed it?** If the token scrolled past in Docker logs, run:
-> ```bash
-> docker-compose logs myapi | grep "Token:"
-> ```
-> For manual installs, delete `src/data/myapi.db` and restart to regenerate.
+#### Finding Your Token
+
+- **Docker:** Check logs with `docker-compose logs myapi | grep "Token:"`
+- **Manual install:** Check terminal output where you ran `node src/index.js`
+
+#### If You Lost It
+
+The token is NOT stored anywhere in the database for security. If you lost it:
+
+1. **Stop the server**
+2. **Delete the database:** `rm src/data/myapi.db`
+3. **Restart** — a new token will be generated
+4. **Copy it immediately** — it won't be shown again
+
+### Accessing the Dashboard
+
+1. **Open** `http://localhost:4500/dashboard/` (production) or `http://localhost:5173` (development)
+2. **On login screen**, paste your master token into the token field
+3. You now have full access — create personas, connect services, manage agents
+
+### After First Login
+
+- Set a user password in Settings (optional, but recommended)
+- Create scoped tokens for specific agents/workflows
+- Enable 2FA for production instances
+- Generate device tokens for programmatic access
 
 ---
 
 ## Configuration
 
-Copy `src/.env.example` to `src/.env` and fill in your values.
+### Setup Environment File
+
+Copy `src/.env.example` to `src/.env`:
+
+```bash
+cp src/.env.example src/.env
+```
+
+Then edit `src/.env` with your configuration values. At minimum, you need the encryption/session keys.
 
 ### Generate Secure Keys
 
@@ -243,18 +277,6 @@ See the full deployment guide: [`DEPLOYMENT_GUIDE.md`](DEPLOYMENT_GUIDE.md)
 
 ---
 
-## ☁️  Skip the Server — myapiai.com
-
-**Don't want to manage your own server?**
-
-[**myapiai.com**](https://www.myapiai.com) is the official managed version of this project — full-featured cloud hosting, always running the latest release, with automatic backups, SSL, and email built in.
-
-- ✅ **Always up to date** — latest features and security patches
-- ✅ **Free tier available** — get started immediately
-- ✅ **Pro and Team plans** — for power users and organizations
-- ✅ **Zero infrastructure** — same open-source codebase, no servers to manage
-
-👉 **[Sign up at myapiai.com](https://www.myapiai.com)**
 
 ---
 
