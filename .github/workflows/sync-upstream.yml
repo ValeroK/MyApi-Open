@@ -1,0 +1,47 @@
+name: Sync to Upstream MyApi
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  create-upstream-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create PR on upstream MyApi repo
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_GITHUB_TOKEN }}
+          UPSTREAM_REPO: omribenami/MyApi
+        run: |
+          # Configure git
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          # Get commit details
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          COMMIT_HASH=$(git log -1 --pretty=%h)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+
+          # Create unique branch name
+          BRANCH_NAME="community-sync-${COMMIT_HASH}-$(date +%s)"
+
+          # Add upstream remote and push
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git push "https://${GH_TOKEN}@github.com/${UPSTREAM_REPO}.git" HEAD:${BRANCH_NAME}
+
+          # Create PR on upstream using GitHub CLI
+          gh pr create \
+            --repo "${UPSTREAM_REPO}" \
+            --base community-contributions \
+            --head "${BRANCH_NAME}" \
+            --title "[Community] ${COMMIT_MSG}" \
+            --body "Automated sync from MyApi-Open community repository.
+
+**Original Commit**: ${COMMIT_HASH}
+**Author**: ${COMMIT_AUTHOR}
+
+This PR was automatically created from a community contribution."
