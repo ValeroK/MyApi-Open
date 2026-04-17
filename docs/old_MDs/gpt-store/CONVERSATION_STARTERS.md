@@ -1,0 +1,6 @@
+- List all available MyApi services and their auth types.
+- My OAuth callback is failing—here’s the error and redirect URL (no secrets).
+- Create a guest token with read-only scopes for GitHub and Google.
+- I’m getting 401/403 from /api/v1/...—help me debug.
+- What env vars are required for the Slack connector in MyApi?
+- Which connectors are not configured yet, and what do they need?

@@ -1,0 +1,119 @@
+# =============================================================================
+# AFP Desktop App Build Pipeline
+# Builds Windows NSIS installer and uploads to GitHub Releases.
+# macOS builds are coming soon (pending Apple Developer certificate).
+#
+# Trigger:
+#   git tag afp-app-v1.0.0 && git push --tags
+#   OR: Actions → Build AFP Desktop App → Run workflow
+#
+# Signing (optional — skip for unsigned dev builds):
+#   Win: set WIN_CERT_B64 (base64 .pfx), WIN_CERT_PASSWORD
+# =============================================================================
+
+name: Build AFP Desktop App
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'afp-app-v*'
+    paths:
+      - 'connectors/afp-app/**'
+      - 'connectors/afp-oauth/**'
+      - 'connectors/afp-daemon/**'
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # required to create releases + upload assets
+
+jobs:
+  # ─── Windows Build ───────────────────────────────────────────────────────────
+  build-win:
+    name: Build Windows (x64)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: connectors/afp-app
+        run: npm ci
+
+      - name: Decode signing cert (if present)
+        shell: pwsh
+        env:
+          WIN_CERT_B64: ${{ secrets.WIN_CERT_B64 }}
+        run: |
+          if ($env:WIN_CERT_B64) {
+            $bytes = [Convert]::FromBase64String($env:WIN_CERT_B64)
+            [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\myapi-cert.pfx", $bytes)
+            echo "WIN_CERT_PATH=$env:RUNNER_TEMP\myapi-cert.pfx" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "No WIN_CERT_B64 secret — skipping signing."
+          }
+
+      - name: Build NSIS installer
+        working-directory: connectors/afp-app
+        run: npm run build:win
+        env:
+          WIN_CERT_PATH:     ${{ env.WIN_CERT_PATH || '' }}
+          WIN_CERT_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD || '' }}
+
+      - name: Rename artifact to fixed name
+        working-directory: connectors/afp-app/dist
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Filter "*.exe" | Where-Object { $_.Name -notmatch 'Uninstall' } | Select-Object -First 1
+          if ($exe) {
+            Rename-Item $exe.FullName "MyApi-AFP-win-x64.exe"
+            Write-Host "renamed: $($exe.Name)"
+          } else {
+            Write-Error "No installer .exe found in dist/"
+          }
+          Get-ChildItem *.exe | Format-Table Name, Length
+
+      - name: Upload win artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-exe
+          path: connectors/afp-app/dist/MyApi-AFP-win-x64.exe
+          retention-days: 7
+
+  # ─── Deploy to server ────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy installer to server
+    runs-on: ubuntu-latest
+    needs: [build-win]
+
+    steps:
+      - name: Download win artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: win-exe
+          path: dist/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload installer to server
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p /opt/MyApi/connectors/afp-app/dist"
+          scp -i ~/.ssh/id_ed25519 dist/MyApi-AFP-win-x64.exe \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/opt/MyApi/connectors/afp-app/dist/MyApi-AFP-win-x64.exe
+          echo "Deployed successfully"

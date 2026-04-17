@@ -49,11 +49,6 @@ function EnhancedPersonaBuilder({ onSave, isLoading, initialData = null }) {
   const masterToken = useAuthStore((state) => state.masterToken);
   const currentWorkspace = useAuthStore((state) => state.currentWorkspace);
 
-  useEffect(() => {
-    fetchDocuments();
-    fetchSkills();
-  }, [masterToken, currentWorkspace?.id]);
-
   const authHeaders = () => {
     const h = {};
     if (masterToken) h['Authorization'] = `Bearer ${masterToken}`;
@@ -61,7 +56,7 @@ function EnhancedPersonaBuilder({ onSave, isLoading, initialData = null }) {
     return h;
   };
 
-  const fetchDocuments = async () => {
+  const fetchDocuments = useCallback(async () => {
     try {
       const response = await fetch('/api/v1/brain/knowledge-base', {
         headers: authHeaders(),
@@ -73,9 +68,9 @@ function EnhancedPersonaBuilder({ onSave, isLoading, initialData = null }) {
     } catch (err) {
       console.error('Failed to fetch documents:', err);
     }
-  };
+  }, [masterToken, currentWorkspace?.id]);
 
-  const fetchSkills = async () => {
+  const fetchSkills = useCallback(async () => {
     try {
       const response = await fetch('/api/v1/skills', {
         headers: authHeaders(),
@@ -88,7 +83,12 @@ function EnhancedPersonaBuilder({ onSave, isLoading, initialData = null }) {
     } catch (err) {
       console.error('Failed to fetch skills:', err);
     }
-  };
+  }, [masterToken, currentWorkspace?.id]);
+
+  useEffect(() => {
+    fetchDocuments();
+    fetchSkills();
+  }, [masterToken, currentWorkspace?.id, fetchDocuments, fetchSkills]);
 
   const handleInputChange = (field, value) => {
     setFormData(prev => ({

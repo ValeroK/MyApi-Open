@@ -25,12 +25,7 @@ function NotificationSettings() {
     { key: 'service_connected', label: 'Service Connected' },
   ];
 
-  // Fetch settings on mount
-  useEffect(() => {
-    fetchSettings();
-  }, [masterToken, currentWorkspace?.id]);
-
-  const fetchSettings = async () => {
+  const fetchSettings = useCallback(async () => {
     setLoading(true);
     setError(null);
 
@@ -44,7 +39,11 @@ function NotificationSettings() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [masterToken, currentWorkspace?.id]);
+
+  useEffect(() => {
+    fetchSettings();
+  }, [masterToken, currentWorkspace?.id, fetchSettings]);
 
   const updateSettings = async (updates) => {
     setIsSaving(true);

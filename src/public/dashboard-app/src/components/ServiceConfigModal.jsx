@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
 function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
@@ -9,13 +9,7 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
   const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
 
-  useEffect(() => {
-    if (isOpen && service) {
-      fetchPreferences();
-    }
-  }, [isOpen, service]);
-
-  const fetchPreferences = async () => {
+  const fetchPreferences = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
@@ -43,7 +37,13 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [service]);
+
+  useEffect(() => {
+    if (isOpen && service) {
+      fetchPreferences();
+    }
+  }, [isOpen, service, fetchPreferences]);
 
   const getDefaultPreferences = (serviceName) => {
     const defaults = {

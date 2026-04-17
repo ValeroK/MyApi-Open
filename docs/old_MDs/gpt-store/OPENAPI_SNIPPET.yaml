@@ -1,0 +1,119 @@
+openapi: 3.1.0
+info:
+  title: MyApi Actions
+  version: 1.0.0
+servers:
+  - url: https://myapiai.com
+paths:
+  /api/v1/services:
+    get:
+      operationId: listServices
+      summary: List available services
+      responses:
+        '200':
+          description: OK
+  /api/v1/services/categories:
+    get:
+      operationId: listServiceCategories
+      summary: List service categories
+      responses:
+        '200':
+          description: OK
+  /api/v1/services/{name}:
+    get:
+      operationId: getService
+      summary: Get service by name
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+  /api/v1/services/{serviceName}/execute:
+    post:
+      operationId: executeServiceMethod
+      summary: Execute a service method
+      parameters:
+        - name: serviceName
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method:
+                  type: string
+                params:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: OK
+  /api/v1/export:
+    get:
+      operationId: exportData
+      summary: Export account data (v2 JSON / v3 ZIP)
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [portable, forensic]
+            default: portable
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [json, zip]
+            default: json
+        - name: includeFiles
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: profile
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: tokens
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: personas
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: knowledge
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: settings
+          in: query
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: JSON export package
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+security:
+  - bearerAuth: []

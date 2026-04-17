@@ -3,7 +3,7 @@
  * Shows invitations that the current user has received and can accept/decline
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../stores/authStore';
 import './PendingInvitations.css';
@@ -16,13 +16,7 @@ function PendingInvitations() {
   const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
 
-  useEffect(() => {
-    if (masterToken) {
-      fetchPendingInvitations();
-    }
-  }, [masterToken]);
-
-  const fetchPendingInvitations = async () => {
+  const fetchPendingInvitations = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -51,7 +45,13 @@ function PendingInvitations() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [masterToken, user?.email]);
+
+  useEffect(() => {
+    if (masterToken) {
+      fetchPendingInvitations();
+    }
+  }, [masterToken, fetchPendingInvitations]);
 
   const handleAcceptInvitation = async (invitationId) => {
     try {

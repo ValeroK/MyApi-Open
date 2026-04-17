@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useNotificationStore } from '../stores/notificationStore';
 
@@ -21,14 +21,14 @@ export default function NotificationBell() {
     fetchUnreadCount();
     const interval = setInterval(() => fetchUnreadCount(), 30000); // Poll every 30s
     return () => clearInterval(interval);
-  }, [currentWorkspace?.id]);
+  }, [currentWorkspace?.id, fetchUnreadCount]);
 
   // Fetch notifications when dropdown opens
   useEffect(() => {
     if (!isOpen) return;
     setLoading(true);
     fetchNotifications().finally(() => setLoading(false));
-  }, [isOpen, currentWorkspace?.id]);
+  }, [isOpen, currentWorkspace?.id, fetchNotifications]);
 
   const handleMarkAsRead = async (notificationId) => {
     await markAsRead(undefined, notificationId);
