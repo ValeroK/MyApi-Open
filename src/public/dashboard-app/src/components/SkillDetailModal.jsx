@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useSkillStore } from '../stores/skillStore';
 
@@ -19,7 +19,15 @@ function DocumentsSection({ skillId }) {
   const [showPicker, setShowPicker] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  const fetchDocs = useCallback(async () => {
+  useEffect(() => {
+    if (skillId && masterToken) {
+      fetchDocs();
+      fetchAllDocs();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skillId, masterToken]);
+
+  const fetchDocs = async () => {
     try {
       const res = await fetch(`/api/v1/skills/${skillId}/documents`, {
         headers: { Authorization: `Bearer ${masterToken}` },
@@ -35,7 +43,7 @@ function DocumentsSection({ skillId }) {
     }
   };
 
-  const fetchAllDocs = useCallback(async () => {
+  const fetchAllDocs = async () => {
     try {
       const res = await fetch('/api/v1/brain/knowledge-base', {
         headers: { Authorization: `Bearer ${masterToken}` },
@@ -47,14 +55,7 @@ function DocumentsSection({ skillId }) {
     } catch (e) {
       console.error(e);
     }
-  }, [masterToken]);
-
-  useEffect(() => {
-    if (skillId && masterToken) {
-      fetchDocs();
-      fetchAllDocs();
-    }
-  }, [skillId, masterToken, fetchDocs, fetchAllDocs]);
+  };
 
   const handleAttach = async (docId) => {
     await fetch(`/api/v1/skills/${skillId}/documents`, {

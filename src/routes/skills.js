@@ -1,9 +1,12 @@
+const logger = require('../utils/logger');
 const express = require('express');
 const { body, query, validationResult } = require('express-validator');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const GitHubRepoMetadata = require('../services/github-repo-metadata');
+const NotificationDispatcher = require('../lib/notificationDispatcher');
+const { isResourceAllowed } = require('../middleware/scope-validator');
 
 // Where Claude Code skills live when mounted into the container
 const CLAUDE_SKILLS_DIR = process.env.CLAUDE_SKILLS_DIR || '/app/claude-skills';
@@ -13,6 +16,10 @@ function createSkillsRoutes(
   createSkill,
   getSkills,
   getSkillById,
+  getSkillBySlug,
+  getSkillsByIds,
+  getSkillsBySlugList,
+  suggestSkills,
   updateSkill,
   deleteSkill,
   updateSkillOrigin,
@@ -82,14 +89,65 @@ function createSkillsRoutes(
     next();
   };
 
-  // GET /skills - List skills
+  // Sanitize YAML frontmatter in skill script_content to prevent parse errors in AI tools.
+  // Strips control chars, escapes problematic YAML punctuation in description lines,
+  // and replaces common arrow unicode with ASCII equivalents.
+  const sanitizeFrontmatter = (content) => {
+    if (!content || typeof content !== 'string') return content;
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) return content;
+    const sanitizedFm = fmMatch[1]
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+      .replace(/→/g, '->')
+      .replace(/←/g, '<-')
+      .replace(/^\s*(description|summary|name|title)\s*:\s*(.+)$/gm, (_, key, val) => {
+        // Wrap values containing unquoted colons or special chars in double-quotes
+        const trimmed = val.trim();
+        if ((trimmed.includes(':') || trimmed.includes('"') || trimmed.includes("'") || trimmed.includes('#')) && !trimmed.startsWith('"') && !trimmed.startsWith("'")) {
+          const escaped = trimmed.replace(/"/g, '\\"');
+          return `${key}: "${escaped}"`;
+        }
+        return `${key}: ${trimmed}`;
+      });
+    return content.replace(fmMatch[0], `---\n${sanitizedFm}\n---`);
+  };
+
+  const enrichSkill = (skill) => ({
+    ...skill,
+    slug: skill.name,
+    origin: {
+      type: skill.origin_type || 'local',
+      sourceId: skill.origin_source_id,
+      owner: skill.origin_owner,
+      ownerType: skill.origin_owner_type,
+      isFork: Boolean(skill.is_fork),
+      upstreamOwner: skill.upstream_owner,
+      upstreamRepoUrl: skill.upstream_repo_url,
+      license: skill.license || 'Proprietary',
+      publishedAt: skill.published_at
+    },
+    isFork: Boolean(skill.is_fork)
+  });
+
+  // GET /skills - List skills with optional filtering
+  // Query params: slug, category, q (search), limit
   router.get('/', [
-    query('include_archived').optional().isBoolean()
+    query('include_archived').optional().isBoolean(),
+    query('slug').optional().isString().trim(),
+    query('category').optional().isString().trim(),
+    query('q').optional().isString().trim(),
+    query('limit').optional().isInt({ min: 1, max: 200 }).toInt()
   ], handleValidationErrors, (req, res) => {
     if (!canReadSkills(req)) return res.status(403).json({ error: "Requires 'skills:read' scope" });
     try {
       const ownerId = getOwnerId(req);
-      let skills = getSkills(ownerId);
+      const filters = {
+        slug: req.query.slug,
+        category: req.query.category,
+        q: req.query.q,
+        limit: req.query.limit
+      };
+      let skills = getSkills(ownerId, null, filters);
 
       // Bundle token: restrict to skills attached to the bundled persona only
       const bundlePersonaId = getBundlePersonaId(req);
@@ -99,26 +157,120 @@ function createSkillsRoutes(
         skills = skills.filter(s => allowedIds.has(Number(s.id)));
       }
 
-      // Enhance response with origin info and metadata
-      const enhancedSkills = skills.map(skill => ({
-        ...skill,
-        origin: {
-          type: skill.origin_type || 'local',
-          sourceId: skill.origin_source_id,
-          owner: skill.origin_owner,
-          ownerType: skill.origin_owner_type,
-          isFork: Boolean(skill.is_fork),
-          upstreamOwner: skill.upstream_owner,
-          upstreamRepoUrl: skill.upstream_repo_url,
-          license: skill.license || 'Proprietary',
-          publishedAt: skill.published_at
-        },
-        isFork: Boolean(skill.is_fork)
-      }));
+      // Per-resource allow-list filter.
+      skills = skills.filter((s) => isResourceAllowed(req, 'skills', s.id));
 
-      res.json({ skills: enhancedSkills });
+      const result = { skills: skills.map(enrichSkill) };
+      if (result.skills.length === 0) {
+        result._discovery = {
+          hint: 'No skills matched. Try broader filters or fetch all skills without query params.',
+          endpoints: {
+            listAll: 'GET /api/v1/skills',
+            suggestions: 'GET /api/v1/skills/suggestions?q=<term>',
+            bySlug: 'GET /api/v1/skills/_by_slug/<name>',
+            docs: '/openapi.json'
+          }
+        };
+      }
+      res.json(result);
     } catch (error) {
-      console.error('Error listing skills:', error);
+      logger.error('Error listing skills:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /skills/suggestions - Fuzzy skill name/description suggestions for AI discovery
+  router.get('/suggestions', [
+    query('q').isString().trim().notEmpty()
+  ], handleValidationErrors, (req, res) => {
+    if (!canReadSkills(req)) return res.status(403).json({ error: "Requires 'skills:read' scope" });
+    try {
+      const ownerId = getOwnerId(req);
+      const results = suggestSkills(req.query.q, ownerId, 10);
+      const response = {
+        suggestions: results.map(s => ({
+          id: s.id,
+          slug: s.name,
+          name: s.name,
+          description: s.description,
+          category: s.category
+        }))
+      };
+      if (response.suggestions.length === 0) {
+        response._discovery = {
+          hint: 'No skills matched your query. List all skills to browse available options.',
+          listAll: 'GET /api/v1/skills'
+        };
+      }
+      res.json(response);
+    } catch (error) {
+      logger.error('Error fetching skill suggestions:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /skills/_by_slug/:slug - Retrieve a skill by its name/slug (faster for AI agents)
+  router.get('/_by_slug/:slug', (req, res) => {
+    if (!canReadSkills(req)) return res.status(403).json({ error: "Requires 'skills:read' scope" });
+    try {
+      const ownerId = getOwnerId(req);
+      const skill = getSkillBySlug(req.params.slug, ownerId);
+      if (!skill) return res.status(404).json({ error: 'Skill not found' });
+
+      const bundlePersonaId = getBundlePersonaId(req);
+      if (bundlePersonaId) {
+        const attached = db.prepare('SELECT skill_id FROM persona_skills WHERE persona_id = ? AND skill_id = ?').get(bundlePersonaId, skill.id);
+        if (!attached) return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
+      if (!isResourceAllowed(req, 'skills', skill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
+      res.json({ skill: enrichSkill(skill) });
+    } catch (error) {
+      logger.error('Error fetching skill by slug:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /skills/_batch - Fetch multiple skills by id or slug in one request
+  // Query params: id (repeatable), slug (repeatable)
+  router.get('/_batch', (req, res) => {
+    if (!canReadSkills(req)) return res.status(403).json({ error: "Requires 'skills:read' scope" });
+    try {
+      const ownerId = getOwnerId(req);
+      const ids = [].concat(req.query.id || []).filter(Boolean).slice(0, 50);
+      const slugs = [].concat(req.query.slug || []).filter(Boolean).slice(0, 50);
+
+      if (ids.length === 0 && slugs.length === 0) {
+        return res.status(400).json({ error: 'Provide at least one id or slug query param' });
+      }
+
+      let byId = ids.length ? getSkillsByIds(ids, ownerId) : [];
+      let bySlug = slugs.length ? getSkillsBySlugList(slugs, ownerId) : [];
+
+      // Deduplicate by id
+      const seen = new Set();
+      const combined = [...byId, ...bySlug].filter(s => {
+        if (seen.has(s.id)) return false;
+        seen.add(s.id);
+        return true;
+      });
+
+      const bundlePersonaId = getBundlePersonaId(req);
+      const allowed = bundlePersonaId
+        ? new Set(db.prepare('SELECT skill_id FROM persona_skills WHERE persona_id = ?').all(bundlePersonaId).map(r => Number(r.skill_id)))
+        : null;
+
+      const skills = combined
+        .filter(s => !allowed || allowed.has(Number(s.id)))
+        .filter(s => isResourceAllowed(req, 'skills', s.id))
+        .map(enrichSkill);
+
+      res.json({ skills });
+    } catch (error) {
+      logger.error('Error fetching skill batch:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -141,6 +293,10 @@ function createSkillsRoutes(
         if (!attached) return res.status(403).json({ error: 'Skill not accessible with this token' });
       }
 
+      if (!isResourceAllowed(req, 'skills', skill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
       // Get fork info if it's a fork
       const forkInfo = skill.is_fork ? getSkillForkInfo(skill.id) : null;
 
@@ -152,25 +308,58 @@ function createSkillsRoutes(
 
       res.json({
         skill: {
-          ...skill,
-          origin: {
-            type: skill.origin_type || 'local',
-            sourceId: skill.origin_source_id,
-            owner: skill.origin_owner,
-            ownerType: skill.origin_owner_type,
-            isFork: Boolean(skill.is_fork),
-            upstreamOwner: skill.upstream_owner,
-            upstreamRepoUrl: skill.upstream_repo_url,
-            license: skill.license || 'Proprietary',
-            publishedAt: skill.published_at
-          },
+          ...enrichSkill(skill),
           versions,
           forkInfo,
           ownershipClaims
         }
       });
     } catch (error) {
-      console.error('Error getting skill:', error);
+      logger.error('Error getting skill:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /skills/:id/content - Get raw skill content (SKILL.md text) as JSON or plain text
+  // Accepts: application/json (default) or text/plain / text/markdown
+  router.get('/:id/content', (req, res) => {
+    if (!canReadSkills(req)) return res.status(403).json({ error: "Requires 'skills:read' scope" });
+    try {
+      const ownerId = getOwnerId(req);
+      const skill = getSkillById(req.params.id, ownerId);
+      if (!skill) return res.status(404).json({ error: 'Skill not found' });
+
+      const bundlePersonaId = getBundlePersonaId(req);
+      if (bundlePersonaId) {
+        const attached = db.prepare('SELECT skill_id FROM persona_skills WHERE persona_id = ? AND skill_id = ?').get(bundlePersonaId, skill.id);
+        if (!attached) return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
+      if (!isResourceAllowed(req, 'skills', skill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
+      let content = skill.script_content || '';
+      if (!content) {
+        const diskPath = path.join(CLAUDE_SKILLS_DIR, skill.name, 'SKILL.md');
+        try { content = fs.readFileSync(diskPath, 'utf8'); } catch (_) { content = ''; }
+      }
+
+      const accept = req.headers.accept || '';
+      if (accept.includes('text/')) {
+        res.set('Content-Type', 'text/markdown; charset=utf-8');
+        return res.send(content);
+      }
+
+      res.json({
+        id: skill.id,
+        slug: skill.name,
+        name: skill.name,
+        content,
+        contentType: 'text/markdown'
+      });
+    } catch (error) {
+      logger.error('Error getting skill content:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -203,10 +392,19 @@ function createSkillsRoutes(
         githubUsername
       } = req.body;
 
+      // Sanitize name and description to prevent prompt injection when used in LLM prompts
+      const sanitizeSkillText = (s, maxLen) => {
+        if (!s || typeof s !== 'string') return s;
+        return s
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+          .replace(/ignore\s+(all\s+)?(previous|prior)\s+instructions?/gi, '')
+          .slice(0, maxLen);
+      };
+
       // If GitHub URL provided, fetch metadata
       let skillData = {
-        name,
-        description,
+        name: sanitizeSkillText(name, 100),
+        description: sanitizeSkillText(description, 1000),
         category,
         scriptContent,
         configJson,
@@ -243,8 +441,13 @@ function createSkillsRoutes(
             }
           }
         } catch (error) {
-          console.warn('Failed to fetch GitHub metadata:', error.message);
+          logger.warn('Failed to fetch GitHub metadata:', error.message);
         }
+      }
+
+      // Sanitize YAML frontmatter in scriptContent before saving
+      if (skillData.scriptContent) {
+        skillData.scriptContent = sanitizeFrontmatter(skillData.scriptContent);
       }
 
       // Create the skill
@@ -278,6 +481,13 @@ function createSkillsRoutes(
 
       const updatedSkill = getSkillById(skill.id, ownerId);
 
+      // Notify user of new skill
+      const skillCreateWs = db.prepare('SELECT id FROM workspaces WHERE owner_id = ? LIMIT 1').get(ownerId);
+      if (skillCreateWs) {
+        NotificationDispatcher.onSkillInstalled(skillCreateWs.id, ownerId, skillData.name, skill.id)
+          .catch(() => {});
+      }
+
       res.status(201).json({
         skill: {
           ...updatedSkill,
@@ -295,7 +505,7 @@ function createSkillsRoutes(
         }
       });
     } catch (error) {
-      console.error('Error creating skill:', error);
+      logger.error('Error creating skill:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -311,6 +521,10 @@ function createSkillsRoutes(
 
       if (!skill) {
         return res.status(404).json({ error: 'Skill not found' });
+      }
+
+      if (!isResourceAllowed(req, 'skills', skill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
       }
 
       const { releaseNotes } = req.body;
@@ -336,7 +550,7 @@ function createSkillsRoutes(
 
       res.status(201).json({ version });
     } catch (error) {
-      console.error('Error creating skill version:', error);
+      logger.error('Error creating skill version:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -355,7 +569,7 @@ function createSkillsRoutes(
 
       res.json({ versions });
     } catch (error) {
-      console.error('Error getting skill versions:', error);
+      logger.error('Error getting skill versions:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -366,7 +580,7 @@ function createSkillsRoutes(
       const forks = getSkillForks(req.params.id);
       res.json({ forks });
     } catch (error) {
-      console.error('Error getting skill forks:', error);
+      logger.error('Error getting skill forks:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -388,6 +602,10 @@ function createSkillsRoutes(
 
       if (!originalSkill) {
         return res.status(404).json({ error: 'Original skill not found' });
+      }
+
+      if (!isResourceAllowed(req, 'skills', originalSkill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
       }
 
       // Check license allows forking
@@ -434,7 +652,7 @@ function createSkillsRoutes(
         }
       });
     } catch (error) {
-      console.error('Error forking skill:', error);
+      logger.error('Error forking skill:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -457,6 +675,10 @@ function createSkillsRoutes(
         if (!attached) return res.status(403).json({ error: 'Skill not accessible with this token' });
       }
 
+      if (!isResourceAllowed(req, 'skills', skill.id)) {
+        return res.status(403).json({ error: 'Skill not accessible with this token' });
+      }
+
       let content = skill.script_content || null;
 
       // Fall back to SKILL.md on disk (mounted from the host Claude skills dir)
@@ -472,7 +694,7 @@ function createSkillsRoutes(
       res.set('Content-Type', 'text/markdown; charset=utf-8');
       res.send(content);
     } catch (error) {
-      console.error('Error getting skill.md:', error);
+      logger.error('Error getting skill.md:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -501,6 +723,10 @@ function createSkillsRoutes(
           return res.status(404).json({ error: 'Skill not found' });
         }
 
+        if (!isResourceAllowed(req, 'skills', skill.id)) {
+          return res.status(403).json({ error: 'Skill not accessible with this token' });
+        }
+
         // Resolve content from either raw text or JSON body
         const ct = req.headers['content-type'] || '';
         let content;
@@ -510,10 +736,11 @@ function createSkillsRoutes(
           content = req.body?.content ?? req.body?.script_content ?? '';
         }
 
-        const updated = updateSkill(skill.id, { script_content: String(content) }, ownerId);
+        const sanitized = sanitizeFrontmatter(String(content));
+        const updated = updateSkill(skill.id, { script_content: sanitized }, ownerId);
         res.json({ ok: true, skill: updated });
       } catch (error) {
-        console.error('Error updating skill.md:', error);
+        logger.error('Error updating skill.md:', error);
         res.status(500).json({ error: error.message });
       }
     }
@@ -525,7 +752,7 @@ function createSkillsRoutes(
       const licenses = getLicenses();
       res.json({ licenses });
     } catch (error) {
-      console.error('Error getting licenses:', error);
+      logger.error('Error getting licenses:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -554,7 +781,7 @@ function createSkillsRoutes(
 
       res.status(201).json({ claim });
     } catch (error) {
-      console.error('Error creating ownership claim:', error);
+      logger.error('Error creating ownership claim:', error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -598,7 +825,7 @@ function createSkillsRoutes(
 
       res.json({ claim: verified, verified: true });
     } catch (error) {
-      console.error('Error verifying ownership:', error);
+      logger.error('Error verifying ownership:', error);
       res.status(500).json({ error: error.message });
     }
   });

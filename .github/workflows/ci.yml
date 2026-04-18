@@ -10,7 +10,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
-  workflow_call:
+  workflow_call: {}
 
 permissions:
   contents: read
@@ -27,9 +27,9 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -54,9 +54,9 @@ jobs:
         node-version: ['20', '22']
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -76,7 +76,7 @@ jobs:
 
       - name: Upload coverage
         if: matrix.node-version == '22' && always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-report
           path: coverage/
@@ -89,9 +89,9 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -112,17 +112,21 @@ jobs:
     if: github.event_name == 'push'
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Create placeholder connector dist dirs
+        run: mkdir -p connectors/afp-daemon/dist connectors/afp-oauth/dist
+
       - name: Build backend image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          context: ./src
+          context: .
           file: ./src/Dockerfile
           push: false
           tags: myapi-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+

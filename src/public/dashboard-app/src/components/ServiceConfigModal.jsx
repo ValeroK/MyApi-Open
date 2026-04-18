@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
 function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
@@ -9,9 +9,14 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
   const [error, setError] = useState(null);
   const [successMessage, setSuccessMessage] = useState(null);
 
-  const masterToken = useAuthStore((state) => state.masterToken);
+  useEffect(() => {
+    if (isOpen && service) {
+      fetchPreferences();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, service]);
 
-  const fetchPreferences = useCallback(async () => {
+  const fetchPreferences = async () => {
     setIsLoading(true);
     setError(null);
     try {
@@ -39,13 +44,7 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
     } finally {
       setIsLoading(false);
     }
-  }, [service, masterToken]);
-
-  useEffect(() => {
-    if (isOpen && service) {
-      fetchPreferences();
-    }
-  }, [isOpen, service, fetchPreferences]);
+  };
 
   const getDefaultPreferences = (serviceName) => {
     const defaults = {
@@ -54,7 +53,7 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
       instagram: { default_account_id: '' },
       twitter: { default_account: '' },
       tiktok: { default_account: '' },
-      discord: { default_server_id: '', default_channel_id: '' },
+      discord: { bot_token: '', default_server_id: '', default_channel_id: '' },
       linkedin: { default_profile_id: '' },
       reddit: { default_subreddit: '' },
       fal: { fal_api_key: '', default_image_model: 'fal-ai/fast-sdxl' },
@@ -105,6 +104,13 @@ function ServiceConfigModal({ isOpen, service, onClose, onSave }) {
         },
       ],
       discord: [
+        {
+          key: 'bot_token',
+          label: 'Bot Token',
+          type: 'password',
+          placeholder: 'MTxxxxxxxxxxxxxxxxxxxxxxxx.Xxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+          help: 'Required for reading channels and messages. Discord Developer Portal → your app → Bot → Reset Token. The bot must be installed in the target server.',
+        },
         {
           key: 'default_server_id',
           label: 'Default Server ID',

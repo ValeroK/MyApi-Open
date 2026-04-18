@@ -4,6 +4,7 @@ import apiClient from '../utils/apiClient';
 import AlertBanner from '../components/AlertBanner';
 import PendingInvitations from '../components/PendingInvitations';
 import { useAuthStore } from '../stores/authStore';
+import { isOnboardingActive, wasChecklistDismissed, dismissChecklist, completeOnboarding } from '../utils/onboardingUtils';
 
 /**
  * Dashboard - Professional enterprise-grade dashboard with real-time alerts
@@ -34,12 +35,38 @@ function Dashboard() {
     skills: 0,
     marketplace: 0,
     knowledge: 0,
+    memories: 0,
   });
+  const [connectorsSummary, setConnectorsSummary] = useState({ afpDevices: 0, afpOnline: 0, names: [], chatgptActive: false });
 
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [twoFAEnabled, setTwoFAEnabled] = useState(null);
+  const [checklistHidden, setChecklistHidden] = useState(() => wasChecklistDismissed());
+  const [onboardingActive, setOnboardingActive] = useState(() => Boolean(user?.needsOnboarding) || isOnboardingActive());
+
+  const dismissChecklistPermanently = () => {
+    dismissChecklist();
+    setChecklistHidden(true);
+    setOnboardingActive(false);
+  };
+
+  useEffect(() => {
+    if (user?.needsOnboarding) {
+      setOnboardingActive(true);
+      setChecklistHidden(wasChecklistDismissed());
+    }
+  }, [user?.needsOnboarding]);
+
+  useEffect(() => {
+    const onOpen = () => {
+      setOnboardingActive(true);
+      setChecklistHidden(false);
+    };
+    window.addEventListener('myapi:open-onboarding', onOpen);
+    return () => window.removeEventListener('myapi:open-onboarding', onOpen);
+  }, []);
 
   // Fetch 2FA status
   const fetch2FAStatus = async () => {
@@ -49,6 +76,35 @@ function Dashboard() {
     } catch (err) {
       console.error('Failed to fetch 2FA status:', err);
       setTwoFAEnabled(false);
+    }
+  };
+
+  // Fetch AFP devices + check for active ChatGPT token
+  const fetchConnectorsSummary = async () => {
+    if (!isAuthenticated) return;
+    try {
+      const [afpRes, tokensRes] = await Promise.all([
+        apiClient.get('/afp/devices').catch(() => null),
+        apiClient.get('/tokens').catch(() => null),
+      ]);
+      const afpDevices = afpRes?.data?.devices || afpRes?.data?.data || [];
+      const afpOnline = afpDevices.filter((d) => d.status === 'online');
+
+      const allTokens = tokensRes?.data?.data || [];
+      const chatgptActive = allTokens.some((t) => {
+        const label = (t.label || '').toLowerCase();
+        const notRevoked = !t.revokedAt && !t.revoked_at;
+        return notRevoked && (label.includes('chatgpt') || label.includes('openai') || label.includes('gpt'));
+      });
+
+      setConnectorsSummary({
+        afpDevices: afpDevices.length,
+        afpOnline: afpOnline.length,
+        names: afpDevices.slice(0, 4).map((d) => d.device_name || d.name || d.id),
+        chatgptActive,
+      });
+    } catch (err) {
+      console.error('Failed to fetch connectors summary:', err);
     }
   };
 
@@ -233,17 +289,18 @@ function Dashboard() {
 
       navigate(`${targetPath}?${forwardedParams.toString()}`, { replace: true });
     }
-  }, [navigate]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [navigate]);
 
   // Initial setup
   useEffect(() => {
     if (!isAuthenticated) return undefined;
 
     fetchMetrics();
+    fetchConnectorsSummary();
     fetch2FAStatus();
     setupWebSocket();
 
-    const metricsInterval = setInterval(fetchMetrics, 30000);
+    const metricsInterval = setInterval(() => { fetchMetrics(); fetchConnectorsSummary(); }, 30000);
 
     return () => {
       clearInterval(metricsInterval);
@@ -254,7 +311,27 @@ function Dashboard() {
         wsRef.current.close();
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [masterToken, isAuthenticated, currentWorkspace?.id]);
+
+  const checklistItems = [
+    { done: !!(user?.displayName), label: 'Complete your profile', href: '/settings' },
+    { done: (metrics.personas || 0) > 0, label: 'Create a persona', href: '/personas' },
+    { done: twoFAEnabled === true, label: 'Secure your account with 2FA', href: '/settings' },
+    { done: (metrics.connectedServices || 0) > 0, label: 'Connect a service', href: '/services' },
+    { done: (metrics.knowledge || 0) > 0 || (metrics.memories || 0) > 0, label: 'Add knowledge or memory', href: '/knowledge' },
+    { done: (metrics.activeTokens || 0) > 0, label: 'Issue an access token', href: '/access-tokens' },
+  ];
+  const completedChecklistCount = checklistItems.filter((item) => item.done).length;
+  const isChecklistComplete = checklistItems.length > 0 && completedChecklistCount === checklistItems.length;
+
+  useEffect(() => {
+    if (onboardingActive && isChecklistComplete) {
+      completeOnboarding();
+      setChecklistHidden(true);
+      setOnboardingActive(false);
+    }
+  }, [onboardingActive, isChecklistComplete]);
 
   if (loading) {
     return (
@@ -316,21 +393,29 @@ function Dashboard() {
       {/* Pending Invitations */}
       <PendingInvitations />
 
-      {/* Getting Started Checklist — shown for new users until all 4 items are done */}
-      {user?.needsOnboarding && (
+      {/* Getting Started Checklist — persists until completed or explicitly dismissed */}
+      {onboardingActive && !checklistHidden && !isChecklistComplete && (
         <div className="rounded-lg border border-blue-700/40 bg-blue-950/20 p-5">
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-start gap-2 mb-3">
             <span className="text-blue-400 text-lg">🚀</span>
-            <h3 className="text-white font-semibold text-sm">Getting started</h3>
-            <span className="ml-auto text-xs text-slate-500">Complete these to unlock the full platform</span>
+            <div>
+              <h3 className="text-white font-semibold text-sm">Getting started</h3>
+              <span className="text-xs text-slate-500">{completedChecklistCount}/{checklistItems.length} complete · Finish setup or hide this checklist permanently</span>
+            </div>
+            <button
+              type="button"
+              onClick={dismissChecklistPermanently}
+              className="ml-auto inline-flex items-center gap-1 text-xs text-slate-400 hover:text-slate-200 transition-colors"
+              title="Hide this checklist permanently"
+            >
+              Dismiss
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
           <div className="space-y-2">
-            {[
-              { done: !!(user?.displayName), label: 'Complete your profile', href: '/identity' },
-              { done: (metrics.connectedServices || 0) > 0, label: 'Connect a service', href: '/services' },
-              { done: (metrics.knowledge || 0) > 0, label: 'Add a memory or knowledge doc', href: '/memory' },
-              { done: (metrics.personas || 0) > 0, label: 'Create a persona', href: '/personas' },
-            ].map((item) => (
+            {checklistItems.map((item) => (
               <Link
                 key={item.label}
                 to={item.href}
@@ -368,7 +453,8 @@ function Dashboard() {
 
       {/* Main Grid - 4 Key Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Card 1: Security Status */}
+
+        {/* Card 1: Security */}
         <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
           <div className="mb-4">
             <div className="flex items-center gap-2 mb-2">
@@ -377,43 +463,32 @@ function Dashboard() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                 </svg>
               </div>
-              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">
-                Security
-              </h3>
+              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Security</h3>
             </div>
-            <p className="text-2xl font-bold text-slate-100 tracking-tight">
-              {metrics.approvedDevices}
-            </p>
+            <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.approvedDevices}</p>
             <p className="text-xs text-slate-400 mt-1">Approved Devices</p>
           </div>
           <div className="pt-4 border-t border-slate-700/30 space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Pending Approvals</span>
-              <span className={`text-sm font-semibold ${metrics.pendingApprovals > 0 ? 'text-amber-400' : 'text-green-400'}`}>
+              <span className="text-xs text-slate-400">Pending</span>
+              <span className={`text-sm font-semibold ${metrics.pendingApprovals > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
                 {metrics.pendingApprovals}
               </span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Last Activity</span>
-              <span className="text-xs text-slate-300">
-                {metrics.lastActivityTime
-                  ? new Date(metrics.lastActivityTime).toLocaleDateString()
-                  : 'None'}
+              <span className="text-xs text-slate-400">Last activity</span>
+              <span className="text-sm font-semibold text-slate-400">
+                {metrics.lastActivityTime ? new Date(metrics.lastActivityTime).toLocaleDateString() : 'None'}
               </span>
             </div>
           </div>
-          <Link
-            to="/device-management"
-            className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-          >
+          <Link to="/device-management" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
             View Details
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-            </svg>
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
           </Link>
         </div>
 
-        {/* Card 2: Connected Services */}
+        {/* Card 2: Services */}
         <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
           <div className="mb-4">
             <div className="flex items-center gap-2 mb-2">
@@ -422,40 +497,30 @@ function Dashboard() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.658 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
                 </svg>
               </div>
-              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">
-                Services
-              </h3>
+              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Services</h3>
             </div>
-            <p className="text-2xl font-bold text-slate-100 tracking-tight">
-              {metrics.connectedServices}
-            </p>
+            <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.connectedServices}</p>
             <p className="text-xs text-slate-400 mt-1">Connected</p>
           </div>
           <div className="pt-4 border-t border-slate-700/30 space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Total Services</span>
-              <span className="text-sm font-semibold text-slate-200">{metrics.totalServices || 0}</span>
+              <span className="text-xs text-slate-400">Available</span>
+              <span className="text-sm font-semibold text-slate-400">{metrics.totalServices || 0}</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-xs text-slate-400">Status</span>
-              <span className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/20">
-                <span className="w-2 h-2 rounded-full bg-green-400"></span>
-                Connected
+              <span className={`text-sm font-semibold ${metrics.connectedServices > 0 ? 'text-emerald-400' : 'text-slate-500'}`}>
+                {metrics.connectedServices > 0 ? 'Active' : 'None connected'}
               </span>
             </div>
           </div>
-          <Link
-            to="/services"
-            className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-          >
+          <Link to="/services" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
             Manage Services
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-            </svg>
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
           </Link>
         </div>
 
-        {/* Card 4: Recent Activity */}
+        {/* Card 3: Activity */}
         <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
           <div className="mb-4">
             <div className="flex items-center gap-2 mb-2">
@@ -464,38 +529,67 @@ function Dashboard() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
               </div>
-              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">
-                Activity
-              </h3>
+              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Activity</h3>
             </div>
-            <p className="text-2xl font-bold text-slate-100 tracking-tight">
-              {metrics.recentActivity?.length || 0}
-            </p>
+            <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.recentActivity?.length || 0}</p>
             <p className="text-xs text-slate-400 mt-1">Recent Events</p>
           </div>
-          <div className="pt-4 border-t border-slate-700/30">
-            <div className="space-y-2">
-              {metrics.recentActivity && metrics.recentActivity.length > 0 ? (
-                metrics.recentActivity.slice(0, 2).map((activity, idx) => (
-                  <p key={idx} className="text-xs text-slate-400 truncate">
-                    {activity.description}
-                  </p>
-                ))
-              ) : (
-                <p className="text-xs text-slate-500 italic">No recent activity</p>
-              )}
+          <div className="pt-4 border-t border-slate-700/30 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400">Latest</span>
+              <span className="text-sm font-semibold text-slate-400 truncate max-w-[130px] text-right">
+                {metrics.recentActivity?.[0]?.description || 'None'}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400">When</span>
+              <span className="text-sm font-semibold text-slate-400 truncate max-w-[130px] text-right">
+                {metrics.recentActivity?.[0]?.createdAt
+                  ? new Date(metrics.recentActivity[0].createdAt).toLocaleDateString()
+                  : 'None'}
+              </span>
             </div>
           </div>
-          <Link
-            to="/activity"
-            className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-          >
+          <Link to="/activity" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
             View All
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-            </svg>
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
           </Link>
         </div>
+
+        {/* Card 4: Connectors */}
+        <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
+          <div className="mb-4">
+            <div className="flex items-center gap-2 mb-2">
+              <div className="w-8 h-8 rounded bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Connectors</h3>
+            </div>
+            <p className="text-2xl font-bold text-slate-100 tracking-tight">{connectorsSummary.afpDevices}</p>
+            <p className="text-xs text-slate-400 mt-1">PC Devices</p>
+          </div>
+          <div className="pt-4 border-t border-slate-700/30 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400">Online</span>
+              <span className={`text-sm font-semibold ${connectorsSummary.afpOnline > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                {connectorsSummary.afpOnline}/{connectorsSummary.afpDevices}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-slate-400">ChatGPT</span>
+              <span className={`text-sm font-semibold ${connectorsSummary.chatgptActive ? 'text-emerald-400' : 'text-slate-500'}`}>
+                {connectorsSummary.chatgptActive ? 'Connected' : 'Not connected'}
+              </span>
+            </div>
+          </div>
+          <Link to="/connectors" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
+            Manage Connectors
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+          </Link>
+        </div>
+
       </div>
 
       {/* AI & Data Section - Personas, Skills, Marketplace, Knowledge */}
@@ -505,13 +599,20 @@ function Dashboard() {
           {/* Personas Card */}
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
             <div className="mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-8 h-8 rounded bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
-                  <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
-                  </svg>
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                    <svg className="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                    </svg>
+                  </div>
+                  <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Personas</h3>
                 </div>
-                <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Personas</h3>
+                <Link to="/marketplace" title="Marketplace" className="text-amber-500 hover:text-amber-400 transition-colors">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                  </svg>
+                </Link>
               </div>
               <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.personas || 0}</p>
               <p className="text-xs text-slate-400 mt-1">Active</p>
@@ -519,27 +620,29 @@ function Dashboard() {
             <div className="pt-4 border-t border-slate-700/30">
               <p className="text-xs text-slate-400 mb-3">AI agents and personas</p>
             </div>
-            <Link
-              to="/personas"
-              className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-            >
+            <Link to="/personas" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
               Manage
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
             </Link>
           </div>
 
           {/* Skills Card */}
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
             <div className="mb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="w-8 h-8 rounded bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center">
-                  <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                  </svg>
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center">
+                    <svg className="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                  </div>
+                  <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Skills</h3>
                 </div>
-                <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Skills</h3>
+                <Link to="/marketplace" title="Marketplace" className="text-amber-500 hover:text-amber-400 transition-colors">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                  </svg>
+                </Link>
               </div>
               <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.skills || 0}</p>
               <p className="text-xs text-slate-400 mt-1">Available</p>
@@ -547,42 +650,32 @@ function Dashboard() {
             <div className="pt-4 border-t border-slate-700/30">
               <p className="text-xs text-slate-400 mb-3">Capabilities and tools</p>
             </div>
-            <Link
-              to="/skills"
-              className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-            >
+            <Link to="/skills" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
               Browse
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
             </Link>
           </div>
 
-          {/* Marketplace Card */}
+          {/* Memory Card */}
           <div className="rounded-lg border border-slate-700/50 bg-slate-900/50 backdrop-blur p-6 hover:border-slate-600/50 transition-all duration-200">
             <div className="mb-4">
               <div className="flex items-center gap-2 mb-2">
-                <div className="w-8 h-8 rounded bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
-                  <svg className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z" />
+                <div className="w-8 h-8 rounded bg-violet-500/10 border border-violet-500/20 flex items-center justify-center">
+                  <svg className="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
                   </svg>
                 </div>
-                <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Marketplace</h3>
+                <h3 className="text-xs font-semibold text-slate-300 uppercase tracking-widest">Memory</h3>
               </div>
-              <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.marketplace || 0}</p>
-              <p className="text-xs text-slate-400 mt-1">Listings</p>
+              <p className="text-2xl font-bold text-slate-100 tracking-tight">{metrics.memories || 0}</p>
+              <p className="text-xs text-slate-400 mt-1">Stored entries</p>
             </div>
             <div className="pt-4 border-t border-slate-700/30">
-              <p className="text-xs text-slate-400 mb-3">Buy and sell skills</p>
+              <p className="text-xs text-slate-400 mb-3">Facts and notes about you</p>
             </div>
-            <Link
-              to="/marketplace"
-              className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors"
-            >
-              Explore
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
+            <Link to="/memory" className="mt-4 inline-flex items-center gap-1 text-xs font-semibold text-blue-400 hover:text-blue-300 transition-colors">
+              View Memory
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
             </Link>
           </div>
 

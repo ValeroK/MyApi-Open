@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useNotificationStore } from '../stores/notificationStore';
 import apiClient from '../utils/apiClient';
@@ -25,25 +25,27 @@ function NotificationSettings() {
     { key: 'service_connected', label: 'Service Connected' },
   ];
 
-  const fetchSettings = useCallback(async () => {
+  // Fetch settings on mount
+  useEffect(() => {
+    fetchSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [masterToken, currentWorkspace?.id]);
+
+  const fetchSettings = async () => {
     setLoading(true);
     setError(null);
 
     try {
       const headers = masterToken ? { Authorization: `Bearer ${masterToken}` } : undefined;
       const response = await apiClient.get('/notifications/settings', { headers });
-      setSettings(response.data?.settings || {});
+      setSettings(response.data?.data?.settings || {});
     } catch (err) {
       console.error('Failed to fetch notification settings:', err);
       setError('Failed to load notification settings');
     } finally {
       setLoading(false);
     }
-  }, [masterToken, currentWorkspace?.id]);
-
-  useEffect(() => {
-    fetchSettings();
-  }, [masterToken, currentWorkspace?.id, fetchSettings]);
+  };
 
   const updateSettings = async (updates) => {
     setIsSaving(true);
@@ -52,7 +54,7 @@ function NotificationSettings() {
     try {
       const headers = masterToken ? { Authorization: `Bearer ${masterToken}` } : undefined;
       const response = await apiClient.put('/notifications/settings', updates, { headers });
-      setSettings(response.data.settings || {});
+      setSettings(response.data?.data?.settings || {});
       addToast('Notification settings saved', 'success');
     } catch (err) {
       console.error('Failed to save notification settings:', err);

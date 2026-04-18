@@ -1,3 +1,4 @@
+const logger = require('../utils/logger');
 /**
  * Authentication Routes
  * Handles user login/registration and persistent user management
@@ -6,9 +7,53 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
-const { getAccessTokens, getExistingMasterToken, db } = require('../database');
+const { getAccessTokens, getExistingMasterToken, createAccessToken, db } = require('../database');
+const emailService = require('../services/emailService');
+
+const { generateCSRFToken, validateCSRFToken } = require('../lib/csrf-protection');
+const { requireBetaSlot } = require('../middleware/betaCap');
+const { invalidateBetaFullCache } = require('../lib/betaMode');
 
 const router = express.Router();
+
+/**
+ * GET /api/v1/auth/csrf-token
+ * Returns a CSRF token for the current session.
+ * Frontend must call this before submitting any state-changing form with a session cookie.
+ */
+router.get('/csrf-token', (req, res) => {
+  if (!req.session) return res.status(400).json({ error: 'Session not available' });
+  if (!req.session.csrfToken) {
+    req.session.csrfToken = generateCSRFToken();
+  }
+  res.json({ csrfToken: req.session.csrfToken });
+});
+
+/**
+ * Middleware: validate CSRF token for cookie-session-based POST requests.
+ * Bearer-token authenticated requests skip CSRF (inherently CSRF-safe).
+ */
+function requireCsrfForSession(req, res, next) {
+  // Skip CSRF check if using Bearer token auth (not cookie-based)
+  if (req.headers.authorization?.startsWith('Bearer ')) return next();
+  // Skip if no session is established yet (GET csrf-token first)
+  if (!req.session?.csrfToken) return next();
+
+  const provided = req.body?._csrf || req.headers['x-csrf-token'];
+  if (!provided) {
+    return res.status(403).json({ error: 'CSRF token required', code: 'CSRF_MISSING' });
+  }
+  try {
+    if (!validateCSRFToken(provided, req.session.csrfToken)) {
+      return res.status(403).json({ error: 'Invalid CSRF token', code: 'CSRF_INVALID' });
+    }
+  } catch {
+    return res.status(403).json({ error: 'CSRF validation error', code: 'CSRF_ERROR' });
+  }
+  // Rotate token after successful validation (defense in depth)
+  req.session.csrfToken = generateCSRFToken();
+  next();
+}
 
 function buildCookieDomainCandidates(req) {
   const candidates = new Set();
@@ -64,7 +109,7 @@ function regenerateSession(req) {
  * POST /api/v1/auth/token-login
  * Login with master token (for cross-device access)
  */
-router.post('/token-login', (req, res) => {
+router.post('/token-login', requireCsrfForSession, async (req, res) => {
   try {
     const token = req.body?.token;
     if (!token || typeof token !== 'string' || token.length < 16) {
@@ -79,7 +124,7 @@ router.post('/token-login', (req, res) => {
     for (const tokenRecord of tokens) {
       if (tokenRecord.revokedAt) continue;
       if (tokenRecord.expiresAt && new Date(tokenRecord.expiresAt) <= new Date()) continue;
-      if (tokenRecord.hash && bcryptLib.compareSync(token, tokenRecord.hash)) {
+      if (tokenRecord.hash && await bcryptLib.compare(token, tokenRecord.hash).catch(() => false)) {
         validToken = tokenRecord;
         break;
       }
@@ -97,7 +142,7 @@ router.post('/token-login', (req, res) => {
       res.json({ success: true, message: 'Logged in with token' });
     });
   } catch (error) {
-    console.error('Token login error:', error);
+    logger.error('Token login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -106,7 +151,7 @@ router.post('/token-login', (req, res) => {
  * POST /api/v1/auth/login
  * Login with email and password, returns master token
  */
-router.post('/login', async (req, res) => {
+router.post('/login', requireCsrfForSession, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -118,7 +163,7 @@ router.post('/login', async (req, res) => {
     try {
       user = getUserByEmail(email);
     } catch (e) {
-      console.error('Error fetching user:', e);
+      logger.error('Error fetching user:', e);
       return res.status(500).json({ error: 'Internal server error', message: 'Service temporarily unavailable' });
     }
     
@@ -126,7 +171,7 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const passwordMatch = bcrypt.compareSync(password, user.password_hash || '');
+    const passwordMatch = await bcrypt.compare(password, user.password_hash || '').catch(() => false);
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -169,7 +214,7 @@ router.post('/login', async (req, res) => {
       });
     });
   } catch (error) {
-    console.error('Login error:', error);
+    logger.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
   }
 });
@@ -181,10 +226,11 @@ router.post('/login', async (req, res) => {
  * Body: { username, password, email, timezone, display_name }
  * Response: { success: true, data: { token, user: {...}, needsOnboarding: true } }
  */
-router.post('/register', (req, res) => {
+router.post('/register', requireCsrfForSession, requireBetaSlot, async (req, res) => {
   const { username, password, display_name, email, timezone } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
-  if (password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+  const { isStrongPassword } = require('../utils/passwordUtils');
+  if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and contain 3 of: uppercase, lowercase, number, symbol' });
   if (username.length < 3 || username.length > 50) return res.status(400).json({ error: 'username must be between 3 and 50 characters' });
   if (!/^[a-zA-Z0-9_.-]+$/.test(username)) return res.status(400).json({ error: 'username can only contain letters, numbers, underscores, hyphens, and dots' });
   if (password.length > 128) return res.status(400).json({ error: 'password must not exceed 128 characters' });
@@ -199,13 +245,19 @@ router.post('/register', (req, res) => {
     if (existing) return res.status(409).json({ error: 'Username already exists' });
 
     const id = 'usr_' + crypto.randomBytes(16).toString('hex');
-    const hash = bcrypt.hashSync(password, 12);
+    const hash = await bcrypt.hash(password, 12);
     const now = new Date().toISOString();
 
     db.prepare(`INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user')`).run(
       id, username, hash, display_name || username, email || '', timezone || 'UTC', now
     );
+    invalidateBetaFullCache();
+
+    // Fire-and-forget welcome email (does not block the 201 response)
+    if (email) {
+      emailService.sendWelcomeEmail(email, display_name || username).catch(() => {});
+    }
 
     // Auto-login after registration
     req.session.user = { id, username, display_name: display_name || username, roles: 'user', needsOnboarding: true };
@@ -218,7 +270,7 @@ router.post('/register', (req, res) => {
     // FIX BUG-3: Return 201 for successful creation
     return res.status(201).json({ data: { token: sessionToken, user: { id, username, displayName: display_name || username, email: email || '', timezone: timezone || 'UTC' }, needsOnboarding: true } });
   } catch (err) {
-    console.error('Registration error:', err);
+    logger.error('Registration error:', err);
     return res.status(500).json({ error: 'Registration failed' });
   }
 });
@@ -231,7 +283,7 @@ router.post('/register', (req, res) => {
  * - Clears session cookies
  * - Returns no-cache headers to prevent auto-login on refresh
  */
-router.post('/logout', (req, res) => {
+router.post('/logout', requireCsrfForSession, (req, res) => {
   try {
     const userId = req.session?.user?.id;
 
@@ -244,9 +296,9 @@ router.post('/logout', (req, res) => {
     // Nothing to revoke here — the session destruction below is the entire logout action.
     if (userId) {
       try {
-        console.log(`[Logout] User ${userId}: session destroyed (master token and service connections preserved)`);
+        logger.info(`[Logout] User ${userId}: session destroyed (master token and service connections preserved)`);
       } catch (err) {
-        console.error('[Logout] Error during logout:', err);
+        logger.error('[Logout] Error during logout:', err);
       }
     }
 
@@ -298,7 +350,7 @@ router.post('/logout', (req, res) => {
       // Save the cleared session first
       req.session.save((saveErr) => {
         if (saveErr) {
-          console.error('Error saving cleared session:', saveErr);
+          logger.error('Error saving cleared session:', saveErr);
         }
         
         // THEN destroy the session entirely
@@ -308,20 +360,20 @@ router.post('/logout', (req, res) => {
           }
 
           if (err) {
-            console.error('Session destruction error:', err);
+            logger.error('Session destruction error:', err);
             return res.status(500).json({ success: false, error: 'Failed to logout' });
           }
 
-          console.log(`[Auth] User ${userId} logged out successfully (all tokens revoked/deleted)`);
+          logger.info(`[Auth] User ${userId} logged out successfully (all tokens revoked/deleted)`);
           return res.json({ success: true, message: 'Successfully logged out', cleared: true });
         });
       });
     } else {
-      console.log(`[Auth] No session to destroy`);
+      logger.info(`[Auth] No session to destroy`);
       return res.json({ success: true, message: 'Successfully logged out', cleared: true });
     }
   } catch (error) {
-    console.error('Logout error:', error);
+    logger.error('Logout error:', error);
     res.status(500).json({ success: false, error: 'Logout failed' });
   }
 });
@@ -333,28 +385,31 @@ router.post('/logout', (req, res) => {
  * so it must check req.session.user directly (for OAuth session auth)
  * and validate Bearer tokens manually.
  */
-router.get('/me', (req, res) => {
+router.get('/me', async (req, res) => {
   try {
     const { getAccessTokens } = require('../database');
     const bcrypt = require('bcrypt');
     
     // Check session auth FIRST (OAuth login via browser)
+    // Track auth method so we know whether bootstrap is safe to return.
     let userId = null;
+    let authViaSession = false;
     if (req.session && req.session.user && req.session.user.id) {
       userId = String(req.session.user.id);
-      console.log(`[Auth/Me] Authenticated via session: ${userId}`);
+      authViaSession = true;
+      logger.info(`[Auth/Me] Authenticated via session: ${userId}`);
     }
-    
+
     // Fallback to tokenMeta (set by authenticate middleware if this route is wrapped)
     if (!userId && req.tokenMeta?.ownerId) {
       userId = String(req.tokenMeta.ownerId);
-      console.log(`[Auth/Me] Authenticated via req.tokenMeta: ${userId}`);
+      logger.info(`[Auth/Me] Authenticated via req.tokenMeta: ${userId}`);
     }
-    
+
     // Fallback to req.user (in case this route is later wrapped in authenticate())
     if (!userId && req.user?.id) {
       userId = String(req.user.id);
-      console.log(`[Auth/Me] Authenticated via req.user: ${userId}`);
+      logger.info(`[Auth/Me] Authenticated via req.user: ${userId}`);
     }
 
     // Fallback: directly validate Bearer token from Authorization header.
@@ -366,24 +421,72 @@ router.get('/me', (req, res) => {
       if (parts.length === 2 && parts[0] === 'Bearer') {
         const rawToken = parts[1];
         const tokens = getAccessTokens() || [];
+        let matchedToken = null;
         for (const tokenRecord of tokens) {
           if (
             !tokenRecord.revokedAt &&
             tokenRecord.hash &&
-            bcrypt.compareSync(rawToken, tokenRecord.hash)
+            await bcrypt.compare(rawToken, tokenRecord.hash).catch(() => false)
           ) {
             if (tokenRecord.expiresAt && new Date(tokenRecord.expiresAt) <= new Date()) {
               continue; // skip expired tokens
             }
             userId = String(tokenRecord.ownerId);
+            matchedToken = tokenRecord;
             break;
+          }
+        }
+        // Bearer tokens reaching /auth/me MUST honor requires_approval and per-token
+        // device approval. Do NOT trust caller-controlled Referer/Origin — those are spoofable.
+        // Session-authed dashboard hits the session branch above; this path only runs for
+        // external Bearer callers (agents, AI), which must be gated.
+        if (matchedToken) {
+          try {
+            const { db: dbInstance, getPendingApprovals, createPendingApproval } = require('../database');
+            const DeviceFingerprint = require('../utils/deviceFingerprint');
+            const tokenRow = dbInstance.prepare(
+              'SELECT label, requires_approval, token_type, scope FROM access_tokens WHERE id = ?'
+            ).get(matchedToken.tokenId);
+            const isMasterToken = tokenRow?.token_type === 'master' || tokenRow?.scope === 'full';
+            const isOAuthToken = tokenRow?.label && tokenRow.label.endsWith('(OAuth)');
+            // Gate if: master token, OAuth-labeled token, OR guest token with requires_approval=1.
+            // Guest token without approval requirement still passes (existing policy).
+            const gateEnabled = isMasterToken || isOAuthToken || !!tokenRow?.requires_approval;
+
+            if (gateEnabled) {
+              const fingerprint = DeviceFingerprint.fromRequest(req);
+              // Per-token lookup: master approval must NOT auto-authorize guest tokens.
+              const approvedForToken = dbInstance.prepare(
+                'SELECT id FROM approved_devices WHERE token_id = ? AND user_id = ? AND device_fingerprint_hash = ? AND revoked_at IS NULL LIMIT 1'
+              ).get(matchedToken.tokenId, userId, fingerprint.fingerprintHash);
+
+              if (!approvedForToken) {
+                const pendingApprovals = getPendingApprovals(userId, matchedToken.tokenId);
+                const existingPending = pendingApprovals.find(p => p.device_fingerprint_hash === fingerprint.fingerprintHash);
+                if (!existingPending) {
+                  createPendingApproval(matchedToken.tokenId, userId, fingerprint.fingerprintHash, fingerprint.summary, fingerprint.fingerprint.ipAddress);
+                }
+                return res.status(403).json({
+                  error: 'device_not_approved',
+                  code: 'DEVICE_APPROVAL_REQUIRED',
+                  message: 'Access denied — waiting for the user to approve you in the dashboard.',
+                });
+              }
+            }
+          } catch (err) {
+            logger.error('[Auth/Me] Device approval check failed, failing closed', { err: err.message });
+            return res.status(403).json({
+              error: 'device_approval_error',
+              code: 'DEVICE_APPROVAL_FAILED',
+              message: 'Access denied — device check temporarily unavailable.',
+            });
           }
         }
       }
     }
 
     if (!userId) {
-      console.log(`[Auth/Me] No authentication found (no session, no valid Bearer token)`);
+      logger.info(`[Auth/Me] No authentication found (no session, no valid Bearer token)`);
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
@@ -429,7 +532,7 @@ router.get('/me', (req, res) => {
         if (req.session) {
           delete req.session.masterTokenRaw;
           delete req.session.masterTokenId;
-          req.session.save?.((err) => { if (err) console.error('[Auth/Me] Session clear error:', err); });
+          req.session.save?.((err) => { if (err) logger.error('[Auth/Me] Session clear error:', err); });
         }
       }
     }
@@ -439,15 +542,30 @@ router.get('/me', (req, res) => {
       if (existing) {
         masterTokenRaw = existing.rawToken;
         masterTokenId  = existing.tokenId;
-        // Cache in session for subsequent requests within the same session
-        if (req.session) {
-          req.session.masterTokenRaw = masterTokenRaw;
-          req.session.masterTokenId  = masterTokenId;
-          req.session.save?.((err) => { if (err) console.error('[Auth/Me] Session save error:', err); });
+      } else {
+        // No master token exists yet — create the canonical one for this user.
+        // Platform-generated, not linked to any OAuth service. Persists until
+        // the user explicitly rotates it via /tokens/master/regenerate.
+        try {
+          const rawToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
+          const hash = await bcrypt.hash(rawToken, 10);
+          const tokenId = createAccessToken(hash, userId, 'full', 'Master Token', null, null, null, rawToken, 'master');
+          masterTokenRaw = rawToken;
+          masterTokenId  = tokenId;
+          logger.info('[Auth/Me] Created initial master token', { userId, tokenId });
+        } catch (mintErr) {
+          logger.error('[Auth/Me] Failed to create master token', { error: mintErr.message });
         }
+      }
+
+      if (masterTokenRaw && req.session) {
+        req.session.masterTokenRaw = masterTokenRaw;
+        req.session.masterTokenId  = masterTokenId;
+        req.session.save?.((err) => { if (err) logger.error('[Auth/Me] Session save error:', err); });
       }
     }
 
+    const _pwrEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || '').trim().toLowerCase();
     const userPayload = {
       id: user.id,
       email: user.email,
@@ -456,16 +574,26 @@ router.get('/me', (req, res) => {
       avatarUrl: user.avatarUrl,
       timezone: user.timezone,
       plan: user.plan,
+      isPowerUser: !!(_pwrEmail && String(user.email || '').toLowerCase() === _pwrEmail),
+      needsOnboarding: Boolean(user?.needsOnboarding),
     };
+
+    // SECURITY: only return the master token bootstrap to session-authenticated
+    // requests (browser dashboard). Bearer-token callers (including scoped guest
+    // tokens) must NOT receive the master token — doing so would allow any guest
+    // token holder to escalate to full account control.
+    const bootstrapPayload = (authViaSession && masterTokenRaw)
+      ? { masterToken: masterTokenRaw, tokenId: masterTokenId }
+      : null;
 
     res.json({
       success: true,
       user: userPayload,
       isFirstLogin,
-      bootstrap: masterTokenRaw ? { masterToken: masterTokenRaw, tokenId: masterTokenId } : null,
+      bootstrap: bootstrapPayload,
     });
   } catch (error) {
-    console.error('Get user error:', error);
+    logger.error('Get user error:', error);
     res.status(500).json({ error: 'Failed to get user' });
   }
 });

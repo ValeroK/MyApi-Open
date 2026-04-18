@@ -5,6 +5,8 @@ import apiRequest from '../utils/apiRequest';
 import DeleteAccountModal from '../components/DeleteAccountModal';
 import NotificationSettings from '../components/NotificationSettings';
 import ImportExport from '../components/ImportExport';
+import { restartOnboarding, requestOnboardingModal } from '../utils/onboardingUtils';
+import { fetchPublicConfig } from '../utils/publicConfig';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared UI helpers
@@ -1699,6 +1701,15 @@ function BillingSection() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [betaActive, setBetaActive] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPublicConfig().then((cfg) => {
+      if (!cancelled) setBetaActive(Boolean(cfg?.beta));
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const loadBilling = useCallback(async () => {
     try {
@@ -1901,6 +1912,9 @@ function BillingSection() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {plans.map((plan) => {
           const isCurrent = String(current.plan).toLowerCase() === String(plan.id).toLowerCase();
+          const planId = String(plan.id).toLowerCase();
+          const isFree = planId === 'free';
+          const isComingSoon = Boolean(plan.beta_locked) || (betaActive && !isFree);
           return (
             <div key={plan.id} className={`bg-slate-900 border rounded-lg p-4 ${isCurrent ? 'border-blue-500 ring-1 ring-blue-500/40' : 'border-slate-700'}`}>
               <div className="flex items-center justify-between gap-2">
@@ -1909,7 +1923,15 @@ function BillingSection() {
                   <span className="text-[10px] uppercase tracking-wide font-semibold px-2 py-1 rounded bg-blue-600 text-white">Current</span>
                 )}
               </div>
-              <p className="text-slate-300 text-xl mt-1">${plan.priceMonthly ?? Math.floor((plan.price_cents || 0) / 100)}<span className="text-sm text-slate-400">/mo</span></p>
+              {isFree ? (
+                <p className="text-slate-300 text-xl mt-1 flex items-baseline gap-2">
+                  {betaActive && <span className="line-through text-slate-500 text-base">$10</span>}
+                  <span>Free</span>
+                  {betaActive && <span className="text-xs text-violet-400 font-semibold">Beta</span>}
+                </p>
+              ) : (
+                <p className="text-slate-300 text-xl mt-1">${plan.priceMonthly ?? Math.floor((plan.price_cents || 0) / 100)}<span className="text-sm text-slate-400">/mo</span></p>
+              )}
               {plan.description && <p className="text-slate-400 text-xs mt-1">{plan.description}</p>}
               {Array.isArray(plan.features) && plan.features.length > 0 && (
                 <ul className="mt-2 space-y-1 text-xs text-slate-400">
@@ -1922,11 +1944,11 @@ function BillingSection() {
                 </ul>
               )}
               <button
-                disabled={loading || isCurrent}
-                onClick={() => handleCheckout(plan.id)}
-                className="mt-4 w-full px-3 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white text-sm disabled:opacity-50"
+                disabled={loading || isCurrent || isComingSoon}
+                onClick={() => !isComingSoon && handleCheckout(plan.id)}
+                className={`mt-4 w-full px-3 py-2 rounded text-sm text-white disabled:opacity-50 ${isComingSoon ? 'bg-slate-700 cursor-default' : 'bg-blue-600 hover:bg-blue-500'}`}
               >
-                {isCurrent ? 'Current Plan' : 'Choose Plan'}
+                {isCurrent ? 'Current Plan' : isComingSoon ? 'Soon' : 'Choose Plan'}
               </button>
             </div>
           );
@@ -2009,9 +2031,44 @@ const SECTIONS = [
   { id: 'danger', label: 'Danger Zone' },
 ];
 
+function OnboardingSection() {
+  const [message, setMessage] = useState('');
+
+  const handleRerunOnboarding = () => {
+    restartOnboarding();
+    requestOnboardingModal();
+    setMessage('Onboarding restarted. The setup modal is open again.');
+  };
+
+  return (
+    <SectionCard title="Onboarding" description="Replay the first-run setup whenever you want to refresh your profile, security, or integrations flow">
+      <div className="space-y-4">
+        {message && <SuccessBanner message={message} onClose={() => setMessage('')} />}
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+          <div>
+            <p className="text-sm text-slate-300">
+              Re-run onboarding to walk through profile setup, persona creation, 2FA, and first integrations again.
+            </p>
+            <p className="text-xs text-slate-500 mt-1">
+              This also restores the getting-started checklist until you finish or dismiss it again.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleRerunOnboarding}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors text-sm whitespace-nowrap"
+          >
+            Run onboarding again
+          </button>
+        </div>
+      </div>
+    </SectionCard>
+  );
+}
+
 function Settings() {
   const { activeSection, setActiveSection } = useSettingsStore();
-  const { logout } = useAuthStore();
+  const forceUnauthenticated = useAuthStore((state) => state.forceUnauthenticated);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -2026,8 +2083,14 @@ function Settings() {
       if (!res.ok) {
         throw new Error(payload?.error || 'Failed to delete account');
       }
+
+      // The backend already destroys the session and clears auth cookies as part of
+      // account deletion. Only clear client-side auth state here; do not run the
+      // normal logout flow, which performs a second /auth/logout request and can
+      // surface a false failure after the account is already gone.
       setShowDeleteModal(false);
-      logout();
+      forceUnauthenticated();
+      window.location.replace('/');
     } catch (err) {
       alert(err?.message || 'Failed to delete account');
     } finally {
@@ -2063,7 +2126,12 @@ function Settings() {
       </div>
 
       {/* Section content */}
-      {activeSection === 'profile' && <ProfileSection />}
+      {activeSection === 'profile' && (
+        <>
+          <ProfileSection />
+          <OnboardingSection />
+        </>
+      )}
       {activeSection === 'billing' && <BillingSection />}
       {activeSection === 'security' && <SecuritySection />}
       {activeSection === 'audit' && <AuditLogsSection />}

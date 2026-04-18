@@ -1,6 +1,62 @@
+const crypto = require('crypto');
 const DeviceFingerprint = require('../utils/deviceFingerprint');
 const db = require('../database');
 const NotificationService = require('../services/notificationService');
+
+// ─── ASC: Ed25519 signature verification ─────────────────────────────────────
+
+function verifyASCSignature(req, userId, tokenId) {
+  const pubKeyB64  = req.headers['x-agent-publickey'];
+  const sigB64     = req.headers['x-agent-signature'];
+  const tsHeader   = req.headers['x-agent-timestamp'];
+
+  if (!pubKeyB64 || !sigB64 || !tsHeader) return null; // not an ASC request
+
+  // Replay protection: timestamp must be within 60 seconds
+  const ts = parseInt(tsHeader, 10);
+  const now = Math.floor(Date.now() / 1000);
+  if (isNaN(ts) || Math.abs(now - ts) > 60) {
+    return { valid: false, reason: 'timestamp_invalid' };
+  }
+
+  // Decode public key — must be 32 bytes (raw Ed25519)
+  let pubKeyBuf;
+  try {
+    pubKeyBuf = Buffer.from(pubKeyB64, 'base64');
+  } catch {
+    return { valid: false, reason: 'publickey_invalid' };
+  }
+  if (pubKeyBuf.length !== 32) {
+    return { valid: false, reason: 'publickey_invalid' };
+  }
+
+  // Compute key fingerprint (first 32 hex chars of SHA256)
+  const keyFingerprint = crypto.createHash('sha256').update(pubKeyBuf).digest('hex').substring(0, 32);
+
+  // Verify Ed25519 signature: message = "<timestamp>:<tokenId>"
+  const message = Buffer.from(`${tsHeader}:${tokenId}`);
+  let sigBuf;
+  try {
+    sigBuf = Buffer.from(sigB64, 'base64');
+  } catch {
+    return { valid: false, reason: 'signature_invalid' };
+  }
+
+  let sigValid = false;
+  try {
+    // Node 22 supports Ed25519 verify with raw 32-byte key via SubjectPublicKeyInfo wrapping
+    const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex'); // SPKI prefix for Ed25519
+    const spkiKey = Buffer.concat([spkiPrefix, pubKeyBuf]);
+    const keyObj = crypto.createPublicKey({ key: spkiKey, format: 'der', type: 'spki' });
+    sigValid = crypto.verify(null, message, keyObj, sigBuf);
+  } catch {
+    return { valid: false, reason: 'signature_invalid' };
+  }
+
+  if (!sigValid) return { valid: false, reason: 'signature_mismatch' };
+
+  return { valid: true, keyFingerprint, pubKeyB64 };
+}
 
 /**
  * Device Approval Middleware
@@ -54,30 +110,111 @@ function deviceApprovalMiddleware(req, res, next) {
   }
 
   // Extract user context from token metadata ONLY (no session fallback)
+  // Note: Referer/Origin headers are caller-controlled and must NOT be used to bypass device approval.
   const userId = req.tokenMeta?.ownerId;
   const tokenId = req.tokenMeta?.tokenId;
   const isMasterToken = req.tokenMeta?.tokenType === 'master' || req.tokenMeta?.scope === 'full';
   const tokenKind = isMasterToken ? 'master' : 'guest';
   
-  console.log('[Device Approval Middleware]', {
-    userId,
-    tokenId,
-    path: req.path,
-    authType: req.authType,
-  });
-  
   // Skip device check if not a Bearer token
   if (!userId || !tokenId) {
-    console.log('[Device Approval] Skipping - not an API token');
     return next();
   }
 
-  // Check if this token requires device approval
-  // Tokens without requires_approval=1 (e.g. bundle tokens without the approval checkbox) skip this gate
+  // ── ASC: Ed25519 signed request ──────────────────────────────────────────
+  const ascResult = verifyASCSignature(req, userId, tokenId);
+  if (ascResult !== null) {
+    // Headers were present — this is an ASC request
+    if (!ascResult.valid) {
+      return res.status(401).json({
+        error: 'asc_signature_invalid',
+        code: 'ASC_INVALID',
+        reason: ascResult.reason,
+        message: 'Request signature is invalid or timestamp is too old.',
+      });
+    }
+    // Signature valid — check if this key is approved
+    const ascDevice = db.getApprovedDeviceByKeyFingerprint(userId, ascResult.keyFingerprint);
+    if (ascDevice && !ascDevice.revoked_at) {
+      db.updateDeviceLastUsed(ascDevice.id);
+      return next();
+    }
+    if (ascDevice && ascDevice.revoked_at) {
+      return res.status(403).json({
+        error: 'device_not_approved',
+        code: 'DEVICE_APPROVAL_REQUIRED',
+        message: 'Access denied — waiting for the user to approve you in the dashboard.',
+        key_fingerprint: ascResult.keyFingerprint,
+      });
+    }
+    // Key not registered at all — create pending approval
+    const pending = db.getPendingApprovals(userId, tokenId);
+    const existingPending = pending.find(p => p.device_fingerprint_hash === ascResult.keyFingerprint);
+    if (!existingPending) {
+      db.createPendingApproval(tokenId, userId, ascResult.keyFingerprint,
+        { type: 'asc', key_fingerprint: ascResult.keyFingerprint }, req.ip);
+    }
+    return res.status(403).json({
+      error: 'device_not_approved',
+      code: 'DEVICE_APPROVAL_REQUIRED',
+      message: 'Access denied — waiting for the user to approve you in the dashboard.',
+      key_fingerprint: ascResult.keyFingerprint,
+    });
+  }
+
+  // OAuth-issued tokens (label ends with "(OAuth)") are pre-authorized by the user during
+  // the OAuth consent flow — no additional device approval needed.
+  // Daemon tokens (AFP daemon, raw API tokens) must go through device approval.
+  // Guest/scoped tokens respect the per-token requires_approval flag.
   try {
-    const tokenRow = db.db.prepare('SELECT requires_approval FROM access_tokens WHERE id = ?').get(tokenId);
-    if (!tokenRow || !tokenRow.requires_approval) {
-      return next(); // token doesn't require approval — pass through
+    const tokenRow = db.db.prepare('SELECT label, requires_approval FROM access_tokens WHERE id = ?').get(tokenId);
+    if (tokenRow?.label && tokenRow.label.endsWith('(OAuth)')) {
+      // Register/track in approved_devices so the user can see and revoke from the dashboard.
+      // Revocation is token-level: if the user has revoked any device for this token,
+      // block ALL requests from this token (regardless of fingerprint) until re-approved.
+      // Step 1: Revocation check — fail closed
+      let anyRevoked;
+      try {
+        anyRevoked = db.db.prepare(
+          'SELECT id FROM approved_devices WHERE token_id = ? AND user_id = ? AND revoked_at IS NOT NULL LIMIT 1'
+        ).get(tokenId, userId);
+      } catch (err) {
+        console.error('[Device Approval] Revocation check failed', { err: err.message, tokenId, userId });
+        return res.status(503).json({
+          error: 'device_approval_error',
+          code: 'DEVICE_APPROVAL_FAILED',
+          message: 'Access denied — device check temporarily unavailable.',
+        });
+      }
+      const fingerprint = DeviceFingerprint.fromRequest(req);
+      if (anyRevoked) {
+        // Revoked — create a new pending approval so the user can re-approve from the dashboard
+        const pendingApprovals = db.getPendingApprovals(userId, tokenId);
+        const existingPending = pendingApprovals.find(p => p.device_fingerprint_hash === fingerprint.fingerprintHash);
+        if (!existingPending) {
+          db.createPendingApproval(tokenId, userId, fingerprint.fingerprintHash, fingerprint.summary, fingerprint.fingerprint.ipAddress);
+        }
+        return res.status(403).json({
+          error: 'device_not_approved',
+          code: 'DEVICE_APPROVAL_REQUIRED',
+          message: 'Access denied — waiting for the user to approve you in the dashboard.',
+        });
+      }
+      // Step 2: Device registration/tracking — fail open (non-critical).
+      // Track per (token, device) so each OAuth token has its own approved row
+      // and the dashboard can list/revoke devices per token.
+      try {
+        const existing = db.getApprovedDeviceByHashAndToken(userId, fingerprint.fingerprintHash, tokenId);
+        if (!existing) {
+          db.createApprovedDevice(tokenId, userId, fingerprint.fingerprintHash, tokenRow.label, fingerprint.summary, fingerprint.fingerprint.ipAddress);
+        } else {
+          db.updateDeviceLastUsed(existing.id);
+        }
+      } catch (_) { /* registration tracking failure — non-critical */ }
+      return next();
+    }
+    if (!isMasterToken && !tokenRow?.requires_approval) {
+      return next(); // scoped token without approval requirement — pass through
     }
   } catch (_) {
     // If lookup fails, fall through to full device check
@@ -88,13 +225,16 @@ function deviceApprovalMiddleware(req, res, next) {
     const currentFingerprint = DeviceFingerprint.fromRequest(req);
     const fingerprintHash = currentFingerprint.fingerprintHash;
 
-    // Check if device is already approved
-    const approvedDevice = db.getApprovedDeviceByHash(userId, fingerprintHash);
-    
+    // Check if device is already approved for THIS token.
+    // Token-scoped lookup prevents an approval granted to a master token (or any
+    // other token) from auto-authorizing a different guest token on the same
+    // device. Each (token, device) pair must be explicitly approved.
+    const approvedDevice = db.getApprovedDeviceByHashAndToken(userId, fingerprintHash, tokenId);
+
     if (approvedDevice && !approvedDevice.revoked_at) {
       // Device is approved, update last used
       db.updateDeviceLastUsed(approvedDevice.id);
-      
+
       // Attach device info to request
       req.device = {
         id: approvedDevice.id,
@@ -102,41 +242,46 @@ function deviceApprovalMiddleware(req, res, next) {
         fingerprint: fingerprintHash,
         approvedAt: approvedDevice.approved_at,
       };
-      
+
       // Set cache-control headers to prevent stale device status
       res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.set('Pragma', 'no-cache');
       res.set('Expires', '0');
-      
+
       return next();
     }
+
+    // SECURITY: Do NOT silently auto-approve new device fingerprints because an older
+    // device on the same token was approved. This was a bypass allowing any new device
+    // to access a token without explicit user confirmation.
+    // Each new fingerprint must go through the explicit approval flow below.
 
     // Device not approved - return 403 immediately
     // (Do NOT rate limit the rejection itself, only the approval request creation)
     
+    // Get token info for device name generation (must be before rate-limit block that uses tokenName)
+    const tokenInfo = db.db.prepare('SELECT label, token_type FROM access_tokens WHERE id = ?').get(tokenId);
+    const tokenName = tokenInfo?.label || (isMasterToken ? 'Master Token' : 'Guest Token');
+
     // But first, check if approval already pending
     const pendingApprovals = db.getPendingApprovals(userId, tokenId);
     const existingPending = pendingApprovals.find(p => p.device_fingerprint_hash === fingerprintHash);
 
     // Check rate limit ONLY for new approval requests (not for the 403 response itself)
     const canCreateApproval = checkApprovalRateLimit(tokenId);
-    
+
     if (!existingPending && !canCreateApproval) {
       // RATE LIMITED - but we still return 403 to maintain security posture
       // (The rate limit applies only to creating NEW pending approvals)
       return res.status(403).json({
         error: 'device_not_approved',
-        message: 'Device not approved for this token.',
+        message: 'Access denied — waiting for the user to approve you in the dashboard.',
         code: 'DEVICE_NOT_APPROVED',
         token: { kind: tokenKind, name: tokenName },
         approval_pending: false,
         approval_id: null,
       });
     }
-
-    // Get token info for device name generation
-    const tokenInfo = db.db.prepare('SELECT label, token_type FROM access_tokens WHERE id = ?').get(tokenId);
-    const tokenName = tokenInfo?.label || (isMasterToken ? 'Master Token' : 'Guest Token');
 
     // Create pending approval if not already exists
     let approvalId = null;
@@ -247,7 +392,7 @@ function deviceApprovalMiddleware(req, res, next) {
     return res.status(403).json({
       error: 'device_not_approved',
       code: 'DEVICE_APPROVAL_REQUIRED',
-      message: 'This device requires approval to access MyApi',
+      message: 'Access denied — waiting for the user to approve you in the dashboard.',
       token: {
         kind: tokenKind,
         name: tokenName,
@@ -261,6 +406,15 @@ function deviceApprovalMiddleware(req, res, next) {
       device: currentFingerprint.summary,
       ipAddress: currentFingerprint.fingerprint.ipAddress,
       suspiciousActivity: suspiciousAnalysis.warnings.length > 0 ? suspiciousAnalysis : null,
+      ...(isMasterToken ? {
+        recommendation: {
+          message: 'Using a master token is not recommended for AI agents. Each agent should have its own identity.',
+          alternatives: [
+            { method: 'device_flow', label: 'OAuth Device Flow', description: 'Get a dedicated token with one browser approval.', url: '/dashboard/connectors' },
+            { method: 'asc', label: 'ASC (Agentic Secure Connection)', description: 'Use an Ed25519 keypair for cryptographic identity per agent.', url: '/dashboard/connectors' },
+          ],
+        },
+      } : {}),
     });
   } catch (error) {
     console.error('[Device Approval Middleware CRITICAL ERROR]', {
@@ -275,7 +429,7 @@ function deviceApprovalMiddleware(req, res, next) {
     return res.status(403).json({
       error: 'device_approval_error',
       code: 'DEVICE_APPROVAL_FAILED',
-      message: 'Device approval check failed. Please approve this device in Device Management and try again.',
+      message: 'Access denied — waiting for the user to approve you in the dashboard.',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined,
     });
   }

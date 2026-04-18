@@ -33,6 +33,10 @@ const { marked } = require('marked');
 const http = require('http');
 const EventEmitter = require('events');
 const expressRateLimit = require('express-rate-limit');
+const logger = require('./utils/logger');
+const { requestContextMiddleware } = require('./lib/request-context');
+const betaMode = require('./lib/betaMode');
+const { requireBetaSlot } = require('./middleware/betaCap');
 
 // Database initialization
 let mongodbReady = Promise.resolve();
@@ -59,6 +63,7 @@ const alertEmitter = new EventEmitter();
 const NotificationService = require('./services/notificationService');
 const NotificationDispatcher = require('./lib/notificationDispatcher');
 const emailService = require('./services/emailService');
+const alerting = require('./lib/alerting');
 
 // PERFORMANCE FIX: Token cache to prevent repeated decryption
 // Each decryption is CPU-intensive. Cache for 5 minutes to prevent 502 errors.
@@ -101,6 +106,8 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
+const { pendingRequests: afpPendingRequests, afpConnections } = require('./lib/afp-state');
+
 const {
   db,
   initDatabase,
@@ -115,6 +122,7 @@ const {
   getExistingMasterToken,
   revokeAccessToken,
   // Scope functions
+  seedDefaultScopes,
   validateScope,
   getAllScopes,
   grantScopes,
@@ -125,6 +133,9 @@ const {
   createConnector,
   getConnectors,
   createAuditLog,
+  // AFP
+  getAfpDeviceById,
+  updateAfpDeviceStatus,
   getAuditLogs,
   createUser,
   getUsers,
@@ -132,6 +143,8 @@ const {
   getUserById,
   updateUserPlan,
   updateUserOAuthProfile,
+  setUserNeedsOnboarding,
+  clearUserOnboarding,
   updateUserSubscriptionStatus,
   getUserTotpSecret,
   setUserTotpSecret,
@@ -156,8 +169,8 @@ const {
   getOAuthStatus,
   createStateToken,
   validateStateToken,
-  cleanupExpiredStateTokens, // BUG-11
-  cleanupOldRateLimits, // BUG-10
+  cleanupExpiredStateTokens,
+  cleanupOldRateLimits,
   createConversation,
   getConversations,
   getConversation,
@@ -196,6 +209,10 @@ const {
   createSkill,
   getSkills,
   getSkillById,
+  getSkillBySlug,
+  getSkillsByIds,
+  getSkillsBySlugList,
+  suggestSkills,
   updateSkill,
   deleteSkill,
   setActiveSkill,
@@ -260,7 +277,9 @@ const {
   getComplianceAuditLogs,
   executeRetentionCleanup,
   upsertOAuthServerClient,
+  createApprovedDevice,
 } = require("./database");
+const DeviceFingerprint = require('./utils/deviceFingerprint');
 
 // OAuth service adapters
 const GoogleAdapter = require("./services/google-adapter");
@@ -286,12 +305,13 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 4500;
 const WORKSPACE_ROOT = path.join(__dirname, '..', '..', '..');
-const USER_MD_PATH = path.join(WORKSPACE_ROOT, 'USER.md');
-const SOUL_MD_PATH = path.join(WORKSPACE_ROOT, 'SOUL.md');
+const USER_MD_PATH = process.env.USER_MD_PATH || path.join(WORKSPACE_ROOT, 'USER.md');
+const SOUL_MD_PATH = process.env.SOUL_MD_PATH || path.join(WORKSPACE_ROOT, 'SOUL.md');
 const LEGAL_DOCS_DIR = path.join(__dirname, '..', 'docs', 'legal');
 
 // Import device approval middleware
 const { deviceApprovalMiddleware, setAlertEmitter: setDeviceAlertEmitter } = require('./middleware/deviceApproval');
+const { isResourceAllowed } = require('./middleware/scope-validator');
 
 function escapeHtml(value = '') {
   return String(value)
@@ -371,6 +391,9 @@ function renderLegalPage({ title, markdownContent }) {
 // Initialize database
 initDatabase();
 
+// Seed scope definitions (idempotent upsert — safe to run every startup)
+seedDefaultScopes();
+
 // Run database migrations
 runMigrations();
 
@@ -390,8 +413,8 @@ if (!startupHealth.healthy) {
 let oauthConfig = {
   google: {
     enabled: true,
-    clientId: process.env.GOOGLE_CLIENT_ID || '',
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
+    clientId: process.env.GOOGLE_CLIENT_ID || 'REMOVED_CLIENT_ID',
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || 'REMOVED_SECRET',
     redirectUri: process.env.GOOGLE_REDIRECT_URI || 'https://www.myapiai.com/api/v1/oauth/callback/google'
   }
 };
@@ -455,8 +478,7 @@ const oauthAdapters = {
     authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
     tokenUrl: 'https://open.tiktokapis.com/v2/oauth/token/',
     verifyUrl: 'https://open.tiktokapis.com/v1/user/info/',
-    // Keep TikTok OAuth scope minimal to avoid unauthorized_client for unapproved products.
-    scope: process.env.TIKTOK_SCOPE || 'user.info.basic video.list',
+    scope: process.env.TIKTOK_SCOPE || 'user.info.basic,user.info.profile,user.info.stats,video.list,video.upload,video.publish,comment.list,comment.list.pull',
     redirectUri: process.env.TIKTOK_REDIRECT_URI || oauthConfig.tiktok?.redirectUri || `http://localhost:${PORT}/api/v1/oauth/callback/tiktok`,
     // TikTok docs/UI often call this value "Client Key". Accept both env names.
     // TikTok expects this key in `client_key` (not `client_id`).
@@ -731,11 +753,26 @@ if (!process.env.DATABASE_URL) {
   BetterSqlite3StoreFactory = require('better-sqlite3-session-store')(session);
 }
 
+// SOC2 Phase 2 — CC7: Assign a unique correlation ID to every request for log tracing
+// Propagated automatically via AsyncLocalStorage — no manual threading needed
+app.use(requestContextMiddleware);
+
+// SOC2 Phase 4.3 — CSP nonce: generate a cryptographically random nonce per request.
+// The nonce is injected into the CSP header (scriptSrc) by Helmet and into the dashboard
+// HTML at serve time so script tags can carry matching `nonce=""` attributes.
+// NOTE: styleSrc retains `unsafe-inline` because React inline style={} props emit
+//       `style="..."` attributes in the DOM which cannot carry nonces — removing it
+//       would break every component that uses dynamic styling.
+app.use((req, res, next) => {
+  res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://static.cloudflareinsights.com", "https://unpkg.com"],
+      scriptSrc: ["'self'", "https://unpkg.com", "https://static.cloudflareinsights.com", (req, res) => `'nonce-${res.locals.cspNonce}'`],
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://unpkg.com"],
       imgSrc: ["'self'", "data:", "https:", "blob:"],
       fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
@@ -769,7 +806,7 @@ app.use('/api/', (req, res, next) => {
 });
 
 const devOrigins = ['http://localhost:3001', 'http://127.0.0.1:3001', 'http://localhost:4500', 'http://127.0.0.1:4500', 'http://localhost:5173', 'http://127.0.0.1:5173'];
-const envOrigins = String(process.env.CORS_ORIGIN || '')
+const envOrigins = String(process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -842,14 +879,23 @@ app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), a
 
   if (type === 'customer.subscription.created' || type === 'customer.subscription.updated') {
     if (metadataWorkspaceId) {
+      const newPlanId = (obj.items?.data?.[0]?.price?.nickname || obj.items?.data?.[0]?.price?.lookup_key || 'free').toLowerCase();
       upsertBillingSubscription(metadataWorkspaceId, {
         stripe_subscription_id: obj.id,
-        plan_id: (obj.items?.data?.[0]?.price?.nickname || obj.items?.data?.[0]?.price?.lookup_key || 'free').toLowerCase(),
+        plan_id: newPlanId,
         status: obj.status || 'active',
         period_start: obj.current_period_start ? new Date(obj.current_period_start * 1000).toISOString() : null,
         period_end: obj.current_period_end ? new Date(obj.current_period_end * 1000).toISOString() : null,
         cancel_at_period_end: !!obj.cancel_at_period_end,
       });
+      // Notify workspace owner on active subscription (upgrade)
+      if (type === 'customer.subscription.updated' && obj.status === 'active' && newPlanId !== 'free') {
+        const billingWs = getWorkspaces(null, metadataWorkspaceId);
+        if (billingWs?.ownerId) {
+          NotificationDispatcher.onSubscriptionUpgraded(metadataWorkspaceId, billingWs.ownerId, newPlanId)
+            .catch(err => console.error('[Billing] Subscription upgrade notification error:', err));
+        }
+      }
     }
   }
 
@@ -889,6 +935,15 @@ app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), a
         invoice_url: obj.hosted_invoice_url || null,
         created_at: obj.created ? new Date(obj.created * 1000).toISOString() : new Date().toISOString(),
       });
+      // Notify workspace owner on payment failure
+      if (type === 'invoice.payment_failed') {
+        const failWs = getWorkspaces(null, metadataWorkspaceId);
+        if (failWs?.ownerId) {
+          const failReason = obj.last_payment_error?.message || 'Payment was declined';
+          NotificationDispatcher.onBillingFailure(metadataWorkspaceId, failWs.ownerId, failReason)
+            .catch(err => console.error('[Billing] Payment failure notification error:', err));
+        }
+      }
     }
   }
 
@@ -1016,6 +1071,43 @@ if (process.env.NODE_ENV !== 'test' && !process.env.DATABASE_URL) {
   });
 }
 
+// SOC2 CC6 — Concurrent session limits (max 3 per user, oldest invalidated on new login)
+const MAX_SESSIONS_PER_USER = 3;
+// userId -> [{ sessionId, createdAt }]
+const userSessionRegistry = new Map();
+
+function registerUserSession(userId, sessionId) {
+  if (!userSessionRegistry.has(userId)) userSessionRegistry.set(userId, []);
+  const sessions = userSessionRegistry.get(userId);
+  sessions.push({ sessionId, createdAt: Date.now() });
+
+  // Evict oldest sessions that exceed the limit
+  while (sessions.length > MAX_SESSIONS_PER_USER) {
+    const { sessionId: oldSid } = sessions.shift(); // oldest first
+    if (sessionStore && typeof sessionStore.destroy === 'function') {
+      try { sessionStore.destroy(oldSid, () => {}); } catch (_) {}
+    }
+    logger.warn('Session evicted due to concurrent session limit', { userId, evictedSessionId: oldSid });
+  }
+}
+
+function unregisterUserSession(userId, sessionId) {
+  const sessions = userSessionRegistry.get(userId);
+  if (!sessions) return;
+  const idx = sessions.findIndex(s => s.sessionId === sessionId);
+  if (idx !== -1) sessions.splice(idx, 1);
+}
+
+function revokeAllUserSessions(userId) {
+  const sessions = userSessionRegistry.get(userId) || [];
+  for (const { sessionId } of sessions) {
+    if (sessionStore && typeof sessionStore.destroy === 'function') {
+      try { sessionStore.destroy(sessionId, () => {}); } catch (_) {}
+    }
+  }
+  userSessionRegistry.delete(userId);
+}
+
 app.use(session({
   ...(sessionStore ? { store: sessionStore } : {}),
   secret: process.env.SESSION_SECRET, // P0 Security Fix: No fallback - validated at startup
@@ -1023,8 +1115,25 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   proxy: true,
-  cookie: { secure: secureCookie, httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: 'lax', path: '/' }
+  cookie: { secure: secureCookie, httpOnly: true, maxAge: 8 * 60 * 60 * 1000, sameSite: 'lax', path: '/' }
 }));
+
+// SOC2 CC6: Idle session timeout (20-minute inactivity, 8-hour absolute max)
+const IDLE_TIMEOUT_MS = 20 * 60 * 1000;
+app.use((req, res, next) => {
+  // Only applies to session-authenticated requests (human dashboard)
+  if (!req.session || !req.session.user) return next();
+
+  const now = Date.now();
+  if (req.session.lastActivity && now - req.session.lastActivity > IDLE_TIMEOUT_MS) {
+    req.session.destroy((err) => {
+      if (err) logger.error('Session destroy error during idle timeout', { error: err.message });
+    });
+    return res.status(401).json({ error: 'Session expired due to inactivity' });
+  }
+  req.session.lastActivity = now;
+  next();
+});
 
 function buildCookieDomainCandidates(req) {
   const candidates = new Set();
@@ -1193,21 +1302,42 @@ app.use((req, res, next) => {
 // Dashboard static files - serve ONLY specific file types, not index.html
 // This allows SPA shell to serve index.html with fresh build
 const dashboardDistPath = path.join(__dirname, 'public', 'dist');
+
+// SOC2 Phase 4.3 — Read the SPA shell per-request so rebuilds are reflected without restart
+function getDashboardHtml() {
+  try {
+    return fs.readFileSync(path.join(dashboardDistPath, 'index.html'), 'utf8');
+  } catch (_) {
+    return '';
+  }
+}
+
 app.use('/dashboard/assets', express.static(path.join(dashboardDistPath, 'assets')));
 app.use('/dashboard', (req, res, next) => {
   // Only serve non-HTML static files directly (images, favicons, etc)
   if (/\.(js|css|svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot)$/i.test(req.path)) {
     return express.static(dashboardDistPath)(req, res, next);
   }
-  // Let SPA shell handle everything else (including / and /index.html)
-  next();
+  // Inject nonce into every <script> and <link rel="stylesheet"> tag in the SPA shell
+  const nonce = res.locals.cspNonce;
+  const html = getDashboardHtml();
+  if (!html) return next();
+  const patched = html
+    .replace(/<script(\b[^>]*)>/gi, (_, attrs) => `<script${attrs} nonce="${nonce}">`)
+    .replace(/<link(\b[^>]*rel=["']stylesheet["'][^>]*)>/gi, (_, attrs) => `<link${attrs} nonce="${nonce}">`);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(patched);
 });
 
 // General static files
 app.use(express.static(path.join(__dirname, "public")));
 
 // Connectors — serve OpenAPI specs and related files publicly
-app.use('/connectors', express.static(path.join(__dirname, '..', 'connectors')));
+// In Docker __dirname=/app (src/ contents are at /app/); in dev __dirname=.../src/
+const connectorsDir = fs.existsSync(path.join(__dirname, 'connectors'))
+  ? path.join(__dirname, 'connectors')
+  : path.join(__dirname, '..', 'connectors');
+app.use('/connectors', express.static(connectorsDir));
 
 // Legal pages - Terms and Privacy
 app.get('/terms', (req, res) => {
@@ -1325,7 +1455,7 @@ app.get('/api/v1/quick-start', (req, res) => {
     important: AI_APPROVAL_MESSAGE,
     authenticated: hasAuth,
     canonicalBaseUrl: canonicalBase,
-    urlWarning: 'Always use this exact base URL for all API calls. Do NOT follow redirects — HTTP redirects strip Authorization headers and will result in auth failures.',
+    urlWarning: 'Always use this exact base URL for all API calls. Do NOT follow redirects — HTTP redirects strip Authorization headers and will result in auth failures. IMPORTANT: Do NOT append /api/v1 to this base URL — all endpoint paths in this guide already include /api/v1. A common mistake is setting a base URL of https://www.myapiai.com/api/v1 and then calling /api/v1/skills — that produces a double-prefix (https://www.myapiai.com/api/v1/api/v1/skills) which returns ROUTE_NOT_FOUND.',
     prerequisite: {
       action: 'Ask the human for approval before every action',
       detail: 'You MUST describe what you plan to do and wait for the human user to explicitly approve before calling any endpoint. Never proceed without confirmation. This is mandatory for all actions.',
@@ -1448,7 +1578,7 @@ app.post('/api/v1/ask', authenticate, async (req, res) => {
       google: 'gmail(/gmail/v1/users/me/messages), calendar(/calendar/v3/calendars/primary/events)',
       slack: 'channels(/conversations.list), messages(/conversations.history), users(/users.list)',
       notion: 'pages(/pages), databases(/databases), search(/search)',
-      discord: 'guilds(/users/@me/guilds), channels(/channels/{id}/messages)',
+      discord: 'user-guilds(/users/@me/guilds), guild-channels(/guilds/{id}/channels), messages(/channels/{id}/messages)',
       linear: 'issues(/issues), projects(/projects), teams(/teams)',
       microsoft365: 'mail(/me/messages), calendar(/me/events), files(/me/drive/root/children)',
       jira: 'issues(/rest/api/3/search), projects(/rest/api/3/project)',
@@ -1540,7 +1670,7 @@ Rules:
   }
 });
 
-// /.well-known/openapi - standard discovery path
+// /.well-known/openapi - standard discovery path (public for AI agent bootstrap)
 app.get('/.well-known/openapi.json', (req, res) => {
   res.redirect('/openapi.json');
 });
@@ -1565,23 +1695,18 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
 
 // User profile routes
 app.get('/api/v1/users/me', authenticate, (req, res) => {
-  let identity = {};
-  if (fs.existsSync(USER_MD_PATH)) {
-    const raw = fs.readFileSync(USER_MD_PATH, 'utf8');
-    const lines = raw.split('\n');
-    for (const line of lines) {
-      const m = line.match(/^\s*[-*]\s*\*\*(.+?)\*\*[:\s]*(.*)$/);
-      if (m) identity[m[1].trim()] = (m[2] || '').trim();
-    }
+  // SECURITY FIX: Require 'identity' scope to access personal identity data
+  if (!hasScope(req, 'identity')) {
+    return res.status(403).json({ error: "Requires 'identity' scope to access user identity" });
   }
-
-  // Fetch full user data from database to include avatarUrl
   const userId = req.user?.id;
   let user = req.user || { id: 'owner', username: 'owner' };
+  let identity = {};
 
+  let fullUser = null;
   if (userId) {
     try {
-      const fullUser = getUserById(userId);
+      fullUser = getUserById(userId);
       if (fullUser) {
         user = {
           id: fullUser.id,
@@ -1594,8 +1719,33 @@ app.get('/api/v1/users/me', authenticate, (req, res) => {
       }
     } catch (err) {
       console.warn('[GET /users/me] Failed to fetch full user from DB:', err.message);
-      // Fall back to req.user
     }
+  }
+
+  if (isOwnerUser(userId)) {
+    // Owner: read Name/Email/Timezone from USER.md, extended fields from DB
+    if (fs.existsSync(USER_MD_PATH)) {
+      const raw = fs.readFileSync(USER_MD_PATH, 'utf8');
+      for (const line of raw.split('\n')) {
+        const m = line.match(/^\s*[-*]\s*\*\*(.+?)\*\*[:\s]*(.*)$/);
+        if (m) identity[m[1].trim()] = (m[2] || '').trim();
+      }
+    }
+    // Overlay extended fields from database profile_metadata
+    if (fullUser?.profile_metadata) {
+      try { Object.assign(identity, JSON.parse(fullUser.profile_metadata)); } catch (_) {}
+    }
+    // Apply any in-session overrides
+    if (vault.identityDocs[userId]) Object.assign(identity, vault.identityDocs[userId]);
+  } else {
+    // Non-owner: serve from DB (never the owner's USER.md)
+    identity = buildIdentityFromUser(fullUser) || {};
+    // Merge persisted extended fields from profile_metadata
+    if (fullUser?.profile_metadata) {
+      try { Object.assign(identity, JSON.parse(fullUser.profile_metadata)); } catch (_) {}
+    }
+    // Apply any in-session updates
+    if (vault.identityDocs[userId]) Object.assign(identity, vault.identityDocs[userId]);
   }
 
   res.json({ user, identity });
@@ -1610,43 +1760,65 @@ app.put('/api/v1/users/me', authenticate, (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Update USER.md file
-  const lines = (fs.existsSync(USER_MD_PATH) ? fs.readFileSync(USER_MD_PATH, 'utf8') : '# USER.md\n\n').split('\n');
+  const { updateUserOAuthProfile } = require('./database');
 
-  for (const [key, rawValue] of Object.entries(fields)) {
-    const value = typeof rawValue === 'string' ? rawValue.trim() : rawValue;
-    const marker = `- **${key}**:`;
-    const idx = lines.findIndex(l => l.trim().startsWith(marker));
+  // Fields stored in USER.md (owner only)
+  const USER_MD_FIELDS = new Set(['Name', 'Email', 'Timezone']);
 
-    if (value === undefined || value === null || value === '') {
-      if (idx >= 0) lines.splice(idx, 1);
-      continue;
+  // Extended fields stored in profile_metadata (unlimited length, multi-line)
+  const EXTENDED_FIELDS = new Set(['Location', 'Role', 'GitHub', 'Website', 'Bio']);
+
+  if (isOwnerUser(userId)) {
+    // Owner path: store Name/Email/Timezone in USER.md only
+    const lines = (fs.existsSync(USER_MD_PATH) ? fs.readFileSync(USER_MD_PATH, 'utf8') : '# USER.md\n\n').split('\n');
+
+    for (const [key, rawValue] of Object.entries(fields)) {
+      if (!USER_MD_FIELDS.has(key)) continue; // Skip extended fields
+
+      const value = typeof rawValue === 'string' ? rawValue.trim() : rawValue;
+      const marker = `- **${key}**:`;
+      const idx = lines.findIndex(l => l.trim().startsWith(marker));
+
+      if (value === undefined || value === null || value === '') {
+        if (idx >= 0) lines.splice(idx, 1);
+        continue;
+      }
+
+      if (idx >= 0) lines[idx] = `- **${key}**: ${value}`;
+      else lines.push(`- **${key}**: ${value}`);
     }
 
-    if (idx >= 0) lines[idx] = `- **${key}**: ${value}`;
-    else lines.push(`- **${key}**: ${value}`);
+    const nextMd = `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
+    fs.writeFileSync(USER_MD_PATH, nextMd);
+    vault.identityDocs['owner'] = parseUserMd(nextMd);
+    vault.identityDocs[userId]  = { ...vault.identityDocs['owner'] };
   }
 
-  const nextMd = `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
-  fs.writeFileSync(USER_MD_PATH, nextMd);
-  vault.identityDocs['owner'] = parseUserMd(nextMd);
+  // Collect extended fields for profile_metadata (owner + non-owner)
+  const extendedMetadata = {};
+  for (const key of EXTENDED_FIELDS) {
+    if (key in fields) {
+      const value = typeof fields[key] === 'string' ? fields[key].trim() : fields[key];
+      if (value) extendedMetadata[key] = value;
+    }
+  }
 
-  // Sync to database (critical: frontend reads from DB, not USER.md)
-  const { updateUserOAuthProfile } = require('./database');
+  // Sync to database
   try {
     updateUserOAuthProfile(userId, {
-      displayName: fields.Name || fields.displayName,
-      email: fields.Email || fields.email,
-      avatarUrl: fields.AvatarUrl || fields.avatarUrl
+      displayName:     fields.Name || fields.displayName,
+      email:           fields.Email || fields.email,
+      avatarUrl:       fields.AvatarUrl || fields.avatarUrl,
+      timezone:        fields.Timezone || fields.timezone,
+      profileMetadata: Object.keys(extendedMetadata).length > 0 ? extendedMetadata : undefined,
     });
   } catch (err) {
     console.error('Failed to sync user profile to database:', err);
-    // Don't fail the request, USER.md is updated
   }
 
   // Return updated user so frontend has fresh data
-  const { getUserById } = require('./database');
-  const updatedUser = getUserById(userId);
+  const { getUserById: _getUserById } = require('./database');
+  const updatedUser = _getUserById(userId);
   res.json({
     ok: true,
     user: updatedUser
@@ -1668,7 +1840,11 @@ const avatarUpload = multer({
   }),
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith('image/')) return cb(new Error('Only image files allowed'));
+    const ALLOWED_MIMES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+    const ALLOWED_EXTS  = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+    if (!ALLOWED_MIMES.has(file.mimetype)) return cb(new Error('Only JPEG/PNG/GIF/WebP images allowed'));
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!ALLOWED_EXTS.has(ext)) return cb(new Error('File extension not allowed'));
     cb(null, true);
   },
 });
@@ -1677,6 +1853,24 @@ const avatarUpload = multer({
 app.post('/api/v1/users/me/avatar', authenticate, avatarUpload.single('avatar'), (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: 'Only master token can update avatar' });
   if (!req.file) return res.status(400).json({ error: 'No image file provided' });
+
+  // Magic bytes validation — reject files with forged extensions
+  try {
+    const buf = fs.readFileSync(req.file.path);
+    const isJpeg = buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+    const isPng  = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+    const isGif  = buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46;
+    const isWebp = buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46
+                && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50;
+    if (!isJpeg && !isPng && !isGif && !isWebp) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: 'File content does not match a supported image format' });
+    }
+  } catch (err) {
+    try { fs.unlinkSync(req.file.path); } catch (_) {}
+    return res.status(400).json({ error: 'Could not validate uploaded file' });
+  }
+
   const avatarUrl = `/uploads/avatars/${req.file.filename}`;
   const userId = req.user?.id;
   if (userId) {
@@ -1702,16 +1896,29 @@ const DEFAULT_EXPOSURE = {
 
 app.get('/api/v1/api_exposure', (req, res) => {
   if (!req.session || !req.session.user) return res.status(401).json({ error: 'unauthorized' });
-  let policy = DEFAULT_EXPOSURE;
-  try { if (fs.existsSync(EXPOSURE_PATH)) policy = JSON.parse(fs.readFileSync(EXPOSURE_PATH, 'utf8')); } catch(e) {}
+  const userId = req.session.user.id;
+  let allPolicies = {};
+  try { if (fs.existsSync(EXPOSURE_PATH)) allPolicies = JSON.parse(fs.readFileSync(EXPOSURE_PATH, 'utf8')); } catch(e) {}
+  // Support both legacy flat format and new per-user keyed format
+  const policy = allPolicies[userId] ?? (allPolicies.main !== undefined ? allPolicies : DEFAULT_EXPOSURE);
   res.json({ policy });
 });
 
 app.post('/api/v1/api_exposure', (req, res) => {
   if (!req.session || !req.session.user) return res.status(401).json({ error: 'unauthorized' });
+  if (!isMaster(req)) return res.status(403).json({ error: 'Only master token can update API exposure policy' });
+  const userId = req.session.user.id;
   const policy = req.body || {};
+  let allPolicies = {};
+  try { if (fs.existsSync(EXPOSURE_PATH)) allPolicies = JSON.parse(fs.readFileSync(EXPOSURE_PATH, 'utf8')); } catch(e) {}
+  // Migrate legacy flat format on first write with per-user keying
+  if (allPolicies.main !== undefined && !allPolicies[userId]) {
+    // preserve legacy data under a special key, don't overwrite other users
+    allPolicies = {};
+  }
+  allPolicies[userId] = policy;
   fs.mkdirSync(path.dirname(EXPOSURE_PATH), { recursive: true });
-  fs.writeFileSync(EXPOSURE_PATH, JSON.stringify(policy, null, 2));
+  fs.writeFileSync(EXPOSURE_PATH, JSON.stringify(allPolicies, null, 2));
   res.json({ ok: true, policy });
 });
 
@@ -1898,7 +2105,10 @@ function checkDbIntegrity() {
   try {
     const tokens = db.prepare("SELECT id, owner_id, scope, label, created_at FROM access_tokens WHERE revoked_at IS NULL").all();
     const hash = require('crypto').createHash('sha256').update(JSON.stringify(tokens)).digest('hex');
-    const integrityFile = path.join(__dirname, '.db_integrity');
+    // Store alongside the DB file (volume-mounted) so it survives container redeploys.
+    // Storing inside the image (__dirname) caused a false-positive warning on every deploy.
+    const dbDir = path.dirname(process.env.DB_PATH || path.join(__dirname, 'data', 'myapi.db'));
+    const integrityFile = path.join(dbDir, '.db_integrity');
     if (fs.existsSync(integrityFile)) {
       const lastHash = fs.readFileSync(integrityFile, 'utf8').trim();
       if (lastHash !== hash) {
@@ -1934,6 +2144,71 @@ const createSkillsRoutes = require('./routes/skills');
 const newAuthRoutes = require('./routes/auth');
 
 app.use('/api/v1/auth', newAuthRoutes);
+
+// AFP binary downloads — public, no auth (must be BEFORE the authRoutes catch-all below)
+{
+  // In Docker the src/ contents live at /app/ directly; connectors are at /app/afp-dist (copied in).
+  // In dev the project root is one level up from __dirname (src/).
+  const AFP_DIST = fs.existsSync(path.join(__dirname, 'afp-dist'))
+    ? path.join(__dirname, 'afp-dist')
+    : path.join(__dirname, '..', 'connectors', 'afp-daemon', 'dist');
+  const AFP_PLATFORMS = {
+    linux:     { file: 'afp-daemon-linux',       mime: 'application/octet-stream' },
+    mac:       { file: 'afp-daemon-macos-x64',   mime: 'application/octet-stream' },
+    'mac-arm': { file: 'afp-daemon-macos-arm64', mime: 'application/octet-stream' },
+    win:       { file: 'afp-daemon-win-x64.exe', mime: 'application/vnd.microsoft.portable-executable' },
+  };
+  app.get('/api/v1/afp/download/:platform', (req, res) => {
+    const meta = AFP_PLATFORMS[req.params.platform];
+    if (!meta) return res.status(400).json({ error: 'Unknown platform. Use: linux, mac, mac-arm, win' });
+    const filePath = path.join(AFP_DIST, meta.file);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Binary not yet built', hint: 'cd connectors/afp-daemon && npm run build' });
+    res.setHeader('Content-Disposition', `attachment; filename="${meta.file}"`);
+    res.setHeader('Content-Type', meta.mime);
+    res.sendFile(filePath);
+  });
+  app.get('/api/v1/afp/download-info', (req, res) => {
+    const platforms = Object.entries(AFP_PLATFORMS).map(([platform, meta]) => {
+      const filePath = path.join(AFP_DIST, meta.file);
+      let size = null;
+      try { size = fs.statSync(filePath).size; } catch (_) {}
+      return { platform, filename: meta.file, available: size !== null, size };
+    });
+    res.json({ ok: true, platforms });
+  });
+}
+
+// AFP OAuth binary downloads — public, no auth
+{
+  const AFP_OAUTH_DIST = fs.existsSync(path.join(__dirname, 'afp-oauth-dist'))
+    ? path.join(__dirname, 'afp-oauth-dist')
+    : path.join(__dirname, '..', 'connectors', 'afp-oauth', 'dist');
+  const AFP_OAUTH_PLATFORMS = {
+    linux:     { file: 'afp-oauth-linux',   mime: 'application/octet-stream' },
+    mac:       { file: 'afp-oauth-mac-x64', mime: 'application/octet-stream' },
+    'mac-arm': { file: 'afp-oauth-mac-arm', mime: 'application/octet-stream' },
+    win:       { file: 'afp-oauth-win.exe', mime: 'application/vnd.microsoft.portable-executable' },
+  };
+  app.get('/api/v1/afp/download-oauth/:platform', (req, res) => {
+    const meta = AFP_OAUTH_PLATFORMS[req.params.platform];
+    if (!meta) return res.status(400).json({ error: 'Unknown platform. Use: linux, mac, mac-arm, win' });
+    const filePath = path.join(AFP_OAUTH_DIST, meta.file);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Binary not yet built', hint: 'cd connectors/afp-oauth && npm run build' });
+    res.setHeader('Content-Disposition', `attachment; filename="${meta.file}"`);
+    res.setHeader('Content-Type', meta.mime);
+    res.sendFile(filePath);
+  });
+  app.get('/api/v1/afp/download-oauth-info', (req, res) => {
+    const platforms = Object.entries(AFP_OAUTH_PLATFORMS).map(([platform, meta]) => {
+      const filePath = path.join(AFP_OAUTH_DIST, meta.file);
+      let size = null;
+      try { size = fs.statSync(filePath).size; } catch (_) {}
+      return { platform, filename: meta.file, available: size !== null, size };
+    });
+    res.json({ ok: true, platforms });
+  });
+}
+
 app.use('/api/v1', authRoutes);
 app.use('/api/v1/devices', authenticate, deviceRoutes);
 // Device approval is now applied globally in the authenticate middleware
@@ -1978,6 +2253,10 @@ app.use('/api/v1/skills', authenticate, createSkillsRoutes(
   createSkill,
   getSkills,
   getSkillById,
+  getSkillBySlug,
+  getSkillsByIds,
+  getSkillsBySlugList,
+  suggestSkills,
   updateSkill,
   deleteSkill,
   updateSkillOrigin,
@@ -1996,7 +2275,53 @@ app.use('/api/v1/skills', authenticate, createSkillsRoutes(
   getSkillOwnershipClaims
 ));
 
-function authenticate(req, res, next) {
+// In-memory cache for validated Bearer tokens: rawToken → { tokenMeta, expiresAt }
+// Avoids repeating bcrypt.compareSync (85ms each) on every request.
+const _tokenCache = new Map();
+const TOKEN_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+function _getCachedToken(rawToken) {
+  const entry = _tokenCache.get(rawToken);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _tokenCache.delete(rawToken); return null; }
+  return entry.tokenMeta;
+}
+
+function _setCachedToken(rawToken, tokenMeta) {
+  // Evict old entries if cache gets large
+  if (_tokenCache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of _tokenCache) { if (now > v.expiresAt) _tokenCache.delete(k); }
+  }
+  _tokenCache.set(rawToken, { tokenMeta, expiresAt: Date.now() + TOKEN_CACHE_TTL_MS });
+}
+
+function _invalidateCachedToken(rawToken) {
+  if (rawToken) _tokenCache.delete(rawToken);
+}
+
+// ── TOTP replay protection (Issue #17) ──────────────────────────────────────
+// Tracks recently used TOTP codes per user to prevent same-code replay attacks.
+// TTL of 90s covers window:2 (±60s) with buffer.
+const usedTotpCodes = new Map(); // key: `${userId}:${code}` → expiresAt
+const TOTP_CODE_TTL_MS = 90_000;
+
+function isTotpCodeUsed(userId, code) {
+  const key = `${userId}:${code}`;
+  const exp = usedTotpCodes.get(key);
+  if (!exp) return false;
+  if (Date.now() > exp) { usedTotpCodes.delete(key); return false; }
+  return true;
+}
+
+function markTotpCodeUsed(userId, code) {
+  const now = Date.now();
+  // Evict expired entries before adding a new one
+  for (const [k, exp] of usedTotpCodes) { if (now > exp) usedTotpCodes.delete(k); }
+  usedTotpCodes.set(`${userId}:${code}`, now + TOTP_CODE_TTL_MS);
+}
+
+async function authenticate(req, res, next) {
   // SKIP authentication for public endpoints (OAuth authorize/callback, login signup)
   const fullPath = req.baseUrl + req.path;
   const publicPaths = [
@@ -2011,6 +2336,10 @@ function authenticate(req, res, next) {
     /^\/api\/v1\/billing\/plans/,
     /^\/oauth\//,
     /^\/api\/v1\/handshakes\/[^/]+\/status$/,  // public: AI agents poll handshake status
+    /^\/api\/v1\/afp\/download/,              // public: AFP daemon binary downloads
+    /^\/api\/v1\/agentic\/device\/token$/,    // public: AI agent polls for token (no prior token available)
+    /^\/api\/v1\/agent-auth\/install\.js$/,   // public: OAuth installer script download
+    /^\/api\/v1\/agent-guide$/,              // public: AI agent capabilities + connection guide
   ];
 
   // Allow DELETE on invitations if email query param is provided (for email-based revocation without login)
@@ -2043,6 +2372,31 @@ function authenticate(req, res, next) {
       req.workspaceId = req.session.currentWorkspace;
     }
 
+    // Auto-approve the user's own device fingerprint whenever they authenticate via session.
+    // This ensures that when their session later expires and they fall back to Bearer-only mode,
+    // their device is already in approved_devices and they don't hit the device approval gate.
+    // We do this silently and without blocking — any error must never affect the request.
+    try {
+      const userId = String(req.session.user.id);
+      const fingerprint = DeviceFingerprint.fromRequest(req);
+      const existing = getApprovedDeviceByHash(userId, fingerprint.fingerprintHash);
+      if (!existing) {
+        // Find any active master token for this user to associate the device with
+        const masterToken = getAccessTokens().find(t =>
+          !t.revokedAt && t.ownerId === userId && t.scope === 'full'
+        );
+        if (masterToken) {
+          createApprovedDevice(
+            masterToken.tokenId, userId,
+            fingerprint.fingerprintHash,
+            'Dashboard (auto-approved)',
+            fingerprint.summary,
+            fingerprint.fingerprint.ipAddress
+          );
+        }
+      }
+    } catch (_) { /* never block the request */ }
+
     // SKIP device approval entirely for session auth.
     // Browsers don't have "devices" in the master-token sense; they have sessions.
     // Device approval is only for API token/agent access.
@@ -2058,42 +2412,58 @@ function authenticate(req, res, next) {
 
   if (parts.length === 2 && parts[0] === "Bearer") {
     rawToken = parts[1];
-  } else if (req.query.token) {
-    rawToken = req.query.token;
-  } else if (req.query.api_key) {
-    rawToken = req.query.api_key;
   }
 
   if (!rawToken) {
     console.warn('[AUTH 401] missing token/session', { method: req.method, fullPath, baseUrl: req.baseUrl, path: req.path, isPublicPath });
+    try {
+      createComplianceAuditLog(
+        req.headers['x-workspace-id'] || 'system', null,
+        'auth_failed', 'token', null, JSON.stringify({ reason: 'missing_token', path: req.path }),
+        req.ip, req.get('user-agent')
+      );
+    } catch (_) {}
     return res.status(401).json({ error: "Missing session, Authorization: Bearer token, or ?token= query parameter" });
   }
-  let tokens;
-  try {
-    tokens = getAccessTokens();
-  } catch (dbError) {
-    console.error('[AUTH] Database error while fetching tokens:', dbError.message);
-    return res.status(500).json({ error: "Internal server error", message: "Service temporarily unavailable" });
-  }
-  let matched = null;
-  for (const tokenMeta of tokens) {
-    // Check that token is not revoked, not expired, and hash matches
-    if (!tokenMeta.revokedAt && tokenMeta.hash && bcrypt.compareSync(rawToken, tokenMeta.hash)) {
-      // Check expiration: if expiresAt is set and is in the past, reject the token
-      if (tokenMeta.expiresAt) {
-        const expiryTime = new Date(tokenMeta.expiresAt);
-        const now = new Date();
-        if (expiryTime <= now) {
-          console.warn('[AUTH] Token has expired', { tokenId: tokenMeta.tokenId, expiresAt: tokenMeta.expiresAt });
-          continue; // Skip this expired token
-        }
-      }
-      matched = tokenMeta;
-      break;
+  // Fast path: check in-memory cache before doing bcrypt scan
+  let matched = _getCachedToken(rawToken);
+
+  if (!matched) {
+    let tokens;
+    try {
+      tokens = getAccessTokens();
+    } catch (dbError) {
+      console.error('[AUTH] Database error while fetching tokens:', dbError.message);
+      return res.status(500).json({ error: "Internal server error", message: "Service temporarily unavailable" });
     }
+    for (const tokenMeta of tokens) {
+      // Check that token is not revoked, not expired, and hash matches
+      if (!tokenMeta.revokedAt && tokenMeta.hash && await bcrypt.compare(rawToken, tokenMeta.hash).catch(() => false)) {
+        // Check expiration: if expiresAt is set and is in the past, reject the token
+        if (tokenMeta.expiresAt) {
+          const expiryTime = new Date(tokenMeta.expiresAt);
+          const now = new Date();
+          if (expiryTime <= now) {
+            console.warn('[AUTH] Token has expired', { tokenId: tokenMeta.tokenId, expiresAt: tokenMeta.expiresAt });
+            continue; // Skip this expired token
+          }
+        }
+        matched = tokenMeta;
+        break;
+      }
+    }
+    if (matched) _setCachedToken(rawToken, matched);
   }
+
   if (!matched) {
     createAuditLog({ requesterId: "unknown", action: "auth_fail", resource: req.path, ip: req.ip });
+    try {
+      createComplianceAuditLog(
+        req.headers['x-workspace-id'] || 'system', null,
+        'auth_failed', 'token', null, null,
+        req.ip, req.get('user-agent')
+      );
+    } catch (_) {}
     return res.status(401).json({ error: "Invalid or revoked token" });
   }
   req.tokenMeta = matched;
@@ -2111,15 +2481,21 @@ function authenticate(req, res, next) {
   // For Bearer tokens (agents/APIs), enforce device approval.
   // This adds a layer of security: even if a master token is leaked, the attacker
   // still needs to approve the device fingerprint before accessing protected APIs.
-  // Exceptions: auth setup routes, device management, OAuth flows, user management (already protected by requirePowerUser),
-  // and read-only activity don't require approval.
+  // Exceptions (below) are routes that can't use device approval (OAuth bootstrap,
+  // device-management itself, etc.) or that only return non-sensitive metadata.
+  // NOTE: Session-authenticated requests are already bypassed by deviceApprovalMiddleware
+  // itself, so we only need to skip here for Bearer-token paths that legitimately can't
+  // be gated. DO NOT add identity-returning endpoints (/users, /identity) to this list —
+  // that was the source of a past security issue where scoped tokens reached user
+  // identity data from unapproved devices.
   // Use req.baseUrl to get the full path (req.path is relative to mount point)
   const routePath = req.baseUrl + req.path;
-  const skipDeviceApproval = routePath.startsWith('/api/v1/auth/') ||
+  const skipDeviceApproval = (routePath.startsWith('/api/v1/auth/') && routePath !== '/api/v1/auth/me') ||
                              routePath.startsWith('/api/v1/devices') ||
                              routePath.startsWith('/api/v1/oauth/') ||
-                             routePath.startsWith('/api/v1/users') ||
-                             routePath.startsWith('/api/v1/billing') ||
+                             routePath.startsWith('/api/v1/billing') ||      // workspace plan/usage metadata only
+                             routePath.startsWith('/api/v1/dashboard') ||    // dashboard metrics, session-authed in practice
+                             routePath.startsWith('/api/v1/agentic/') ||     // Device Flow + ASC bootstrap (have own auth)
                              (routePath.startsWith('/api/v1/activity') && req.method === 'GET');
 
   if (skipDeviceApproval) {
@@ -2185,6 +2561,10 @@ app.use('/api/v1/email', authenticate, emailRoutes);
 app.use('/api/v1/workspaces', authenticate, workspacesRoutes);
 app.use('/api/v1/invitations', authenticate, invitationsRoutes);
 
+// Waitlist: public POST (email capture), admin-gated list/invite/notify-launch.
+const createWaitlistRoutes = require('./routes/waitlist');
+app.use('/api/v1/waitlist', createWaitlistRoutes({ isMaster, authenticate }));
+
 // Mount management routes (audit, tokens, etc)
 // Note: Management routes require authentication but have their own permission checks
 const auditLogService = {
@@ -2212,8 +2592,8 @@ app.get('/api/v1/manage/audit/agents', authenticate, (req, res) => {
       let agentName = 'Unknown';
       let agentType = 'browser';
 
-      if (userAgent.includes('Jarvis') || userAgent.includes('MyApi')) {
-        agentName = 'MyApi Assistant';
+      if (userAgent.includes('Jarvis')) {
+        agentName = 'Jarvis';
         agentType = 'ai';
       } else if (userAgent.includes('OpenClaw')) {
         agentName = 'OpenClaw';
@@ -2260,9 +2640,24 @@ const exportRoutes = require('./routes/export');
 const importRoutes = require('./routes/import');
 const createVaultInstructionsRoutes = require('./routes/vault-instructions');
 
-app.use('/api/v1/export', authenticate, exportRoutes);
+// Export dumps entire user state (tokens, personas, skills, KB, OAuth metadata).
+// Guard: only master tokens and dashboard sessions may export. Guest/scoped
+// tokens never reach this — otherwise a narrow token could exfiltrate the
+// full account via the export bundle.
+app.use('/api/v1/export', authenticate, (req, res, next) => {
+  const meta = req.tokenMeta || {};
+  const isSession = String(meta.tokenId || '').startsWith('sess_') || Boolean(req.session?.user);
+  const isMasterTok = meta.scope === 'full' || meta.tokenType === 'master';
+  if (isSession || isMasterTok) return next();
+  return res.status(403).json({ error: 'Export requires a master token or dashboard session' });
+}, exportRoutes);
 app.use('/api/v1/import', authenticate, importRoutes);
 app.use('/api/v1/vault', authenticate, createVaultInstructionsRoutes(db, null, createAuditLog));
+
+// AFP (API File Protocol) — PC filesystem/exec connector
+const afpRoutes = require('./routes/afp');
+
+app.use('/api/v1/afp', authenticate, afpRoutes);
 
 // FAL Image Generation API
 const falImagesRoutes = require('./routes/fal-images');
@@ -2272,8 +2667,236 @@ app.use('/api/v1/fal', authenticate, falImagesRoutes);
 const oauthServerRoutes = require('./routes/oauth-server');
 app.use('/api/v1/oauth-server', oauthServerRoutes);
 
+const agenticRoutes = require('./routes/agentic');
+app.use('/api/v1/agentic', authenticate, agenticRoutes);
+
+// ─── Public: Agent Auth installer script ──────────────────────────────────────
+// Serve the zero-dependency OAuth PKCE installer so agents/users can run:
+//   curl -sL https://www.myapiai.com/api/v1/agent-auth/install.js | node
+// Path works both locally (src/index.js → ../connectors/) and in container (index.js → connectors/)
+const _connectorBase = require('fs').existsSync(require('path').join(__dirname, 'connectors')) ? __dirname : require('path').join(__dirname, '..');
+const agentAuthScript = require('path').join(_connectorBase, 'connectors/agent-auth/index.js');
+app.get('/api/v1/agent-auth/install.js', (req, res) => {
+  const fs = require('fs');
+  if (!fs.existsSync(agentAuthScript)) {
+    return res.status(404).send('// installer not found');
+  }
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.send(fs.readFileSync(agentAuthScript, 'utf8'));
+});
+
+// ─── Public: Agent connection guide ──────────────────────────────────────────
+// Fetched by AI agents (via the onboarding starter prompt) to learn about
+// MyApi's capabilities and the three connection methods.
+app.get('/api/v1/agent-guide', (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache');
+  res.json({
+    api: 'MyApi — Agent Connection Guide',
+    version: '1.1',
+    base_url: 'https://www.myapiai.com',
+    base_url_warning: 'Use https://www.myapiai.com as the base URL — do NOT append /api/v1. All paths in this guide already include /api/v1. Example: correct = https://www.myapiai.com/api/v1/skills, wrong = https://www.myapiai.com/api/v1/api/v1/skills.',
+
+    headline: 'MyApi gives AI agents secure, scoped access to a user\'s identity, memory, documents, tools, and action history.',
+
+    description: 'MyApi is a personal context and control-plane API. It lets AI agents read who the user is, what they know, and what tools they have connected — and act on their behalf across 45+ services. Instead of re-explaining context every conversation, agents query MyApi once and have everything they need. Every action is logged, every token is revocable.',
+
+    mental_model: {
+      summary: 'Five distinct layers — understand these before making your first call.',
+      layers: {
+        identity: 'Who the user is: name, role, bio, timezone, location, preferences. Read from GET /api/v1/users/me. Start here.',
+        memory: 'Short, durable facts the user wants every agent to know — recurring context that should survive across sessions. Read/write via GET|POST /api/v1/memory.',
+        knowledge_base: 'Long-form documents, SOPs, notes, and files the user has uploaded. Full-text searchable. Read via GET /api/v1/brain/knowledge-base. Distinct from memory: documents are rich and queryable, memory entries are concise key facts.',
+        personas: 'Named behavioural overlays — each persona has a SOUL.md personality file and a scoped knowledge base. Agents can adopt a persona to shift tone, role, and context. Read via GET /api/v1/personas.',
+        services: 'Connected action surfaces: GitHub, Google, Slack, Discord, Notion, Linear, and 40+ more. Agents can read data and trigger actions through these integrations after the user grants access.',
+      },
+    },
+
+    concrete_example: 'An agent loads the user\'s identity (timezone, role), activates their "Work" persona, reads the product brief from the knowledge base, checks open GitHub issues, and drafts a Slack update — all traced in the audit log under the agent\'s named token.',
+
+    quickstart: {
+      summary: 'Five calls to go from zero to fully oriented. Run these in order after connecting.',
+      steps: [
+        {
+          step: 1,
+          label: 'Verify your token works',
+          method: 'GET',
+          path: '/api/v1/auth/me',
+          note: 'Returns your token metadata and scope. If this 401s, your token is wrong or expired.',
+        },
+        {
+          step: 2,
+          label: 'Load the user\'s identity',
+          method: 'GET',
+          path: '/api/v1/users/me',
+          note: 'Returns name, role, bio, timezone, location, preferences. Ground all future responses in this data.',
+        },
+        {
+          step: 3,
+          label: 'Read persistent memory',
+          method: 'GET',
+          path: '/api/v1/memory',
+          note: 'Short facts the user wants every agent to carry. Check this before asking the user questions they\'ve already answered.',
+        },
+        {
+          step: 4,
+          label: 'Browse the knowledge base',
+          method: 'GET',
+          path: '/api/v1/brain/knowledge-base',
+          note: 'Lists uploaded documents and SOPs. Use GET /api/v1/brain/knowledge-base/:id to read a specific document.',
+        },
+        {
+          step: 5,
+          label: 'Check available personas',
+          method: 'GET',
+          path: '/api/v1/personas',
+          note: 'Lists named personas with their SOUL.md content. Ask the user which one to activate if multiple exist.',
+        },
+        {
+          step: 6,
+          label: 'Discover connected services (optional)',
+          method: 'GET',
+          path: '/api/v1/services',
+          note: 'Lists which external services (GitHub, Google, Slack, etc.) the user has connected. Use this to know which action surfaces are available before attempting service calls.',
+        },
+        {
+          step: 7,
+          label: 'List available skills (optional)',
+          method: 'GET',
+          path: '/api/v1/skills',
+          note: 'Lists all skills configured for this account. Each skill has a name, description, and optional script. Requires skills:read scope.',
+        },
+      ],
+    },
+
+    connection_methods: [
+      {
+        id: 'device_flow',
+        name: 'OAuth Device Flow',
+        recommended: true,
+        summary: 'RFC 8628 browser-approval flow. The agent requests a short user code, the user approves it in the dashboard, and the agent receives its own dedicated scoped token.',
+        pros: [
+          'Each agent gets its own named token — full per-agent audit trail',
+          'User explicitly approves each agent in the browser — no blind trust',
+          'Tokens can be scoped to read-only or specific resources',
+          'Revoke one agent token without affecting others',
+        ],
+        cons: [
+          'Requires the user to open a browser tab once to approve',
+          'Approval window is 15 minutes — agent must poll until approved',
+        ],
+        best_for: 'Most users. Secure, auditable, and the recommended default.',
+        setup: {
+          quick_start: 'curl -sL https://www.myapiai.com/api/v1/agent-auth/install.js | node',
+          quick_start_note: 'Runs the full device flow automatically and prints a ready-to-use Bearer token.',
+          manual_steps: [
+            'Step 1 — Request a device code:',
+            '  POST /api/v1/agentic/device/authorize',
+            '  Body: { "label": "My Claude Agent", "scope": "full" }',
+            '  Response: { "device_code": "...", "user_code": "ABCD-1234", "verification_uri_complete": "https://...", "expires_in": 900 }',
+            '',
+            'Step 2 — Show the user_code to the user and ask them to visit verification_uri_complete.',
+            '  Approval page: https://www.myapiai.com/dashboard/activate',
+            '',
+            'Step 3 — Poll for the token every 5 seconds:',
+            '  POST /api/v1/agentic/device/token',
+            '  Body: { "device_code": "..." }',
+            '  Returns 428 while pending, 400 if denied, 200 with access_token when approved.',
+            '',
+            'Step 4 — Use the token:',
+            '  Authorization: Bearer <access_token>',
+          ],
+        },
+      },
+      {
+        id: 'master_token',
+        name: 'Master Token',
+        recommended: false,
+        summary: 'A single long-lived bearer token with full API access. Generated automatically when the account was created. Find it in the dashboard under Access Tokens.',
+        pros: [
+          'Zero setup — token already exists in the dashboard',
+          'Full read/write access to all resources',
+          'Works immediately with any HTTP client',
+        ],
+        cons: [
+          'One token shared across all agents — no per-agent identity in audit logs',
+          'Compromising the token compromises everything',
+          'Cannot be scoped to read-only or a subset of resources',
+        ],
+        best_for: 'Quick local experiments or personal single-agent setups where auditability is not a concern.',
+        setup: {
+          steps: [
+            'Step 1 — Log in at https://www.myapiai.com/dashboard/',
+            'Step 2 — Go to Access Tokens — the Master Token is listed at the top.',
+            'Step 3 — Copy it and set the header on every request:',
+            '  Authorization: Bearer <your_master_token>',
+          ],
+          dashboard_url: 'https://www.myapiai.com/dashboard/access-tokens',
+        },
+      },
+      {
+        id: 'asc_keypair',
+        name: 'ASC — Agentic Secure Connection (Ed25519 Keypair)',
+        recommended: false,
+        summary: 'Cryptographic keypair auth. The agent generates an Ed25519 keypair, registers the public key once with user approval, then signs every request. The private key never leaves the agent.',
+        pros: [
+          'Private key is never transmitted — strongest security posture',
+          'Every request is individually signed — cryptographic non-repudiation',
+          'Replay protection via timestamp window (±60 seconds)',
+          'Revoke a single key without affecting other agents',
+        ],
+        cons: [
+          'Agent must implement Ed25519 request signing',
+          'Initial key registration requires one-time user approval in the dashboard',
+          'Requires accurate system clock (±60 seconds)',
+        ],
+        best_for: 'Production agents or automated pipelines where cryptographic proof of origin is required.',
+        setup: {
+          steps: [
+            'Step 1 — Generate an Ed25519 keypair (save the private key securely):',
+            '  const { privateKey, publicKey } = crypto.generateKeyPairSync("ed25519");',
+            '  const pubKeyB64 = publicKey.export({ type: "spki", format: "der" }).toString("base64");',
+            '',
+            'Step 2 — Register the public key:',
+            '  POST /api/v1/agentic/asc/register',
+            '  Body: { "public_key": "<pubKeyB64>", "label": "My Agent" }',
+            '  Response: { "status": "pending_approval", "key_fingerprint": "..." }',
+            '',
+            'Step 3 — User approves the fingerprint at:',
+            '  https://www.myapiai.com/dashboard/devices',
+            '',
+            'Step 4 — Sign every API request with three headers:',
+            '  X-Agent-PublicKey: <pubKeyB64>',
+            '  X-Agent-Timestamp: <unix_seconds>',
+            '  X-Agent-Signature: base64( Ed25519Sign(privateKey, "<timestamp>:<token_id>") )',
+            '',
+            'Step 5 — Server verifies the signature and timestamp freshness. Request proceeds if both pass.',
+          ],
+        },
+      },
+    ],
+
+    api_reference: 'https://www.myapiai.com/dashboard/docs',
+    support: 'https://www.myapiai.com/dashboard/',
+  });
+});
+
 const createGoogleRoutes = require('./routes/google');
 app.use('/api/v1/google', createGoogleRoutes());
+
+// --- PUBLIC: RUNTIME CONFIG (no auth required) ---
+// Landing page + signup flows read this to decide whether to render the
+// "Now in Beta" chrome and whether to swap signup for the waitlist form.
+// Cache 30s so a BETA flag flip propagates within half a minute.
+app.get('/api/v1/config/public', (req, res) => {
+  try {
+    res.set('Cache-Control', 'public, max-age=30');
+    return res.json({ data: betaMode.getBetaStatus() });
+  } catch (err) {
+    console.error('[Config] public config error:', err);
+    return res.json({ data: { beta: true, betaFull: false, betaMaxUsers: 50 } });
+  }
+});
 
 // --- PUBLIC: BILLING PLANS ENDPOINT (no auth required) ---
 app.get('/api/v1/billing/plans', (req, res) => {
@@ -2289,9 +2912,15 @@ app.get('/api/v1/billing/plans', (req, res) => {
     `);
     const dbPlans = stmt.all();
 
+    const betaActive = betaMode.isBetaMode();
+    const annotate = (plan) => ({
+      ...plan,
+      beta_locked: betaActive && String(plan.id).toLowerCase() !== 'free',
+    });
+
     if (dbPlans && dbPlans.length > 0) {
       // Transform database plans to frontend format
-      const plans = dbPlans.map(plan => ({
+      const plans = dbPlans.map(plan => annotate({
         id: plan.id,
         name: plan.name,
         price_cents: plan.price_cents,
@@ -2308,7 +2937,7 @@ app.get('/api/v1/billing/plans', (req, res) => {
     }
 
     // Fallback to hardcoded plans if database is empty
-    const plans = Object.values(BILLING_PLANS).map(plan => ({
+    const plans = Object.values(BILLING_PLANS).map(plan => annotate({
       id: plan.id,
       name: plan.name,
       price_cents: plan.price_cents,
@@ -2325,6 +2954,7 @@ app.get('/api/v1/billing/plans', (req, res) => {
   } catch (err) {
     console.error('[Billing] Error fetching plans:', err);
     // Return hardcoded plans as fallback
+    const betaActive = betaMode.isBetaMode();
     const plans = Object.values(BILLING_PLANS).map(plan => ({
       id: plan.id,
       name: plan.name,
@@ -2336,7 +2966,8 @@ app.get('/api/v1/billing/plans', (req, res) => {
       maxServices: plan.maxServices,
       maxTeamMembers: plan.maxTeamMembers,
       maxSkillsPerPersona: plan.maxSkillsPerPersona,
-      stripe_product_id: plan.stripe_product_id
+      stripe_product_id: plan.stripe_product_id,
+      beta_locked: betaActive && String(plan.id).toLowerCase() !== 'free',
     }));
     res.json({ data: plans });
   }
@@ -2384,7 +3015,9 @@ app.post('/api/v1/workspace-switch/:workspaceId', authenticate, switchWorkspaceH
 app.use('/api/v1', authenticate, createAuditSecurityRouter({ sessionDb, sessionStore }));
 
 function getRequestOwnerId(req) {
-  return String(req?.tokenMeta?.ownerId || req?.session?.user?.id || 'owner');
+  const id = req?.tokenMeta?.ownerId || req?.session?.user?.id;
+  if (!id) console.warn('[auth] getRequestOwnerId: no user context, falling back to owner');
+  return String(id || 'owner');
 }
 
 function inferMemorySource(req) {
@@ -2392,7 +3025,7 @@ function inferMemorySource(req) {
   if (!label || isMaster(req) && !label) return 'user';
   if (label.includes('chatgpt') || label.includes('openai') || label.includes('gpt')) return 'chatgpt';
   if (label.includes('claude') || label.includes('anthropic')) return 'claude';
-  if (label.includes('jarvis') || label.includes('myapi')) return 'myapi';
+  if (label.includes('jarvis')) return 'jarvis';
   if (label.includes('gemini') || label.includes('google ai')) return 'gemini';
   if (label.includes('copilot') || label.includes('github')) return 'github copilot';
   if (isMaster(req)) return 'user';
@@ -2447,6 +3080,19 @@ function getOwnerEmailFromUserDoc() {
   }
 }
 
+function isOwnerUser(userId) {
+  if (!userId) return false;
+  if (userId === 'owner') return true;
+  try {
+    const ownerEmail = String(
+      process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || getOwnerEmailFromUserDoc() || ''
+    ).trim().toLowerCase();
+    if (!ownerEmail) return false;
+    const user = getUserById(userId);
+    return String(user?.email || '').toLowerCase() === ownerEmail;
+  } catch (_) { return false; }
+}
+
 function requirePowerUser(req, res) {
   const configuredEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || getOwnerEmailFromUserDoc() || '').trim().toLowerCase();
   if (!configuredEmail) {
@@ -2456,10 +3102,6 @@ function requirePowerUser(req, res) {
 
   let email = String(req?.session?.user?.email || req?.user?.email || '').toLowerCase();
   if (!email && req?.tokenMeta?.ownerId) {
-    // Special case: tokens with owner_id = 'owner' are admin tokens (legacy support)
-    if (req.tokenMeta.ownerId === 'owner') {
-      return true;
-    }
     const tokenOwnerUser = getUserById(req.tokenMeta.ownerId);
     email = String(tokenOwnerUser?.email || '').toLowerCase();
   }
@@ -2820,6 +3462,65 @@ function buildCapabilitiesForRequest(req) {
     });
   }
 
+  const canReadSkills = isMaster(req) || hasPermission(scopes, ['skills:read']) || hasPermission(scopes, ['skills:write']) || hasPermission(scopes, ['admin:*']);
+  const canWriteSkills = isMaster(req) || hasPermission(scopes, ['skills:write']) || hasPermission(scopes, ['admin:*']);
+
+  if (canReadSkills) {
+    endpoints.push({
+      purpose: 'List all skills for this account',
+      method: 'GET',
+      url: '/api/v1/skills',
+      params: [{ in: 'query', name: 'include_archived', required: false, type: 'boolean' }],
+      sampleRequest: { method: 'GET', headers: [...auth.requiredHeaders] },
+      sampleResponse: { skills: [{ id: 'skill_x', name: 'My Skill', description: '...', active: true }] },
+      commonErrors: [{ status: 403, error: "Requires 'skills:read' scope" }],
+    });
+    endpoints.push({
+      purpose: 'Get details of a specific skill',
+      method: 'GET',
+      url: '/api/v1/skills/:id',
+      params: [],
+      sampleRequest: { method: 'GET', headers: [...auth.requiredHeaders] },
+      sampleResponse: { skill: { id: 'skill_x', name: 'My Skill', description: '...' } },
+      commonErrors: [{ status: 404, error: 'Skill not found' }],
+    });
+  }
+
+  if (canWriteSkills) {
+    endpoints.push({
+      purpose: 'Create a new skill',
+      method: 'POST',
+      url: '/api/v1/skills',
+      params: [
+        { in: 'body', name: 'name', required: true, type: 'string' },
+        { in: 'body', name: 'description', required: false, type: 'string' },
+        { in: 'body', name: 'script_content', required: false, type: 'string' },
+        { in: 'body', name: 'category', required: false, type: 'string' },
+      ],
+      sampleRequest: { method: 'POST', headers: [...auth.requiredHeaders, 'Content-Type: application/json'], body: { name: 'My Skill', description: 'Does something useful' } },
+      sampleResponse: { skill: { id: 'skill_x', name: 'My Skill' } },
+      commonErrors: [{ status: 400, error: 'Name is required' }],
+    });
+    endpoints.push({
+      purpose: 'Update an existing skill',
+      method: 'PUT',
+      url: '/api/v1/skills/:id',
+      params: [{ in: 'body', name: 'name', required: false, type: 'string' }, { in: 'body', name: 'description', required: false, type: 'string' }],
+      sampleRequest: { method: 'PUT', headers: [...auth.requiredHeaders, 'Content-Type: application/json'], body: { description: 'Updated description' } },
+      sampleResponse: { skill: { id: 'skill_x', name: 'My Skill', description: 'Updated description' } },
+      commonErrors: [{ status: 404, error: 'Skill not found' }],
+    });
+    endpoints.push({
+      purpose: 'Delete a skill',
+      method: 'DELETE',
+      url: '/api/v1/skills/:id',
+      params: [],
+      sampleRequest: { method: 'DELETE', headers: [...auth.requiredHeaders] },
+      sampleResponse: { success: true },
+      commonErrors: [{ status: 404, error: 'Skill not found' }],
+    });
+  }
+
   const filtered = endpoints.filter((e) => {
     if (e.url.startsWith('/api/v1/brain') && !canReadBrain) return false;
     if (e.url.startsWith('/api/v1/vault') && !canReadVault) return false;
@@ -2857,6 +3558,25 @@ function buildCapabilitiesForRequest(req) {
   };
 }
 
+// SSRF: block requests to private/loopback/link-local addresses
+const PRIVATE_RANGES = [
+  /^127\./,
+  /^10\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^169\.254\./,
+  /^0\./,
+  /^100\.64\./,
+  /^::1$/,
+  /^fc00:/i,
+  /^fd/i,
+  /^fe80:/i,
+  /^localhost$/i,
+];
+function isPrivateHost(hostname) {
+  return PRIVATE_RANGES.some(r => r.test(hostname));
+}
+
 async function discoverApiFromWebsite(websiteUrl) {
   const normalizedWebsiteUrl = parseAndValidateHttpUrl(websiteUrl);
   if (!normalizedWebsiteUrl) {
@@ -2870,6 +3590,15 @@ async function discoverApiFromWebsite(websiteUrl) {
   }
 
   const urlObj = new URL(normalizedWebsiteUrl);
+  if (isPrivateHost(urlObj.hostname)) {
+    return {
+      sourceWebsiteUrl: websiteUrl,
+      apiBaseUrl: null,
+      authScheme: 'unknown',
+      confidence: 0,
+      notes: 'blocked: private address'
+    };
+  }
   const origin = urlObj.origin;
 
   // Heuristic: If hostname starts with www., guess api.domain.com
@@ -2900,6 +3629,7 @@ async function discoverApiFromWebsite(websiteUrl) {
 
   for (const candidate of probeCandidates) {
     try {
+      if (isPrivateHost(new URL(candidate).hostname)) continue;
       const probeResp = await fetch(candidate, {
         method: 'GET',
         headers: { Accept: 'application/json' },
@@ -3058,6 +3788,10 @@ connected services, vault tokens, personas, and identity — but only with their
 
 ## Canonical Base URL
 Always use: https://${host}
+⚠️ IMPORTANT: Do NOT append /api/v1 to this base URL.
+   All endpoint paths listed below already include /api/v1.
+   Correct: https://${host}/api/v1/skills
+   Wrong:   https://${host}/api/v1/api/v1/skills  ← double-prefix bug
 Do NOT follow HTTP redirects — redirects from the bare domain strip the Authorization header
 and will cause all authenticated requests to fail with "Invalid or revoked token".
 
@@ -3093,18 +3827,74 @@ No username or extra info needed. Just two steps:
 - Never chain multiple actions without checking in with the user between each one.
 
 ## Key Endpoints
-- GET  /api/v1/                                  → API root and endpoint discovery
+All paths are relative to https://${host} — do NOT add /api/v1 to the base URL.
+
+### Start Here
+- GET  /api/v1/gateway/context                    → Full AI context in one call (persona, identity, memory, endpoints)
 - GET  /api/v1/quick-start                        → Step-by-step guide (includes handshake flow)
+- GET  /api/v1/auth/me                            → Verify token and see your token metadata
+- GET  /api/v1/users/me                           → Owner identity (name, role, bio, timezone)
+
+### Discovery
+- GET  /api/v1/                                  → API root and endpoint discovery
 - GET  /api/v1/capabilities                       → Scope-aware capability list
 - GET  /api/v1/tokens/me/capabilities             → Your token's permissions
-- GET  /api/v1/brain/knowledge-base               → Knowledge base documents
-- GET  /api/v1/vault/tokens                       → Connected service tokens
-- POST /api/v1/services/:name/proxy               → Proxy raw API request to a service
-- GET  /api/v1/personas                           → AI personas
-- GET  /api/v1/identity                           → Owner identity
 - GET  /openapi.json                              → Full OpenAPI specification
+
+### Memory & Knowledge
+- GET    /api/v1/memory                           → List persistent memory entries
+- POST   /api/v1/memory                           → Store a memory entry  { content: "..." }
+- PATCH  /api/v1/memory/:id                       → Update a memory entry
+- DELETE /api/v1/memory/:id                       → Delete one memory entry
+- GET    /api/v1/brain/knowledge-base             → List knowledge base documents
+- POST   /api/v1/brain/knowledge-base/upsert      → Create or update a KB doc by title
+- GET    /api/v1/brain/knowledge-base/:id         → Get full content of a KB document
+
+### Skills
+- GET  /api/v1/skills                             → List skills (scope: skills:read). Filter: ?slug=&category=&q=&limit=
+- GET  /api/v1/skills/suggestions?q=              → Fuzzy skill suggestions for AI discovery (no ID needed)
+- GET  /api/v1/skills/_by_slug/:slug              → Fetch skill by name/slug (preferred for AI agents)
+- GET  /api/v1/skills/_batch?slug=&id=            → Fetch multiple skills in one request (repeatable params)
+- GET  /api/v1/skills/:id                         → Get skill details + versions + forks
+- GET  /api/v1/skills/:id/content                 → Get raw SKILL.md content (JSON or Accept: text/markdown)
+- GET  /api/v1/skills/:id/skill.md                → Get SKILL.md as raw text/markdown
+- PUT  /api/v1/skills/:id/skill.md                → Set SKILL.md content (YAML frontmatter auto-sanitized)
+- POST /api/v1/skills                             → Create skill (scope: skills:write)
+- PUT  /api/v1/skills/:id                         → Update skill (scope: skills:write)
+- DELETE /api/v1/skills/:id                       → Delete skill (scope: skills:write)
+
+### Personas
+- GET  /api/v1/personas                           → List AI personas
+- GET  /api/v1/personas/:id                       → Get a specific persona
+
+### Identity & Preferences
+- GET  /api/v1/identity                           → Owner basic identity
+- GET  /api/v1/identity/professional              → Professional identity
+- GET  /api/v1/identity/availability              → Availability and timezone
+
+### Services & Vault
+- GET  /api/v1/vault/tokens                       → Connected service tokens (vault)
+- GET  /api/v1/services                           → List connected OAuth services
+- POST /api/v1/services/:name/proxy               → Proxy raw API request to a service
+- GET  /api/v1/services/google/gmail/messages     → List Gmail messages
+- GET  /api/v1/services/google/drive/files        → List Google Drive files
+- POST /api/v1/services/google/drive/upload       → Upload file to Google Drive
+
+### Access Requests (no auth required)
 - POST /api/v1/handshakes                         → Request access (no auth)
 - GET  /api/v1/handshakes/:id/status              → Poll handshake status (no auth)
+
+## AFP — PC File System Access (master token only)
+Requires a registered AFP daemon running on the target PC.
+- GET  /api/v1/afp/devices                        → List registered PCs and their online status
+- GET  /api/v1/afp/:deviceId/ls?path=<dir>        → List directory contents on the PC
+- GET  /api/v1/afp/:deviceId/read?path=<file>     → Read a file from the PC
+- POST /api/v1/afp/:deviceId/write                → Write a file to the PC  { path, content, encoding? }
+- GET  /api/v1/afp/:deviceId/stat?path=<path>     → File/directory metadata
+- POST /api/v1/afp/:deviceId/exec                 → Run a shell command on the PC  { cmd, cwd?, timeout? }
+- DELETE /api/v1/afp/:deviceId/rm                 → Delete a file or directory  { path, recursive? }
+- POST /api/v1/afp/:deviceId/mkdir                → Create a directory  { path }
+- GET  /api/v1/afp/download/:platform             → Download AFP daemon binary (linux|mac|mac-arm|win) — no auth required
 
 ## Memory (Cross-AI Persistent Context)
 Store notes that persist across all AI sessions. Any AI reading gateway/context sees these.
@@ -3324,7 +4114,18 @@ app.get('/openapi.json', (req, res) => {
           responses: { '201': { description: 'Created' } },
         },
       },
-      '/api/v1/vault/tokens/{id}/reveal': { get: { summary: 'Reveal vault token', security: [{ bearerAuth: [] }] } },
+      '/api/v1/vault/tokens/{id}/reveal': {
+        get: {
+          summary: 'Decrypt and reveal vault token value (MASTER TOKEN REQUIRED)',
+          description: 'Returns the decrypted actual token/credential value. CRITICAL: This endpoint is required to retrieve stored credentials for use. Only master token can decrypt. All access is audit-logged.',
+          security: [{ bearerAuth: [] }],
+          responses: {
+            '200': { description: 'Token decrypted successfully - check data.token for actual value' },
+            '403': { description: 'Only master token can decrypt vault tokens' },
+            '404': { description: 'Token not found' }
+          }
+        }
+      },
       '/api/v1/vault/tokens/{id}': { delete: { summary: 'Delete vault token', security: [{ bearerAuth: [] }] } },
 
       '/api/v1/tokens': { get: { summary: 'List master tokens', security: [{ bearerAuth: [] }] }, post: { summary: 'Create master token', security: [{ bearerAuth: [] }] } },
@@ -3337,10 +4138,12 @@ app.get('/openapi.json', (req, res) => {
       '/api/v1/gateway/context': { get: { summary: 'Gateway context', security: [{ bearerAuth: [] }] } },
       '/api/v1/audit/log': { get: { summary: 'Audit logs', security: [{ bearerAuth: [] }] } },
 
+      '/api/v1/users/me': { get: { summary: 'Get authenticated user identity', scope: 'identity' } },
       '/api/v1/users': { get: { summary: 'List users', security: [{ bearerAuth: [] }] }, post: { summary: 'Create user', security: [{ bearerAuth: [] }] } },
       '/api/v1/users/{id}/plan': { put: { summary: 'Update user plan', security: [{ bearerAuth: [] }] } },
 
-      '/api/v1/handshakes': { get: { summary: 'List handshakes', security: [{ bearerAuth: [] }] }, post: { summary: 'Create handshake', security: [{ bearerAuth: [] }] } },
+      '/api/v1/handshakes': { get: { summary: 'List handshakes', security: [{ bearerAuth: [] }] }, post: { summary: 'Create handshake (public for AI agents)', description: 'Submit an access request. Returns handshakeId for polling status.' } },
+      '/api/v1/handshakes/{id}/status': { get: { summary: 'Poll handshake approval status', description: 'Retrieve handshake status without authentication (public endpoint for AI agents to poll).' } },
       '/api/v1/handshakes/{id}/approve': { post: { summary: 'Approve handshake', security: [{ bearerAuth: [] }] } },
       '/api/v1/handshakes/{id}/deny': { post: { summary: 'Deny handshake', security: [{ bearerAuth: [] }] } },
       '/api/v1/handshakes/{id}': { delete: { summary: 'Revoke handshake', security: [{ bearerAuth: [] }] } },
@@ -3353,8 +4156,65 @@ app.get('/openapi.json', (req, res) => {
       '/api/v1/personas/{id}/skills': { get: { summary: 'List persona skills', security: [{ bearerAuth: [] }] }, post: { summary: 'Attach skill to persona', security: [{ bearerAuth: [] }] } },
       '/api/v1/personas/{id}/skills/{skillId}': { delete: { summary: 'Detach skill from persona', security: [{ bearerAuth: [] }] } },
 
-      '/api/v1/skills': { get: { summary: 'List skills', security: [{ bearerAuth: [] }] }, post: { summary: 'Create skill', security: [{ bearerAuth: [] }] } },
+      '/api/v1/skills': {
+        get: {
+          summary: 'List skills',
+          description: 'Returns all skills for the authenticated owner. Supports filtering via query params to avoid fetching large payloads.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'slug', in: 'query', description: 'Filter by slug (skill name, case-insensitive)', schema: { type: 'string' } },
+            { name: 'category', in: 'query', description: 'Filter by category (case-insensitive)', schema: { type: 'string' } },
+            { name: 'q', in: 'query', description: 'Full-text search across name, description, category', schema: { type: 'string' } },
+            { name: 'limit', in: 'query', description: 'Maximum number of results (1-200)', schema: { type: 'integer', minimum: 1, maximum: 200 } }
+          ],
+          responses: { '200': { description: 'Array of skills with origin metadata and slug field' } }
+        },
+        post: { summary: 'Create skill', description: 'Creates a skill. YAML frontmatter in scriptContent is automatically sanitized.', security: [{ bearerAuth: [] }] }
+      },
+      '/api/v1/skills/suggestions': {
+        get: {
+          summary: 'Skill name suggestions (AI discovery)',
+          description: 'Returns up to 10 matching skills by name/description/category. Useful for AI agents that don\'t know the exact slug.',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'q', in: 'query', required: true, description: 'Search query', schema: { type: 'string' } }],
+          responses: { '200': { description: 'List of {id, slug, name, description, category} suggestions' } }
+        }
+      },
+      '/api/v1/skills/_by_slug/{slug}': {
+        get: {
+          summary: 'Get skill by slug/name',
+          description: 'Retrieve a skill directly by its name (slug) without needing the numeric ID. Preferred for AI agent access.',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'slug', in: 'path', required: true, description: 'Skill name (case-insensitive)', schema: { type: 'string' } }],
+          responses: { '200': { description: 'Skill object' }, '404': { description: 'Not found' } }
+        }
+      },
+      '/api/v1/skills/_batch': {
+        get: {
+          summary: 'Batch fetch multiple skills',
+          description: 'Fetch multiple skills by numeric id or slug in a single request. Pass ?id=1&id=2 or ?slug=homeassistant&slug=tts.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'id', in: 'query', description: 'Skill numeric ID (repeatable)', schema: { type: 'array', items: { type: 'integer' } } },
+            { name: 'slug', in: 'query', description: 'Skill name/slug (repeatable)', schema: { type: 'array', items: { type: 'string' } } }
+          ],
+          responses: { '200': { description: 'Array of matching skills' } }
+        }
+      },
       '/api/v1/skills/{id}': { get: { summary: 'Get skill', security: [{ bearerAuth: [] }] }, put: { summary: 'Update skill', security: [{ bearerAuth: [] }] }, delete: { summary: 'Delete skill', security: [{ bearerAuth: [] }] } },
+      '/api/v1/skills/{id}/content': {
+        get: {
+          summary: 'Get skill SKILL.md content',
+          description: 'Returns the raw SKILL.md content. Accept: text/markdown returns plain text; default JSON wraps it with metadata.',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'integer' } }],
+          responses: { '200': { description: 'Skill content as JSON {id, slug, name, content} or text/markdown' } }
+        }
+      },
+      '/api/v1/skills/{id}/skill.md': {
+        get: { summary: 'Get SKILL.md raw markdown', description: 'Returns raw text/markdown of the skill content (alias for /:id/content with Accept: text/markdown).', security: [{ bearerAuth: [] }] },
+        put: { summary: 'Set SKILL.md content (YAML frontmatter auto-sanitized)', security: [{ bearerAuth: [] }] }
+      },
       '/api/v1/skills/{id}/activate': { post: { summary: 'Activate skill', security: [{ bearerAuth: [] }] } },
       '/api/v1/skills/{id}/documents': { get: { summary: 'List skill docs', security: [{ bearerAuth: [] }] }, post: { summary: 'Attach doc to skill', security: [{ bearerAuth: [] }] } },
       '/api/v1/skills/{id}/documents/{docId}': { delete: { summary: 'Detach doc from skill', security: [{ bearerAuth: [] }] } },
@@ -3662,6 +4522,214 @@ app.get('/openapi.json', (req, res) => {
         },
       },
 
+      // ── Google Drive ──────────────────────────────────────────
+      '/api/v1/services/google/drive/files': {
+        get: {
+          operationId: 'listDriveFiles',
+          summary: 'List Google Drive files',
+          description: 'List files in the connected Google Drive. Supports Drive search query syntax.',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'q', in: 'query', schema: { type: 'string' }, description: "Drive search query (e.g. \"name contains 'report'\")" },
+            { name: 'pageSize', in: 'query', schema: { type: 'integer', default: 20, maximum: 100 } },
+            { name: 'pageToken', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: { '200': { description: 'Drive files list' }, '401': { description: 'Google not connected or missing drive.file scope' } },
+        },
+      },
+      '/api/v1/services/google/drive/upload': {
+        post: {
+          operationId: 'uploadDriveFile',
+          summary: 'Upload a file to Google Drive',
+          description: 'Upload text or binary content as a new file in Google Drive. Requires Google reconnect with drive.file scope.',
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['name', 'content'],
+                  properties: {
+                    name: { type: 'string', description: 'Filename in Drive' },
+                    content: { type: 'string', description: 'File content (text or base64)' },
+                    mimeType: { type: 'string', default: 'text/plain' },
+                    encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+                    folderId: { type: 'string', description: 'Optional Drive folder ID' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'File uploaded successfully' }, '403': { description: 'Insufficient Drive scope — reconnect Google' } },
+        },
+      },
+      '/api/v1/services/google/drive/files/{fileId}': {
+        delete: {
+          operationId: 'deleteDriveFile',
+          summary: 'Delete a Google Drive file',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'fileId', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: { '200': { description: 'File deleted' } },
+        },
+      },
+
+      // ── AFP — PC File System Access (master token only) ───────
+      '/api/v1/afp/devices': {
+        get: {
+          operationId: 'listAfpDevices',
+          summary: 'List registered AFP devices (PCs)',
+          description: 'Returns all PCs with AFP daemon installed, their online/offline status, platform, and privilege level.',
+          security: [{ bearerAuth: [] }],
+          responses: { '200': { description: 'List of AFP devices' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/ls': {
+        get: {
+          operationId: 'afpListDir',
+          summary: 'List a directory on a remote PC',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'path', in: 'query', required: true, schema: { type: 'string' }, description: 'Absolute path (e.g. C:\\Users or /home/user)' },
+          ],
+          responses: { '200': { description: 'Directory entries' }, '503': { description: 'Device offline' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/read': {
+        get: {
+          operationId: 'afpReadFile',
+          summary: 'Read a file from a remote PC',
+          description: 'Returns file content as UTF-8 or base64 (for binary files).',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'path', in: 'query', required: true, schema: { type: 'string' } },
+          ],
+          responses: { '200': { description: 'File content' }, '503': { description: 'Device offline' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/write': {
+        post: {
+          operationId: 'afpWriteFile',
+          summary: 'Write a file to a remote PC',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['path', 'content'],
+                  properties: {
+                    path: { type: 'string' },
+                    content: { type: 'string' },
+                    encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'File written' }, '503': { description: 'Device offline' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/exec': {
+        post: {
+          operationId: 'afpExec',
+          summary: 'Execute a shell command on a remote PC',
+          description: 'Runs a shell command on the target PC. Returns stdout, stderr, and exit code. Hard timeout: 60s.',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['cmd'],
+                  properties: {
+                    cmd: { type: 'string', description: 'Shell command to run', example: 'whoami' },
+                    cwd: { type: 'string', description: 'Working directory' },
+                    timeout: { type: 'integer', default: 30000, maximum: 60000, description: 'Timeout in ms' },
+                  },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'Command result with stdout/stderr/exitCode' }, '503': { description: 'Device offline' }, '504': { description: 'Command timed out' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/stat': {
+        get: {
+          operationId: 'afpStat',
+          summary: 'Get file/directory metadata on a remote PC',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'path', in: 'query', required: true, schema: { type: 'string' } },
+          ],
+          responses: { '200': { description: 'File metadata' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/rm': {
+        delete: {
+          operationId: 'afpDelete',
+          summary: 'Delete a file or directory on a remote PC',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['path'],
+                  properties: {
+                    path: { type: 'string' },
+                    recursive: { type: 'boolean', default: false },
+                  },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'Deleted' } },
+        },
+      },
+      '/api/v1/afp/{deviceId}/mkdir': {
+        post: {
+          operationId: 'afpMkdir',
+          summary: 'Create a directory on a remote PC',
+          security: [{ bearerAuth: [] }],
+          parameters: [{ name: 'deviceId', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['path'],
+                  properties: {
+                    path: { type: 'string' },
+                    recursive: { type: 'boolean', default: true },
+                  },
+                },
+              },
+            },
+          },
+          responses: { '200': { description: 'Directory created' } },
+        },
+      },
+      '/api/v1/afp/download/{platform}': {
+        get: {
+          operationId: 'downloadAfpDaemon',
+          summary: 'Download AFP daemon binary',
+          description: 'Download the AFP daemon executable for the target platform. No authentication required.',
+          parameters: [{ name: 'platform', in: 'path', required: true, schema: { type: 'string', enum: ['linux', 'mac', 'mac-arm', 'win'] } }],
+          responses: { '200': { description: 'Binary file download' } },
+        },
+      },
+
       '/api/v1/oauth/authorize/{service}': { get: { summary: 'OAuth authorize URL', security: [{ bearerAuth: [] }] } },
       '/api/v1/oauth/callback/{service}': { get: { summary: 'OAuth callback', responses: { '200': { description: 'OK' } } } },
       '/api/v1/oauth/status': { get: { summary: 'OAuth status', security: [{ bearerAuth: [] }] } },
@@ -3692,7 +4760,7 @@ app.get('/api-docs-ui', (req, res) => {
   <body>
     <div id="swagger-ui"></div>
     <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
-    <script>
+    <script nonce="${res.locals.cspNonce}">
       window.ui = SwaggerUIBundle({
         url: ${JSON.stringify(specUrl)},
         dom_id: '#swagger-ui',
@@ -3727,10 +4795,47 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
   });
 });
 
+// Build a basic identity object from the DB users record (for non-owner users who
+// don't have a USER.md-based vault entry). Keys match the USER.md / PROFILE_FIELDS
+// capitalization convention used by the Identity page so form fields pre-populate.
+function buildIdentityFromUser(user) {
+  if (!user) return {};
+  const out = {};
+  const name = user.displayName || user.username;
+  if (name) out.Name = name;
+  if (user.email) out.Email = user.email;
+  if (user.timezone) out.Timezone = user.timezone;
+  // Keep lowercase aliases so any code that reads identity.name still works
+  out.name = out.Name || '';
+  out.email = out.Email || '';
+  out.timezone = out.Timezone || 'UTC';
+  return out;
+}
+
+// Helper: resolve per-user identity doc, isolating non-owner users from the owner's vault entry
+function resolveIdentityForUser(userId) {
+  const userObj = getUserById(userId);
+  // Check per-user in-memory vault first (populated on PUT /users/me)
+  if (vault.identityDocs[userId]) {
+    return vault.identityDocs[userId];
+  }
+  // Owner only: fall back to the vault entry loaded from USER.md at startup
+  if (isOwnerUser(userId)) {
+    return vault.identityDocs['owner'] ?? buildIdentityFromUser(userObj) ?? {};
+  }
+  // Non-owner users: build from their own DB record + persisted profile_metadata
+  const base = buildIdentityFromUser(userObj) || {};
+  if (userObj?.profile_metadata) {
+    try { Object.assign(base, JSON.parse(userObj.profile_metadata)); } catch (_) {}
+  }
+  return base;
+}
+
 // --- IDENTITY ---
 app.get("/api/v1/identity", authenticate, (req, res) => {
   if (!hasScope(req, 'basic')) return res.status(403).json({ error: "Requires 'basic' scope" });
-  const identity = vault.identityDocs["owner"] || {};
+  const userId = getRequestOwnerId(req);
+  const identity = resolveIdentityForUser(userId);
   const effectiveScope = isMaster(req) ? "full" : "basic";
   const filtered = filterByScope(identity, effectiveScope);
   createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_identity", resource: "/identity", scope: req.tokenMeta.scope, ip: req.ip });
@@ -3739,7 +4844,8 @@ app.get("/api/v1/identity", authenticate, (req, res) => {
 
 app.get("/api/v1/identity/professional", authenticate, (req, res) => {
   if (!hasScope(req, 'professional')) return res.status(403).json({ error: "Requires 'professional' scope" });
-  const identity = vault.identityDocs["owner"] || {};
+  const userId = getRequestOwnerId(req);
+  const identity = resolveIdentityForUser(userId);
   const filtered = filterByScope(identity, "professional");
   createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_identity_professional", resource: "/identity/professional", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: filtered, meta: { scope: "professional" } });
@@ -3747,7 +4853,8 @@ app.get("/api/v1/identity/professional", authenticate, (req, res) => {
 
 app.get("/api/v1/identity/availability", authenticate, (req, res) => {
   if (!hasScope(req, 'availability')) return res.status(403).json({ error: "Requires 'availability' scope" });
-  const identity = vault.identityDocs["owner"] || {};
+  const userId = getRequestOwnerId(req);
+  const identity = resolveIdentityForUser(userId);
   const filtered = filterByScope(identity, "availability");
   createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_availability", resource: "/identity/availability", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: filtered, meta: { scope: "availability" } });
@@ -3756,15 +4863,17 @@ app.get("/api/v1/identity/availability", authenticate, (req, res) => {
 // --- PREFERENCES ---
 app.get("/api/v1/preferences", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Insufficient scope" });
+  const userId = getRequestOwnerId(req);
   createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_preferences", resource: "/preferences", scope: req.tokenMeta.scope, ip: req.ip });
-  res.json({ data: vault.preferences["owner"] || {} });
+  res.json({ data: vault.preferences[userId] || {} });
 });
 
 app.put("/api/v1/preferences", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Insufficient scope" });
-  vault.preferences["owner"] = { ...vault.preferences["owner"], ...req.body };
+  const userId = getRequestOwnerId(req);
+  vault.preferences[userId] = { ...(vault.preferences[userId] || {}), ...req.body };
   createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "update_preferences", resource: "/preferences", scope: req.tokenMeta.scope, ip: req.ip });
-  res.json({ data: vault.preferences["owner"] });
+  res.json({ data: vault.preferences[userId] });
 });
 
 // --- VAULT TOKENS (encrypted external API keys) ---
@@ -3914,7 +5023,7 @@ app.delete("/api/v1/vault/tokens/:id", authenticate, (req, res) => {
 app.post("/api/v1/tokens", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can create tokens" });
 
-  const { label = "Guest Token", scopes, expiresInHours, description, allowedPersonas, requiresApproval, scopeBundle } = req.body;
+  const { label = "Guest Token", scopes, expiresInHours, description, allowedPersonas, requiresApproval, scopeBundle, allowedResources } = req.body;
 
   // Parse scopes - support both template names and individual scopes
   let finalScopes = [];
@@ -3972,11 +5081,10 @@ app.post("/api/v1/tokens", authenticate, (req, res) => {
 
   // Set additional fields that aren't in the base createAccessToken signature
   const bundleJson = scopeBundle && typeof scopeBundle === 'object' ? JSON.stringify(scopeBundle) : null;
+  const resourcesJson = allowedResources && typeof allowedResources === 'object' ? JSON.stringify(allowedResources) : null;
   const needsApproval = requiresApproval ? 1 : 0;
-  if (bundleJson || needsApproval) {
-    db.prepare('UPDATE access_tokens SET scope_bundle = ?, requires_approval = ? WHERE id = ?')
-      .run(bundleJson, needsApproval, tokenId);
-  }
+  db.prepare('UPDATE access_tokens SET scope_bundle = ?, requires_approval = ?, allowed_resources = ? WHERE id = ?')
+    .run(bundleJson, needsApproval, resourcesJson, tokenId);
 
   // Grant the scopes to the token
   grantScopes(tokenId, finalScopes);
@@ -4034,6 +5142,12 @@ app.get("/api/v1/tokens/:id", authenticate, (req, res) => {
     ip: req.ip
   });
 
+  let allowedResources = null;
+  try {
+    const row = db.prepare('SELECT allowed_resources FROM access_tokens WHERE id = ?').get(req.params.id);
+    if (row?.allowed_resources) allowedResources = JSON.parse(row.allowed_resources);
+  } catch (_) {}
+
   res.json({
     data: {
       id: token.tokenId,
@@ -4041,6 +5155,11 @@ app.get("/api/v1/tokens/:id", authenticate, (req, res) => {
       description: null,
       scopes: scopes,
       allowedPersonas: token.allowedPersonas || null,
+      requiresApproval: !!token.requiresApproval,
+      scopeBundle: token.scopeBundle || null,
+      allowedResources,
+      tokenType: token.tokenType || 'guest',
+      isShareable: !!token.isShareable,
       createdAt: token.createdAt,
       expiresAt: token.expiresAt,
       revokedAt: token.revokedAt,
@@ -4049,73 +5168,173 @@ app.get("/api/v1/tokens/:id", authenticate, (req, res) => {
   });
 });
 
-// Update token scopes
+// Update a token: scopes, requiresApproval, scopeBundle, allowedResources, allowedPersonas.
+// Partial updates supported — only fields present in the body are modified.
 app.put("/api/v1/tokens/:id", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can update tokens" });
 
-  const { scopes } = req.body;
-  if (!scopes || (!Array.isArray(scopes) && typeof scopes !== 'string')) {
-    return res.status(400).json({ error: "scopes must be provided as a string or array" });
+  const { scopes, requiresApproval, scopeBundle, allowedResources, allowedPersonas, label } = req.body;
+
+  // At least one updatable field must be provided
+  const hasScopes = scopes !== undefined;
+  const hasApproval = requiresApproval !== undefined;
+  const hasBundle = scopeBundle !== undefined;
+  const hasResources = allowedResources !== undefined;
+  const hasPersonas = allowedPersonas !== undefined;
+  const hasLabel = typeof label === 'string' && label.length > 0;
+
+  if (!hasScopes && !hasApproval && !hasBundle && !hasResources && !hasPersonas && !hasLabel) {
+    return res.status(400).json({ error: "At least one updatable field must be provided" });
+  }
+
+  if (hasScopes && !Array.isArray(scopes) && typeof scopes !== 'string') {
+    return res.status(400).json({ error: "scopes must be a string or array" });
   }
 
   const tokens = getAccessTokens();
   const token = tokens.find(t => t.tokenId === req.params.id);
   if (!token) return res.status(404).json({ error: "Token not found" });
 
-  // Parse new scopes
-  let finalScopes = [];
-  if (typeof scopes === 'string') {
-    const expanded = expandScopeTemplate(scopes);
-    if (expanded) {
-      finalScopes = expanded;
-    } else if (validateScope(scopes)) {
-      finalScopes = [scopes];
-    } else {
-      return res.status(400).json({ error: `Invalid scope: ${scopes}` });
-    }
-  } else if (Array.isArray(scopes)) {
-    for (const scope of scopes) {
-      if (typeof scope === 'string') {
-        const expanded = expandScopeTemplate(scope);
-        if (expanded) {
-          finalScopes.push(...expanded);
-        } else if (validateScope(scope)) {
-          finalScopes.push(scope);
-        } else {
-          return res.status(400).json({ error: `Invalid scope: ${scope}` });
-        }
+  // Security: master tokens cannot have their scope downgraded or require_approval toggled
+  // via this endpoint. Use dedicated master-token endpoints for that.
+  if (token.tokenType === 'master' || token.scope === 'full') {
+    return res.status(400).json({ error: "Master tokens cannot be modified via this endpoint" });
+  }
+
+  // Parse scopes only if provided
+  let finalScopes = null;
+  if (hasScopes) {
+    // Block adding service scopes to a published token
+    if (token.isShareable) {
+      const incomingScopes = Array.isArray(scopes) ? scopes : [scopes];
+      const hasServiceScopeIncoming = incomingScopes.some(s => typeof s === 'string' && s.startsWith('services:'));
+      if (hasServiceScopeIncoming) {
+        return res.status(400).json({ error: 'Cannot add service scopes to a published token. Unpublish it first.' });
       }
     }
+
+    const parsed = [];
+    const raw = typeof scopes === 'string' ? [scopes] : scopes;
+    for (const scope of raw) {
+      if (typeof scope !== 'string') continue;
+      const expanded = expandScopeTemplate(scope);
+      if (expanded) {
+        parsed.push(...expanded);
+      } else if (validateScope(scope)) {
+        parsed.push(scope);
+      } else {
+        return res.status(400).json({ error: `Invalid scope: ${scope}` });
+      }
+    }
+    finalScopes = [...new Set(parsed)];
+    if (finalScopes.length === 0) {
+      return res.status(400).json({ error: "No valid scopes provided" });
+    }
   }
 
-  // Remove duplicates
-  finalScopes = [...new Set(finalScopes)];
-
-  if (finalScopes.length === 0) {
-    return res.status(400).json({ error: "No valid scopes provided" });
+  // Validate personas if provided (null clears)
+  let personaIds = undefined;
+  if (hasPersonas) {
+    if (allowedPersonas === null) {
+      personaIds = null;
+    } else if (Array.isArray(allowedPersonas)) {
+      personaIds = allowedPersonas.map(Number).filter(n => !isNaN(n));
+      if (personaIds.length === 0) personaIds = null;
+    } else {
+      return res.status(400).json({ error: "allowedPersonas must be an array or null" });
+    }
   }
 
-  // Update token scopes: revoke old, grant new
-  revokeScopes(req.params.id);
-  grantScopes(req.params.id, finalScopes);
+  // Apply updates. Use the raw better-sqlite3 handle so we can wrap the whole
+  // change in a single transaction for atomicity (scope revoke/grant must not
+  // be observable partially with the flag-only UPDATE).
+  try {
+    const rawDb = typeof db.getRawDB === 'function' ? db.getRawDB() : db;
+    const applyUpdates = () => {
+      if (hasScopes) {
+        revokeScopes(req.params.id);
+        const insertableScopes = finalScopes.filter(s => !/^services:[a-z0-9_-]+:(read|write|\*)$/.test(s));
+        if (insertableScopes.length > 0) {
+          grantScopes(req.params.id, insertableScopes);
+        }
+        db.prepare('UPDATE access_tokens SET scope = ? WHERE id = ?')
+          .run(JSON.stringify(finalScopes), req.params.id);
+      }
 
-  // Update the scope field in access_tokens
-  const updateStmt = db.prepare('UPDATE access_tokens SET scope = ? WHERE id = ?');
-  updateStmt.run(JSON.stringify(finalScopes), req.params.id);
+      const sets = [];
+      const params = [];
+      if (hasApproval) {
+        sets.push('requires_approval = ?');
+        params.push(requiresApproval ? 1 : 0);
+      }
+      if (hasBundle) {
+        sets.push('scope_bundle = ?');
+        params.push(scopeBundle && typeof scopeBundle === 'object' ? JSON.stringify(scopeBundle) : null);
+      }
+      if (hasResources) {
+        sets.push('allowed_resources = ?');
+        params.push(allowedResources && typeof allowedResources === 'object' ? JSON.stringify(allowedResources) : null);
+      }
+      if (hasPersonas) {
+        sets.push('allowed_personas = ?');
+        params.push(personaIds ? JSON.stringify(personaIds) : null);
+      }
+      if (hasLabel) {
+        sets.push('label = ?');
+        params.push(label);
+      }
+      if (sets.length > 0) {
+        params.push(req.params.id);
+        db.prepare(`UPDATE access_tokens SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+      }
+    };
+
+    if (rawDb && typeof rawDb.transaction === 'function') {
+      rawDb.transaction(applyUpdates)();
+    } else {
+      applyUpdates();
+    }
+  } catch (dbErr) {
+    console.error('[PUT /tokens/:id] DB error:', dbErr);
+    return res.status(500).json({ error: 'Failed to update token', detail: dbErr.message });
+  }
+
+  // If approval was just enabled on a scoped token, invalidate existing approved devices
+  // so a freshly-required approval actually gates the next request. Without this,
+  // previously-approved fingerprints continue to pass the gate even after the flag flips.
+  if (hasApproval && requiresApproval) {
+    try {
+      db.prepare(
+        'UPDATE approved_devices SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL'
+      ).run(new Date().toISOString(), req.params.id);
+    } catch (e) {
+      console.error('[PUT /tokens/:id] Failed to revoke approved devices:', e);
+    }
+  }
+
+  const changed = {};
+  if (hasScopes) changed.scopes = finalScopes;
+  if (hasApproval) changed.requiresApproval = !!requiresApproval;
+  if (hasBundle) changed.scopeBundle = scopeBundle || null;
+  if (hasResources) changed.allowedResources = allowedResources || null;
+  if (hasPersonas) changed.allowedPersonas = personaIds;
+  if (hasLabel) changed.label = label;
 
   createAuditLog({
     requesterId: req.tokenMeta.tokenId,
-    action: "update_token_scopes",
+    action: "update_token",
     resource: `/tokens/${req.params.id}`,
     scope: req.tokenMeta.scope,
     ip: req.ip,
-    details: { newScopes: finalScopes }
+    details: changed
   });
+
+  console.warn(`🔑 SECURITY: Token updated id=${req.params.id} by=${req.tokenMeta.tokenId} fields=${Object.keys(changed).join(',')} ip=${req.ip}`);
 
   res.json({
     data: {
       id: req.params.id,
-      scopes: finalScopes,
+      ...changed,
       updatedAt: new Date().toISOString()
     }
   });
@@ -4196,6 +5415,7 @@ app.post("/api/v1/tokens/:id/regenerate", authenticate, (req, res) => {
   if (!token) return res.status(404).json({ error: "Token not found" });
   if (token.revokedAt) return res.status(400).json({ error: "Cannot regenerate a revoked token" });
 
+  _tokenCache.clear(); // old raw token is now invalid
   const rawToken = 'myapi_' + crypto.randomBytes(32).toString("hex");
   const hash = bcrypt.hashSync(rawToken, 10);
   const now = new Date().toISOString();
@@ -4231,41 +5451,46 @@ app.post('/api/v1/tokens/master/bootstrap', authenticate, (req, res) => {
     const ownerId = req?.tokenMeta?.ownerId || req?.session?.user?.id || req?.user?.id;
     if (!ownerId) return res.status(401).json({ error: 'Not authenticated' });
 
-    // Reuse existing session token if available (avoid duplicate DB rows).
-    // But first validate that the session-cached token is still active — it may have been
-    // revoked by a prior master/regenerate call while this session was still alive.
+    // Step 1: Session cache hit — validate it's still active
     if (req.session?.masterTokenRaw && req.session?.masterTokenId) {
       const sessionTokenRow = db.prepare('SELECT revoked_at FROM access_tokens WHERE id = ?').get(req.session.masterTokenId);
       if (sessionTokenRow && !sessionTokenRow.revoked_at) {
         return res.json({ data: { id: req.session.masterTokenId, token: req.session.masterTokenRaw, scope: 'full' } });
       }
-      // Stale — clear and fall through to create a fresh token
+      // Stale — clear and fall through
       delete req.session.masterTokenRaw;
       delete req.session.masterTokenId;
     }
 
-    // Try to retrieve an existing master token from the database before creating a new one
+    // Step 2: Look up the ONE canonical master token from DB (requires encrypted_token to recover raw value)
     const existing = getExistingMasterToken(ownerId);
     if (existing) {
+      // Cache in session so future requests skip the DB lookup
       if (req.session) {
         req.session.masterTokenRaw = existing.rawToken;
         req.session.masterTokenId = existing.tokenId;
         req.session.save?.();
       }
-      const authHeader = req.headers.authorization;
-      if (authHeader && global.sessions) {
-        const bearerToken = authHeader.replace('Bearer ', '');
-        if (global.sessions[bearerToken]) {
-          global.sessions[bearerToken].masterTokenRaw = existing.rawToken;
-          global.sessions[bearerToken].masterTokenId = existing.tokenId;
-        }
-      }
+      createAuditLog({
+        requesterId: req?.tokenMeta?.tokenId || ownerId,
+        action: 'bootstrap_master_token',
+        resource: '/tokens/master/bootstrap',
+        scope: req?.tokenMeta?.scope || 'session',
+        ip: req.ip,
+        details: { tokenId: existing.tokenId, ownerId, reused: true }
+      });
       return res.json({ data: { id: existing.tokenId, token: existing.rawToken, scope: 'full' } });
     }
 
-    const rawToken = 'myapi_' + crypto.randomBytes(32).toString("hex");
+    // Step 3: No recoverable token found.
+    // Revoke ALL active full-scope tokens for this user (including old non-recoverable ones
+    // that lack encrypted_token and can never be retrieved again), then create exactly ONE
+    // new canonical token. All devices will converge to this token on their next bootstrap.
+    revokeExistingMasterTokens(ownerId);
+
+    const rawToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
     const hash = bcrypt.hashSync(rawToken, 10);
-    const tokenId = createAccessToken(hash, ownerId, 'full', 'Master Token (Dashboard Session)', null, null, null, rawToken, 'master');
+    const tokenId = createAccessToken(hash, ownerId, 'full', 'Master Token', null, null, null, rawToken, 'master');
 
     if (req.session) {
       req.session.masterTokenRaw = rawToken;
@@ -4273,18 +5498,14 @@ app.post('/api/v1/tokens/master/bootstrap', authenticate, (req, res) => {
       req.session.save?.();
     }
 
-    // Also save to global.sessions for Bearer token users
-    const authHeader = req.headers.authorization;
-    if (authHeader && global.sessions) {
-      const bearerToken = authHeader.replace('Bearer ', '');
-      if (global.sessions[bearerToken]) {
-        global.sessions[bearerToken].masterTokenRaw = rawToken;
-        global.sessions[bearerToken].masterTokenId = tokenId;
-      }
-    }
-
-    // Keep only minimal safe active full-scope tokens
-    const prune = pruneRedundantMasterTokens(ownerId, 3);
+    // Also set the persistent cookie so the dashboard picks it up immediately
+    res.cookie('myapi_master_token', rawToken, {
+      httpOnly: true,  // Not readable by JS; use GET /api/v1/auth/session-token instead
+      secure: secureCookie,
+      path: '/',
+      maxAge: 30 * 24 * 60 * 60 * 1000,
+      sameSite: 'lax'
+    });
 
     createAuditLog({
       requesterId: req?.tokenMeta?.tokenId || ownerId,
@@ -4292,12 +5513,12 @@ app.post('/api/v1/tokens/master/bootstrap', authenticate, (req, res) => {
       resource: '/tokens/master/bootstrap',
       scope: req?.tokenMeta?.scope || 'session',
       ip: req.ip,
-      details: { tokenId, ownerId, pruned: prune.pruned }
+      details: { tokenId, ownerId, reused: false }
     });
 
     res.json({ data: { id: tokenId, token: rawToken, scope: 'full' } });
   } catch (error) {
-    console.error('Master token bootstrap error:', error);
+    logger.error('Master token bootstrap error', { error: error.message });
     res.status(500).json({ error: 'Failed to bootstrap master token' });
   }
 });
@@ -4305,6 +5526,14 @@ app.post('/api/v1/tokens/master/bootstrap', authenticate, (req, res) => {
 // Revoke (delete) a token
 app.delete("/api/v1/tokens/:id", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can revoke tokens" });
+
+  // Master tokens can only be changed via POST /tokens/master/regenerate — never deleted directly
+  const targetToken = db.prepare("SELECT token_type FROM access_tokens WHERE id = ?").get(req.params.id);
+  if (targetToken?.token_type === 'master') {
+    return res.status(403).json({ error: "Master tokens cannot be revoked directly. Use POST /api/v1/tokens/master/regenerate to rotate." });
+  }
+
+  _tokenCache.clear(); // invalidate all cached tokens on any revocation
   const revoked = revokeAccessToken(req.params.id);
   if (!revoked) return res.status(404).json({ error: "Token not found" });
 
@@ -4328,6 +5557,14 @@ app.delete("/api/v1/tokens/:id", authenticate, (req, res) => {
     scope: req.tokenMeta.scope,
     ip: req.ip
   });
+  try {
+    createComplianceAuditLog(
+      req.headers['x-workspace-id'] || req.workspaceId || 'system',
+      req.user?.id ? String(req.user.id) : null,
+      'token_revoked', 'token', req.params.id, null,
+      req.ip, req.get('user-agent')
+    );
+  } catch (_) {}
 
   res.json({ data: { tokenId: req.params.id, revoked: true } });
 });
@@ -4342,11 +5579,27 @@ app.get("/api/v1/tokens", authenticate, (req, res) => {
 
   const userId = getOAuthUserId(req);
   const tokens = getAccessTokens(userId, workspaceId);
-  const tokensWithScopes = tokens.map(t => ({
-    ...t,
-    scopes: getTokenScopes(t.tokenId),
-    allowedPersonas: t.allowedPersonas || null
-  }));
+  const tokensWithScopes = tokens.map(t => {
+    // Merge junction-table scopes (FK-safe) with JSON scope field (includes per-service scopes)
+    const junctionScopes = getTokenScopes(t.tokenId);
+    let jsonScopes = [];
+    try {
+      const raw = t.scope;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        jsonScopes = Array.isArray(parsed) ? parsed : (typeof parsed === 'string' ? [parsed] : []);
+      }
+    } catch {}
+    const allScopes = [...new Set([...junctionScopes, ...jsonScopes])];
+    // Security: never return the bcrypt hash to clients.
+    const { hash: _hash, ...safe } = t;
+    return {
+      ...safe,
+      scopes: allScopes,
+      allowedPersonas: t.allowedPersonas || null,
+      requiresApproval: !!t.requiresApproval,
+    };
+  });
 
   createAuditLog({
     requesterId: req.tokenMeta.tokenId,
@@ -4361,7 +5614,7 @@ app.get("/api/v1/tokens", authenticate, (req, res) => {
 });
 
 // Validate token endpoint (for login page)
-app.post("/api/v1/tokens/validate", authRateLimit, (req, res) => {
+app.post("/api/v1/tokens/validate", authRateLimit, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: "token is required" });
 
@@ -4370,7 +5623,7 @@ app.post("/api/v1/tokens/validate", authRateLimit, (req, res) => {
 
   // Find matching token
   for (const tokenRecord of tokens) {
-    if (!tokenRecord.revokedAt && bcrypt.compareSync(token, tokenRecord.hash)) {
+    if (!tokenRecord.revokedAt && tokenRecord.hash && await bcrypt.compare(token, tokenRecord.hash).catch(() => false)) {
       matched = tokenRecord;
       break;
     }
@@ -4413,7 +5666,7 @@ const BILLING_PLANS = {
     priceMonthly: 0, // deprecated, kept for backwards compat
     description: 'Perfect for individuals getting started',
     features: [
-      '1 AI Persona',
+      '2 AI Personas',
       '3 Service Connections',
       '10 MB Knowledge Base',
       '5 Token Vault entries',
@@ -4443,6 +5696,7 @@ const BILLING_PLANS = {
       'Attach unlimited Skills per Persona',
       '100,000 API calls/month',
       'Up to 10 team members',
+      'AFP — API File Protocol (remote file & shell operations)',
       'Priority support'
     ],
     monthlyApiCallLimit: 100000,
@@ -4467,6 +5721,7 @@ const BILLING_PLANS = {
       'Attach unlimited Skills per Persona',
       'Unlimited API calls/month',
       'Unlimited team members',
+      'AFP — API File Protocol (remote file & shell operations)',
       'Priority 24/7 support',
       'Custom SLA & onboarding',
       'Dedicated infrastructure option'
@@ -4487,7 +5742,7 @@ const PLAN_ENFORCEMENT_ENABLED = process.env.NODE_ENV === 'test'
 
 const PLAN_LIMITS = {
   free: {
-    personas: 1,
+    personas: 2,
     serviceConnections: 3,
     knowledgeBytes: 10 * 1024 * 1024, // 10 MB
     vaultTokens: 5,
@@ -4604,9 +5859,9 @@ app.post('/api/v1/billing/downgrade-preview', authenticate, (req, res) => {
     // Calculate what would be deleted
     const preview = { isDowngrade: true, toDelete: {} };
 
-    // Check personas (Free: 1, Pro: 5, Enterprise: 20)
+    // Check personas (Free: 2, Pro: 5, Enterprise: 20)
     const personas = db.prepare('SELECT id, created_at FROM personas WHERE owner_id = ? ORDER BY created_at DESC').all(ownerId);
-    const maxPersonas = newPlanId === 'free' ? 1 : (newPlanId === 'pro' ? 5 : -1);
+    const maxPersonas = newPlanId === 'free' ? 2 : (newPlanId === 'pro' ? 5 : -1);
     if (maxPersonas > 0 && personas.length > maxPersonas) {
       const toDelete = personas.length - maxPersonas;
       preview.toDelete.personas = {
@@ -4661,34 +5916,35 @@ app.post('/api/v1/billing/downgrade-confirm', authenticate, async (req, res) => 
       return res.status(400).json({ error: 'This is not a downgrade' });
     }
 
-    const tx = db.transaction(() => {
+    const downgradeRawDb = db.getRawDB ? db.getRawDB() : db;
+    downgradeRawDb.transaction(() => {
       // Delete excess personas (keep oldest)
-      const maxPersonas = newPlanId === 'free' ? 1 : (newPlanId === 'pro' ? 5 : -1);
+      const maxPersonas = newPlanId === 'free' ? 2 : (newPlanId === 'pro' ? 5 : -1);
       if (maxPersonas > 0) {
-        const personas = db.prepare('SELECT id FROM personas WHERE owner_id = ? ORDER BY created_at DESC').all(ownerId);
+        const personas = downgradeRawDb.prepare('SELECT id FROM personas WHERE owner_id = ? ORDER BY created_at DESC').all(ownerId);
         if (personas.length > maxPersonas) {
           const toDelete = personas.slice(0, personas.length - maxPersonas).map(p => p.id);
           for (const id of toDelete) {
-            db.prepare('DELETE FROM persona_documents WHERE persona_id = ?').run(id);
-            db.prepare('DELETE FROM persona_skills WHERE persona_id = ?').run(id);
-            db.prepare('DELETE FROM personas WHERE id = ?').run(id);
+            downgradeRawDb.prepare('DELETE FROM persona_documents WHERE persona_id = ?').run(id);
+            downgradeRawDb.prepare('DELETE FROM persona_skills WHERE persona_id = ?').run(id);
+            downgradeRawDb.prepare('DELETE FROM personas WHERE id = ?').run(id);
           }
         }
       }
 
       // Delete excess service connections (keep oldest)
       if (newPlanDef.maxServices > 0) {
-        const services = db.prepare(`SELECT id FROM oauth_tokens WHERE user_id = ? ORDER BY created_at DESC`).all(ownerId);
+        const services = downgradeRawDb.prepare('SELECT id FROM oauth_tokens WHERE user_id = ? ORDER BY created_at DESC').all(ownerId);
         if (services.length > newPlanDef.maxServices) {
           const toDelete = services.slice(0, services.length - newPlanDef.maxServices).map(s => s.id);
           for (const id of toDelete) {
-            db.prepare('DELETE FROM oauth_tokens WHERE id = ?').run(id);
+            downgradeRawDb.prepare('DELETE FROM oauth_tokens WHERE id = ?').run(id);
           }
         }
       }
 
       // Update user's plan
-      db.prepare('UPDATE users SET plan = ? WHERE id = ?').run(newPlanId, req.user?.id || ownerId);
+      downgradeRawDb.prepare('UPDATE users SET plan = ? WHERE id = ?').run(newPlanId, req.user?.id || ownerId);
 
       // Update workspace subscription
       const workspaceId = getRequestWorkspaceId(req);
@@ -4699,9 +5955,7 @@ app.post('/api/v1/billing/downgrade-confirm', authenticate, async (req, res) => 
           status: 'active',
         });
       }
-    });
-
-    tx();
+    })();
 
     // Cancel Stripe subscription if downgrading from paid plan to lower/free plan
     const paidPlans = ['pro', 'enterprise'];
@@ -4744,6 +5998,14 @@ app.post('/api/v1/billing/checkout', authenticate, async (req, res) => {
     const definition = BILLING_PLANS[selectedPlan];
     if (!definition) {
       return res.status(400).json({ error: `Invalid plan. Allowed: ${Object.keys(BILLING_PLANS).join(', ')}` });
+    }
+
+    if (betaMode.isBetaMode() && selectedPlan !== 'free') {
+      return res.status(403).json({
+        error: 'Paid plans are not available during beta. Ask in Discord for access.',
+        code: 'BETA_PLAN_LOCKED',
+        discordUrl: 'https://discord.gg/WPp4sCN4xB',
+      });
     }
 
     const workspaceId = getRequestWorkspaceId(req);
@@ -5042,7 +6304,7 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
     // User identity from DB (what the AI needs to know about the person it's serving)
     // Prefer DB user record; fall back to vault.identityDocs for file-based setups
     const dbUser = getUserById(ownerId) || getUserById('owner');
-    const vaultIdentity = vault.identityDocs[ownerId] || vault.identityDocs['owner'] || {};
+    const vaultIdentity = resolveIdentityForUser(ownerId);
     const userProfile = dbUser ? {
       ...vaultIdentity,  // file-based extras (role, company, etc.) — overridden by DB below
       name: dbUser.displayName || dbUser.username || vaultIdentity.name || 'User',
@@ -5072,6 +6334,9 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
     }));
 
     // Endpoint manifest — every endpoint this token can call, so the AI knows immediately
+    // ⚠️ IMPORTANT: All paths below include /api/v1. The base URL is https://www.myapiai.com (NO /api/v1 suffix).
+    // Correct: https://www.myapiai.com + /api/v1/skills = https://www.myapiai.com/api/v1/skills
+    // Wrong:   https://www.myapiai.com/api/v1 + /api/v1/skills = double-prefix → ROUTE_NOT_FOUND
     const ENDPOINT_MANIFEST = [
       { method: 'GET',    path: '/api/v1/gateway/context',               description: 'Full AI context: persona, identity, memory, endpoints (this endpoint)' },
       { method: 'GET',    path: '/api/v1/brain/context',                 description: 'Assembled LLM system prompt + conversation context', scope: 'knowledge' },
@@ -5103,9 +6368,121 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
       { method: 'GET',    path: '/api/v1/oauth/status',                  description: 'List all connected OAuth services and their status' },
     ];
 
+    // Per-service usage instructions for connected services — tells AI exactly how to proxy each one
+    const SERVICE_INSTRUCTIONS = {
+      discord: {
+        description: 'Discord — read/write messages and channels via bot token proxy',
+        proxy_note: 'All Discord calls go through POST /api/v1/services/discord/proxy with {path, method, body}.',
+        auth_note: '/users/@me paths use your OAuth token automatically. /guilds/* and /channels/* use the configured bot token automatically — no extra headers needed.',
+        actions: [
+          { action: 'List your guilds (servers)',       method: 'GET',  path: '/users/@me/guilds' },
+          { action: 'List channels in a server',        method: 'GET',  path: '/guilds/{guild_id}/channels' },
+          { action: 'Read messages from a channel',     method: 'GET',  path: '/channels/{channel_id}/messages?limit=50' },
+          { action: 'Send a message to a channel',      method: 'POST', path: '/channels/{channel_id}/messages', body: { content: 'your message text' } },
+          { action: 'Get your Discord profile',         method: 'GET',  path: '/users/@me' },
+        ],
+        example: {
+          description: 'Send a message to a Discord channel',
+          request: { method: 'POST', url: '/api/v1/services/discord/proxy', body: { path: '/channels/{channel_id}/messages', method: 'POST', body: { content: 'Hello from MyApi!' } } },
+        },
+      },
+      github: {
+        description: 'GitHub — repos, issues, pull requests, gists',
+        proxy_note: 'All GitHub calls go through POST /api/v1/services/github/proxy with {path, method, body}.',
+        actions: [
+          { action: 'List your repos',              method: 'GET',  path: '/user/repos?per_page=30' },
+          { action: 'List issues in a repo',        method: 'GET',  path: '/repos/{owner}/{repo}/issues' },
+          { action: 'Create an issue',              method: 'POST', path: '/repos/{owner}/{repo}/issues', body: { title: 'Issue title', body: 'Description' } },
+          { action: 'List pull requests',           method: 'GET',  path: '/repos/{owner}/{repo}/pulls' },
+          { action: 'Get your profile',             method: 'GET',  path: '/user' },
+        ],
+      },
+      google: {
+        description: 'Google — Gmail, Calendar, Drive',
+        proxy_note: 'All Google calls go through POST /api/v1/services/google/proxy with {path, method, body}.',
+        actions: [
+          { action: 'List Gmail messages',          method: 'GET',  path: '/gmail/v1/users/me/messages?maxResults=10' },
+          { action: 'Get a Gmail message',          method: 'GET',  path: '/gmail/v1/users/me/messages/{messageId}' },
+          { action: 'List calendar events',         method: 'GET',  path: '/calendar/v3/calendars/primary/events?maxResults=10' },
+          { action: 'List Drive files',             method: 'GET',  path: '/drive/v3/files?pageSize=10' },
+        ],
+      },
+      slack: {
+        description: 'Slack — channels, messages, users',
+        proxy_note: 'All Slack calls go through POST /api/v1/services/slack/proxy with {path, method, body}.',
+        actions: [
+          { action: 'List channels',                method: 'GET',  path: '/conversations.list?limit=20' },
+          { action: 'Read channel messages',        method: 'GET',  path: '/conversations.history?channel={channel_id}&limit=20' },
+          { action: 'Send a message',               method: 'POST', path: '/chat.postMessage', body: { channel: '{channel_id}', text: 'message' } },
+          { action: 'List workspace users',         method: 'GET',  path: '/users.list' },
+        ],
+      },
+      notion: {
+        description: 'Notion — pages, databases',
+        proxy_note: 'All Notion calls go through POST /api/v1/services/notion/proxy with {path, method, body}.',
+        actions: [
+          { action: 'Search all pages/databases',   method: 'POST', path: '/search', body: { query: '' } },
+          { action: 'List databases',               method: 'POST', path: '/search', body: { filter: { property: 'object', value: 'database' } } },
+          { action: 'Query a database',             method: 'POST', path: '/databases/{database_id}/query', body: {} },
+          { action: 'Get a page',                   method: 'GET',  path: '/pages/{page_id}' },
+        ],
+      },
+      linkedin: {
+        description: 'LinkedIn — profile, posts',
+        proxy_note: 'All LinkedIn calls go through POST /api/v1/services/linkedin/proxy with {path, method, body}.',
+        actions: [
+          { action: 'Get your profile',             method: 'GET',  path: '/me' },
+          { action: 'Get profile picture',          method: 'GET',  path: '/me?projection=(id,profilePicture(displayImage~:playableStreams))' },
+        ],
+      },
+      twitter: {
+        description: 'Twitter/X — tweets, timeline',
+        proxy_note: 'All Twitter calls go through POST /api/v1/services/twitter/proxy with {path, method, body}.',
+        actions: [
+          { action: 'Get your profile',             method: 'GET',  path: '/users/me' },
+          { action: 'Post a tweet',                 method: 'POST', path: '/tweets', body: { text: 'tweet text' } },
+          { action: 'Get home timeline',            method: 'GET',  path: '/timelines/home_timeline?max_results=10' },
+        ],
+      },
+      facebook: {
+        description: 'Facebook — pages, posts',
+        proxy_note: 'All Facebook calls go through POST /api/v1/services/facebook/proxy with {path, method, body}.',
+        actions: [
+          { action: 'Get your profile',             method: 'GET',  path: '/me?fields=id,name,email' },
+          { action: 'List your pages',              method: 'GET',  path: '/me/accounts' },
+        ],
+      },
+      tiktok: {
+        description: 'TikTok — user info, videos',
+        proxy_note: 'All TikTok calls go through POST /api/v1/services/tiktok/proxy with {path, method, body}.',
+        actions: [
+          { action: 'Get your profile',             method: 'POST', path: '/v2/user/info/', body: { fields: ['display_name', 'avatar_url', 'follower_count'] } },
+        ],
+      },
+    };
+
+    // Build connected_services: only include services that have an OAuth token stored
+    const connectedServiceIds = OAUTH_SERVICES.filter(svcId => {
+      try {
+        const tok = getCachedOAuthToken(svcId, ownerId) || getOAuthToken(svcId, ownerId);
+        return !!tok;
+      } catch { return false; }
+    });
+
+    const connectedServices = connectedServiceIds.map(svcId => ({
+      service: svcId,
+      proxy_endpoint: `/api/v1/services/${svcId}/proxy`,
+      ...(SERVICE_INSTRUCTIONS[svcId] || {
+        description: `${svcId} — connected OAuth service`,
+        proxy_note: `All calls go through POST /api/v1/services/${svcId}/proxy with {path, method, body}.`,
+      }),
+    }));
+
     const context = {
       timestamp: new Date().toISOString(),
       version: "2.0",
+      base_url: `${req.protocol}://${req.get('host')}`,
+      base_url_warning: 'All endpoint paths in this response include /api/v1. Do NOT append /api/v1 to base_url when constructing request URLs. Correct: base_url + /api/v1/skills. Wrong: base_url + /api/v1 + /api/v1/skills (double-prefix causes ROUTE_NOT_FOUND).',
       // Who this AI is — full soul_content so it can set its own instructions
       persona,
       // Who the AI is serving — full identity from the database
@@ -5113,6 +6490,8 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
       // Long-term memory: structured DB entries + legacy MEMORY.md bullets
       memory: dbMemories.map(m => ({ id: m.id, content: m.content, created_at: m.created_at })),
       memory_legacy: fileMemory.memories || [],
+      // Connected services with per-service usage instructions
+      connected_services: connectedServices,
       // Connected services metadata (no credentials)
       vault: { tokens: vaultTokens },
       // All available personas
@@ -5177,6 +6556,11 @@ app.post('/api/v1/tokens/:id/make-shareable', authenticate, (req, res) => {
     if (token.revoked_at) return res.status(400).json({ error: 'Cannot share a revoked token' });
     if (token.is_shareable) return res.status(400).json({ error: 'Token is already being shared' });
 
+    // Block master tokens from being published
+    if (token.token_type === 'master') {
+      return res.status(400).json({ error: 'Master tokens cannot be published to the marketplace' });
+    }
+
     // Block publishing tokens that include service scopes (they proxy real OAuth credentials)
     let tokenScopes = [];
     try { tokenScopes = JSON.parse(token.scope) || []; } catch { tokenScopes = token.scope ? token.scope.split(',') : []; }
@@ -5185,34 +6569,71 @@ app.post('/api/v1/tokens/:id/make-shareable', authenticate, (req, res) => {
       return res.status(400).json({ error: 'Tokens with service scopes cannot be published to the marketplace' });
     }
 
-    // Create marketplace listing for this token
+    // Create marketplace listing for this token — enrich with resolved metadata
     const now = new Date().toISOString();
-    const scopeBundle = scopePersonaId ? JSON.stringify({ persona_id: scopePersonaId }) : null;
-    const listingTitle = `Guest Token: ${token.label}`;
-    const listingDescription = description || `Private access token shared by ${ownerId}`;
 
-    const listingResult = db.prepare(`
-      INSERT INTO marketplace_listings (owner_id, type, title, description, content, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      ownerId,
-      'token',
-      listingTitle,
-      listingDescription,
-      JSON.stringify({ token_id: tokenId, scope_persona_id: scopePersonaId }),
-      'active',
-      now,
-      now
-    );
+    // Resolve owner display name
+    const ownerUser = getUserById(ownerId);
+    const ownerDisplayName = ownerUser?.displayName || ownerUser?.username || ownerUser?.name || null;
 
-    const listingId = listingResult.lastInsertRowid;
+    // Parse scope_bundle to detect persona/bundle
+    let parsedBundle = null;
+    try { parsedBundle = token.scope_bundle ? JSON.parse(token.scope_bundle) : null; } catch {}
+
+    // Resolve persona info if bundle
+    let personaInfo = null;
+    if (parsedBundle?.persona_id) {
+      try {
+        const p = db.prepare('SELECT id, name, description FROM personas WHERE id = ?').get(parsedBundle.persona_id);
+        if (p) personaInfo = { id: p.id, name: p.name, description: p.description };
+      } catch {}
+    }
+
+    // Resolve allowed_resources info
+    let allowedResources = null;
+    try { allowedResources = token.allowed_resources ? JSON.parse(token.allowed_resources) : null; } catch {}
+
+    const isBundle = !!(parsedBundle?.persona_id && (tokenScopes.includes('knowledge') || tokenScopes.includes('skills:read')));
+
+    const listingTitle = token.label;
+    const listingDescription = description || token.description || '';
+
+    const contentPayload = {
+      token_id: tokenId,
+      token_label: token.label,
+      token_description: token.description || null,
+      scopes: tokenScopes,
+      scope_bundle: parsedBundle,
+      is_bundle: isBundle,
+      persona: personaInfo,
+      allowed_resources: allowedResources,
+      expires_at: token.expires_at,
+      requires_approval: !!token.requires_approval,
+      owner_display_name: ownerDisplayName,
+    };
+
+    // Reactivate existing listing if one exists from a previous publish cycle
+    let listingId = token.marketplace_listing_id;
+    const existingListing = listingId
+      ? db.prepare('SELECT id FROM marketplace_listings WHERE id = ?').get(listingId)
+      : null;
+
+    if (existingListing) {
+      db.prepare(`
+        UPDATE marketplace_listings SET status = 'active', title = ?, description = ?, content = ?, updated_at = ?
+        WHERE id = ?
+      `).run(listingTitle, listingDescription, JSON.stringify(contentPayload), now, listingId);
+    } else {
+      const listingResult = db.prepare(`
+        INSERT INTO marketplace_listings (owner_id, type, title, description, content, status, created_at, updated_at)
+        VALUES (?, 'token', ?, ?, ?, 'active', ?, ?)
+      `).run(ownerId, listingTitle, listingDescription, JSON.stringify(contentPayload), now, now);
+      listingId = listingResult.lastInsertRowid;
+    }
 
     // Update token to mark as shareable
-    db.prepare(`
-      UPDATE access_tokens 
-      SET is_shareable = 1, marketplace_listing_id = ?, scope_bundle = ?
-      WHERE id = ?
-    `).run(listingId, scopeBundle, tokenId);
+    db.prepare('UPDATE access_tokens SET is_shareable = 1, marketplace_listing_id = ? WHERE id = ?')
+      .run(listingId, tokenId);
 
     createAuditLog({
       requesterId: ownerId,
@@ -5257,12 +6678,8 @@ app.post('/api/v1/tokens/:id/unpublish', authenticate, (req, res) => {
       db.prepare('UPDATE marketplace_listings SET status = ? WHERE id = ?').run('inactive', listingId);
     }
 
-    // Update token
-    db.prepare(`
-      UPDATE access_tokens 
-      SET is_shareable = 0, marketplace_listing_id = NULL
-      WHERE id = ?
-    `).run(tokenId);
+    // Update token — keep marketplace_listing_id so republishing reactivates the same listing
+    db.prepare('UPDATE access_tokens SET is_shareable = 0 WHERE id = ?').run(tokenId);
 
     createAuditLog({
       requesterId: ownerId,
@@ -5338,6 +6755,7 @@ app.delete('/api/v1/vault/:tokenId/revoke', authenticate, (req, res) => {
     if (!token.is_guest_token) return res.status(400).json({ error: 'Can only revoke guest tokens this way' });
 
     const now = new Date().toISOString();
+    _tokenCache.clear();
     db.prepare('UPDATE access_tokens SET revoked_at = ? WHERE id = ?').run(now, tokenId);
 
     createAuditLog({
@@ -5358,8 +6776,8 @@ app.delete('/api/v1/vault/:tokenId/revoke', authenticate, (req, res) => {
 // ============================
 // PUBLIC AUTH (Register + Login)
 // =============================
-app.post("/api/v1/auth/register", (req, res) => {
-  const { username, password, display_name, email, timezone } = req.body;
+app.post("/api/v1/auth/register", authRateLimit, requireBetaSlot, (req, res) => {
+  const { username, password, display_name, email, timezone, accepted_terms_at, accepted_privacy_policy_at } = req.body;
   if (!username || !password) return res.status(400).json({ error: "username and password are required" });
 
   if (!isStrongPassword(password)) {
@@ -5367,7 +6785,13 @@ app.post("/api/v1/auth/register", (req, res) => {
   }
 
   try {
-    const user = createUser(username, display_name || username, email, timezone, password);
+    const now = new Date().toISOString();
+    const consentTimestamps = {
+      acceptedTermsAt: accepted_terms_at || now,
+      acceptedPrivacyPolicyAt: accepted_privacy_policy_at || now,
+    };
+    const user = createUser(username, display_name || username, email, timezone, password, 'free', null, consentTimestamps);
+    betaMode.invalidateBetaFullCache();
     createAuditLog({ requesterId: user.id, action: "user_register", resource: `/users/${user.id}`, scope: "public", ip: req.ip });
     res.status(201).json({ data: user });
   } catch (e) {
@@ -5379,10 +6803,10 @@ app.post("/api/v1/auth/register", (req, res) => {
 });
 
 // BUG-15: Add rate limiting to login endpoint to prevent brute force attacks
-app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
+app.post("/api/v1/auth/login", authRateLimit, async (req, res) => {
   try {
     const { username, email, password, totpCode } = req.body;
-    
+
     // Support both username and email login
     let user = null;
     if (username) {
@@ -5390,10 +6814,10 @@ app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
     } else if (email) {
       user = getUserByEmail(email);
     }
-    
+
     if (!user) return res.status(401).json({ error: "Invalid email or password" });
-    
-    const valid = bcrypt.compareSync(password, user.password_hash);
+
+    const valid = await bcrypt.compare(password, user.password_hash || '').catch(() => false);
     if (!valid) {
       createAuditLog({
         requesterId: 'unknown',
@@ -5403,6 +6827,7 @@ app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
         ip: req.ip,
         details: { username: user.username, reason: 'invalid_credentials' }
       });
+      alerting.trackFailedLogin(req.ip);
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
@@ -5425,8 +6850,15 @@ app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
           ip: req.ip,
           details: { reason: 'invalid_code' }
         });
+        alerting.trackFailedLogin(req.ip);
         return res.status(401).json({ error: "Invalid 2FA code", requires2FA: true });
       }
+      // Replay protection: reject if this exact code was already used recently
+      const totpKey = String(totpCode).replace(/\s+/g, '');
+      if (isTotpCodeUsed(user.id, totpKey)) {
+        return res.status(401).json({ error: '2FA code already used. Wait for the next code.', requires2FA: true });
+      }
+      markTotpCodeUsed(user.id, totpKey);
     }
 
     // Regenerate session and set user
@@ -5459,16 +6891,19 @@ app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
           console.error('[login] Session save error:', saveErr);
           return res.status(500).json({ error: 'Session error' });
         }
-        
-        createAuditLog({ 
-          requesterId: user.id, 
-          action: "user_login", 
-          resource: `/users/${user.id}`, 
-          scope: "session", 
-          ip: req.ip 
+
+        // SOC2 CC6: Track session, evict oldest if user exceeds max concurrent sessions
+        registerUserSession(user.id, req.sessionID);
+
+        createAuditLog({
+          requesterId: user.id,
+          action: "user_login",
+          resource: `/users/${user.id}`,
+          scope: "session",
+          ip: req.ip
         });
-        
-        res.json({ 
+
+        res.json({
           success: true,
           userId: user.id,
           user: {
@@ -5488,16 +6923,19 @@ app.post("/api/v1/auth/login", authRateLimit, (req, res) => {
 });
 
 // Token-based login (for API access tokens)
-app.post("/api/v1/auth/token-login", authRateLimit, (req, res) => {
+app.post("/api/v1/auth/token-login", authRateLimit, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: "token is required" });
 
   // Verify token against stored tokens
   const tokens = getAccessTokens();
-  const tokenRecord = tokens.find(t => {
-    // Check if token matches the hash
-    return bcrypt.compareSync(token, t.hash);
-  });
+  let tokenRecord = null;
+  for (const t of tokens) {
+    if (!t.revokedAt && t.hash && await bcrypt.compare(token, t.hash).catch(() => false)) {
+      tokenRecord = t;
+      break;
+    }
+  }
 
   if (!tokenRecord || tokenRecord.revokedAt) {
     return res.status(401).json({ error: "Invalid or revoked token" });
@@ -5564,6 +7002,11 @@ app.get("/api/v1/auth/me", (req, res) => {
   const token = authHeader.replace("Bearer ", "");
   if (global.sessions && global.sessions[token]) {
     const session = global.sessions[token];
+    const SESSION_TTL = 8 * 60 * 60 * 1000;
+    if (!session.createdAt || Date.now() - session.createdAt > SESSION_TTL) {
+      delete global.sessions[token];
+      return res.status(401).json({ error: 'Session expired' });
+    }
     const user = getUserById(session.userId);
     if (user) {
       const normalizedUser = {
@@ -5585,6 +7028,20 @@ app.get("/api/v1/auth/me", (req, res) => {
     }
   }
   res.status(401).json({ error: "Invalid session" });
+});
+
+// GET /api/v1/auth/session-token - One-shot endpoint: returns master token from session, then clears it
+// Used by the frontend after OAuth login to retrieve the token without exposing it in cookies
+app.get('/api/v1/auth/session-token', authRateLimit, (req, res) => {
+  if (!req.session?.user?.id) return res.status(401).json({ error: 'Not authenticated' });
+  const token  = req.session.masterTokenRaw || null;
+  const tokenId = req.session.masterTokenId || null;
+  if (token) {
+    delete req.session.masterTokenRaw;
+    delete req.session.masterTokenId;
+    req.session.save?.(() => {});
+  }
+  res.json({ token, tokenId });
 });
 
 // GET /api/v1/auth/oauth-signup/pending - returns pending OAuth signup state
@@ -5615,40 +7072,61 @@ app.delete('/api/v1/account', authenticate, (req, res) => {
     const user = getUserById(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const configuredPowerUserEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || getOwnerEmailFromUserDoc() || '').trim().toLowerCase();
-    if (configuredPowerUserEmail && String(user.email || '').toLowerCase() === configuredPowerUserEmail) {
+    const _pwrEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    if (_pwrEmail && String(user.email || '').toLowerCase() === _pwrEmail) {
       return res.status(400).json({ error: 'Cannot delete power user account from self-service endpoint' });
     }
 
-    const tx = db.transaction((uid) => {
-      // Delete from all tables that reference this user (in dependency order)
-      db.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM vault_tokens WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM access_tokens WHERE owner_id = ?').run(uid);
-      db.prepare('DELETE FROM approved_devices WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM device_approvals_pending WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM handshakes WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)').run(uid);
-      db.prepare('DELETE FROM conversations WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM notifications WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM notification_preferences WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM service_preferences WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM activity_log WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM email_queue WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM rate_limits WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM subscriptions WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM team_invitations WHERE sender_id = ? OR recipient_id = ?').run(uid, uid);
-      db.prepare('DELETE FROM marketplace_listings WHERE owner_id = ?').run(uid);
-      db.prepare('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(uid);
-      db.prepare('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(uid);
-      db.prepare('DELETE FROM skills WHERE owner_id = ?').run(uid);
-      db.prepare('DELETE FROM personas WHERE owner_id = ?').run(uid);
-      db.prepare('DELETE FROM kb_documents WHERE owner_id = ?').run(uid);
-      db.prepare('DELETE FROM users WHERE id = ?').run(uid);
-    });
+    const rawDb = db.getRawDB ? db.getRawDB() : db;
+    const existingTables = new Set(
+      rawDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name)
+    );
+    const safeDelete = (sql, ...params) => {
+      const match = sql.match(/DELETE FROM (\w+)/i);
+      if (match && !existingTables.has(match[1])) return;
+      rawDb.prepare(sql).run(...params);
+    };
 
-    tx(userId);
+    // Send goodbye email BEFORE deleting the user record (email address is lost after)
+    if (user.email && user.email !== '' && !user.email.includes('example.com')) {
+      emailService.sendGoodbyeEmail(user.email, user.display_name || user.displayName || user.username).catch(() => {});
+    }
+
+    rawDb.pragma('foreign_keys = OFF');
+    try {
+      rawDb.transaction((uid) => {
+        // Delete from all tables that reference this user (in dependency order)
+        safeDelete('DELETE FROM oauth_tokens WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM vault_tokens WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM access_tokens WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM approved_devices WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM device_approvals_pending WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM handshakes WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)', uid);
+        safeDelete('DELETE FROM conversations WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM notifications WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM notification_preferences WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM service_preferences WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM activity_log WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM email_queue WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM rate_limits WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM subscriptions WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM two_factor_backup_codes WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM team_invitations WHERE sender_id = ? OR recipient_id = ?', uid, uid);
+        safeDelete('DELETE FROM marketplace_listings WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)', uid);
+        safeDelete('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)', uid);
+        safeDelete('DELETE FROM skills WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM personas WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM kb_documents WHERE owner_id = ?', uid);
+        safeDelete('DELETE FROM workspace_members WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM afp_devices WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM user_pii_secure WHERE user_id = ?', uid);
+        safeDelete('DELETE FROM users WHERE id = ?', uid);
+      })(userId);
+    } finally {
+      rawDb.pragma('foreign_keys = ON');
+    }
 
     if (req.session) {
       req.session.destroy(() => {});
@@ -5666,6 +7144,7 @@ app.delete('/api/v1/account', authenticate, (req, res) => {
 
     return res.json({ ok: true, deletedUserId: userId });
   } catch (error) {
+    try { (db.getRawDB ? db.getRawDB() : db).pragma('foreign_keys = ON'); } catch (_e) { /* ignore */ }
     console.error('Delete own account error:', error);
     return res.status(500).json({ error: 'Failed to delete account' });
   }
@@ -5676,6 +7155,15 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
   const pending = req.session?.oauth_signup;
   if (!pending) return res.status(400).json({ error: 'No pending OAuth signup session' });
 
+  if (betaMode.isBetaMode() && betaMode.isBetaFull()) {
+    return res.status(403).json({
+      error: 'Beta is at capacity. Join the waitlist to be notified when a spot opens.',
+      code: 'BETA_FULL',
+      waitlistUrl: '/api/v1/waitlist',
+      email: pending.email || null,
+    });
+  }
+
   const body = req.body || {};
   const confirm = body?.oauthSignupConfirm === true;
   const nonce = String(body?.oauthSignupNonce || '').trim();
@@ -5685,6 +7173,9 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
   }
   if (!confirm) {
     return res.status(400).json({ error: 'OAuth signup confirmation required' });
+  }
+  if (body?.termsAccepted !== true) {
+    return res.status(400).json({ error: 'You must accept the Terms of Use to create an account' });
   }
   if (!nonce || nonce !== String(pending.nonce || '')) {
     return res.status(400).json({ error: 'Invalid or expired OAuth signup nonce' });
@@ -5723,6 +7214,7 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
 
     try {
       createdUser = createUser(usernameCandidate, displayName, email, timezone, generatedPassword);
+      betaMode.invalidateBetaFullCache();
       createdUser = updateUserOAuthProfile(createdUser.id, {
         displayName,
         email,
@@ -5742,9 +7234,17 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
     return res.status(500).json({ error: 'Failed to complete OAuth signup' });
   }
 
-  const rawMasterToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
-  const hash = bcrypt.hashSync(rawMasterToken, 10);
-  const tokenId = createAccessToken(hash, createdUser.id, 'full', 'Master Token (OAuth Signup Session)', null, null, null, rawMasterToken, 'master');
+  // Use existing master token if already created (e.g. retry scenario), otherwise create exactly one
+  let rawMasterToken, tokenId;
+  const existingMaster = getExistingMasterToken(createdUser.id);
+  if (existingMaster) {
+    rawMasterToken = existingMaster.rawToken;
+    tokenId = existingMaster.tokenId;
+  } else {
+    rawMasterToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
+    const hash = bcrypt.hashSync(rawMasterToken, 10);
+    tokenId = createAccessToken(hash, createdUser.id, 'full', 'Master Token', null, null, null, rawMasterToken, 'master');
+  }
 
   await regenerateSession(req);
 
@@ -5758,6 +7258,7 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
     avatarUrl: createdUser.avatarUrl || null,
     two_factor_enabled: Boolean(createdUser.twoFactorEnabled),
     roles: createdUser.roles || 'user',
+    needsOnboarding: true,
   };
 
   // Set default workspace for new user
@@ -5782,10 +7283,50 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
     );
   }
 
+  // Store structured identity fields in profile_metadata (persists to DB)
+  const identityPatch = {};
+  ['role', 'company', 'location', 'bio'].forEach((f) => {
+    const v = String(body[f] || '').trim();
+    if (v) identityPatch[f] = v;
+  });
+  if (Object.keys(identityPatch).length > 0) {
+    updateUserOAuthProfile(createdUser.id, { profileMetadata: identityPatch });
+    vault.identityDocs[createdUser.id] = Object.assign(
+      { name: createdUser.displayName || createdUser.username },
+      identityPatch
+    );
+  }
+
+  // Create initial persona from soul content assembled by the signup wizard
+  const signupSoulContent = String(body.soulMd || '').trim();
+  if (signupSoulContent) {
+    try {
+      const newPersona = createPersona(
+        'My Assistant',
+        signupSoulContent,
+        'Initial persona created during signup',
+        null,
+        createdUser.id,
+        null
+      );
+      if (newPersona?.id) setActivePersona(newPersona.id, createdUser.id);
+    } catch (_) {}
+  }
+
+  // Mark new user as needing onboarding (stored in DB so it survives session loss)
+  setUserNeedsOnboarding(createdUser.id, true);
+
+  // Send welcome email (fire-and-forget; never block the signup response)
+  const signupEmail = createdUser.email || body.email || null;
+  const signupDisplayName = createdUser.displayName || createdUser.display_name || createdUser.username || '';
+  if (signupEmail) {
+    emailService.sendWelcomeEmail(signupEmail, signupDisplayName).catch(() => {});
+  }
+
   delete req.session.oauth_signup;
 
   res.cookie('myapi_master_token', rawMasterToken, {
-    httpOnly: false, // Required: JS reads this to set Authorization header
+    httpOnly: true,  // Not readable by JS; use GET /api/v1/auth/session-token instead
     secure: secureCookie,
     path: '/',
     maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -5900,6 +7441,11 @@ app.post('/api/v1/auth/2fa/verify', authenticate, (req, res) => {
     });
 
     if (!verified) return res.status(400).json({ error: 'Invalid 2FA code (check phone time sync and try current code)' });
+    const totpKey2 = String(code).replace(/\s+/g, '');
+    if (isTotpCodeUsed(userId, totpKey2)) {
+      return res.status(401).json({ error: '2FA code already used. Wait for the next code.' });
+    }
+    markTotpCodeUsed(userId, totpKey2);
 
     const enabled = enableUserTwoFactor(userId);
     if (!enabled) return res.status(500).json({ error: 'Failed to enable 2FA for this user' });
@@ -5945,6 +7491,11 @@ app.post('/api/v1/auth/2fa/disable', authenticate, (req, res) => {
     });
 
     if (!verified) return res.status(400).json({ error: 'Invalid 2FA code' });
+    const totpKey3 = String(code).replace(/\s+/g, '');
+    if (isTotpCodeUsed(userId, totpKey3)) {
+      return res.status(401).json({ error: '2FA code already used. Wait for the next code.' });
+    }
+    markTotpCodeUsed(userId, totpKey3);
 
     disableUserTwoFactor(userId);
     if (req.session?.user) req.session.user.two_factor_enabled = false;
@@ -6066,6 +7617,9 @@ app.post("/api/v1/auth/logout", (req, res) => {
 
   const sid = req.sessionID;
 
+  // SOC2 CC6: Remove from concurrent session registry
+  if (req.session.user?.id) unregisterUserSession(req.session.user.id, sid);
+
   // BUG-12: Ensure ALL session data is cleared before responding
   // Clear all session properties that might contain sensitive data
   delete req.session.pending_2fa_user;
@@ -6073,7 +7627,7 @@ app.post("/api/v1/auth/logout", (req, res) => {
   delete req.session.masterTokenRaw;
   delete req.session.masterTokenId;
   delete req.session.oauth_login_pending;
-  delete req.session.oauth_confirm_token;
+  delete req.session.oauth_confirm;
   delete req.session.oauth_signup;
   delete req.session.oauthStateMeta;
   delete req.session.isFirstLogin;
@@ -6102,6 +7656,33 @@ app.post("/api/v1/auth/logout", (req, res) => {
     // Send response only after session is fully destroyed
     res.json({ ok: true, message: 'Logged out successfully' });
   });
+});
+
+// SOC2 CC6 — Revoke all active sessions for the current user
+app.post('/api/v1/auth/sessions/revoke-all', (req, res) => {
+  const userId = req.session?.user?.id || null;
+  if (!userId) return res.status(401).json({ error: 'Not authenticated' });
+
+  const currentSid = req.sessionID;
+  revokeAllUserSessions(userId);
+
+  // Also destroy the current session
+  clearAuthCookies(req, res);
+  req.session.destroy(() => {
+    if (sessionStore && typeof sessionStore.destroy === 'function') {
+      try { sessionStore.destroy(currentSid, () => {}); } catch (_) {}
+    }
+  });
+
+  createAuditLog({
+    requesterId: userId,
+    action: 'revoke_all_sessions',
+    resource: '/auth/sessions/revoke-all',
+    scope: 'session',
+    ip: req.ip
+  });
+
+  res.json({ ok: true, message: 'All sessions revoked' });
 });
 
 // ============================
@@ -6219,43 +7800,61 @@ app.delete('/api/v1/users/:id', authenticate, (req, res) => {
     const { id } = req.params;
     const user = getUserById(id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const configuredPowerUserEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || getOwnerEmailFromUserDoc() || '').trim().toLowerCase();
-    if (configuredPowerUserEmail && String(user.email || '').toLowerCase() === configuredPowerUserEmail) {
+    const _pwrEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    if (_pwrEmail && String(user.email || '').toLowerCase() === _pwrEmail) {
       return res.status(400).json({ error: 'Cannot delete power user account' });
     }
 
-    const tx = db.transaction((userId) => {
-      // Delete from all tables that reference this user (in dependency order)
-      db.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM vault_tokens WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM access_tokens WHERE owner_id = ?').run(userId);
-      db.prepare('DELETE FROM approved_devices WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM device_approvals_pending WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM handshakes WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)').run(userId);
-      db.prepare('DELETE FROM conversations WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM notifications WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM notification_preferences WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM service_preferences WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM activity_log WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM email_queue WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM rate_limits WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM subscriptions WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = ?').run(userId);
-      db.prepare('DELETE FROM team_invitations WHERE sender_id = ? OR recipient_id = ?').run(userId, userId);
-      db.prepare('DELETE FROM marketplace_listings WHERE owner_id = ?').run(userId);
-      db.prepare('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(userId);
-      db.prepare('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(userId);
-      db.prepare('DELETE FROM skills WHERE owner_id = ?').run(userId);
-      db.prepare('DELETE FROM personas WHERE owner_id = ?').run(userId);
-      db.prepare('DELETE FROM kb_documents WHERE owner_id = ?').run(userId);
-      db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-    });
-    tx(id);
+    const adminRawDb = db.getRawDB ? db.getRawDB() : db;
+    const adminExistingTables = new Set(
+      adminRawDb.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name)
+    );
+    const adminSafeDelete = (sql, ...params) => {
+      const match = sql.match(/DELETE FROM (\w+)/i);
+      if (match && !adminExistingTables.has(match[1])) return;
+      adminRawDb.prepare(sql).run(...params);
+    };
+
+    adminRawDb.pragma('foreign_keys = OFF');
+    try {
+      adminRawDb.transaction((userId) => {
+        // Delete from all tables that reference this user (in dependency order)
+        adminSafeDelete('DELETE FROM oauth_tokens WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM vault_tokens WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM access_tokens WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM approved_devices WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM device_approvals_pending WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM handshakes WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)', userId);
+        adminSafeDelete('DELETE FROM conversations WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM notifications WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM notification_preferences WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM service_preferences WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM activity_log WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM email_queue WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM rate_limits WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM subscriptions WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM two_factor_backup_codes WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM team_invitations WHERE sender_id = ? OR recipient_id = ?', userId, userId);
+        adminSafeDelete('DELETE FROM marketplace_listings WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)', userId);
+        adminSafeDelete('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)', userId);
+        adminSafeDelete('DELETE FROM skills WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM personas WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM kb_documents WHERE owner_id = ?', userId);
+        adminSafeDelete('DELETE FROM workspace_members WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM afp_devices WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM user_pii_secure WHERE user_id = ?', userId);
+        adminSafeDelete('DELETE FROM users WHERE id = ?', userId);
+      })(id);
+    } finally {
+      adminRawDb.pragma('foreign_keys = ON');
+    }
 
     createAuditLog({ requesterId: req.tokenMeta.tokenId, action: 'delete_user', resource: `/users/${id}`, scope: req.tokenMeta.scope, ip: req.ip, details: { email: user.email || null } });
     res.json({ ok: true, deletedUserId: id });
   } catch (error) {
+    try { (db.getRawDB ? db.getRawDB() : db).pragma('foreign_keys = ON'); } catch (_e) { /* ignore */ }
     console.error('Delete user error:', error);
     res.status(500).json({ error: 'Failed to delete user' });
   }
@@ -6269,23 +7868,23 @@ app.post('/api/v1/users/cleanup-test-users', authenticate, (req, res) => {
   try {
     const users = db.prepare('SELECT id, email, username FROM users WHERE username LIKE ?').all(`${prefix}%`);
     let deleted = 0;
-    const tx = db.transaction((list) => {
+    const cleanupRawDb = db.getRawDB ? db.getRawDB() : db;
+    cleanupRawDb.transaction((list) => {
       for (const u of list) {
-        db.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').run(u.id);
-        db.prepare('DELETE FROM access_tokens WHERE owner_id = ?').run(u.id);
-        db.prepare('DELETE FROM handshakes WHERE user_id = ?').run(u.id);
-        db.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)').run(u.id);
-        db.prepare('DELETE FROM conversations WHERE user_id = ?').run(u.id);
-        db.prepare('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(u.id);
-        db.prepare('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(u.id);
-        db.prepare('DELETE FROM skills WHERE owner_id = ?').run(u.id);
-        db.prepare('DELETE FROM personas WHERE owner_id = ?').run(u.id);
-        db.prepare('DELETE FROM kb_documents WHERE owner_id = ?').run(u.id);
-        const r = db.prepare('DELETE FROM users WHERE id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM oauth_tokens WHERE user_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM access_tokens WHERE owner_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM handshakes WHERE user_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM conversations WHERE user_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM persona_documents WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM persona_skills WHERE persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM skills WHERE owner_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM personas WHERE owner_id = ?').run(u.id);
+        cleanupRawDb.prepare('DELETE FROM kb_documents WHERE owner_id = ?').run(u.id);
+        const r = cleanupRawDb.prepare('DELETE FROM users WHERE id = ?').run(u.id);
         if (r.changes > 0) deleted += 1;
       }
-    });
-    tx(users);
+    })(users);
 
     createAuditLog({ requesterId: req.tokenMeta.tokenId, action: 'cleanup_test_users', resource: '/users/cleanup-test-users', scope: req.tokenMeta.scope, ip: req.ip, details: { prefix, deleted } });
     res.json({ ok: true, prefix, deleted });
@@ -6300,18 +7899,24 @@ app.post('/api/v1/users/cleanup-test-users', authenticate, (req, res) => {
 // ============================
 
 // PUBLIC: AI agent initiates a handshake request (no auth required - this is the entry point)
-app.post("/api/v1/handshakes", (req, res) => {
+app.post("/api/v1/handshakes", rateLimit(60000, 20, 'handshake'), (req, res) => {
   const { agentId, requestedScopes, message } = req.body;
   if (!agentId || !requestedScopes || !Array.isArray(requestedScopes)) {
     return res.status(400).json({ error: "agentId and requestedScopes (array) are required" });
   }
+  if (typeof agentId !== 'string' || agentId.length > 256)
+    return res.status(400).json({ error: 'agentId must be a string of ≤256 chars' });
+  if (message !== undefined && (typeof message !== 'string' || message.length > 2000))
+    return res.status(400).json({ error: 'message must be a string of ≤2000 chars' });
+  if (requestedScopes.length > 10)
+    return res.status(400).json({ error: 'Too many requested scopes (max 10)' });
   const validScopes = ["read", "professional", "availability"];
   const invalidScopes = requestedScopes.filter(s => !validScopes.includes(s));
   if (invalidScopes.length > 0) {
     return res.status(400).json({ error: `Invalid scopes: ${invalidScopes.join(", ")}. Allowed: ${validScopes.join(", ")}` });
   }
   const handshake = createHandshake("owner", agentId, requestedScopes, message);
-  createAuditLog({ requesterId: agentId, action: "handshake_request", resource: `/handshakes/${handshake.id}`, scope: requestedScopes.join(","), ip: req.ip });
+  createAuditLog({ requesterId: agentId, action: "handshake_request", resource: `/handshakes/${handshake.id}`, scope: requestedScopes.slice(0, 10).map(s => String(s).slice(0, 50)).join(',').slice(0, 500), ip: req.ip });
   res.status(201).json({
     data: {
       handshakeId: handshake.id,
@@ -6764,7 +8369,7 @@ app.get('/api/v1/oauth/authorize/twitter/x', (req, res) => {
 });
 
 // GET /api/v1/oauth/authorize/:service - Start OAuth flow
-app.get("/api/v1/oauth/authorize/:service", (req, res) => {
+app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
   const { service } = req.params;
   const mode = (req.query.mode || 'connect').toString();
   const explicitForcePrompt = req.query.forcePrompt != null
@@ -6772,20 +8377,8 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
     : null;
   const forcePrompt = explicitForcePrompt == null ? mode === 'login' : explicitForcePrompt;
 
-  // CRITICAL FIX: If masterToken is passed as query param, set it in Authorization header for authentication
-  if (req.query.token && !req.headers.authorization) {
-    req.headers.authorization = `Bearer ${req.query.token}`;
-    console.log(`[OAuth Authorize] Injected Bearer token from query param`);
-  }
-
-  // DEBUG: Log all requests
-  console.log(`[OAuth] authorize/${service} requested`);
-  console.log(`[OAuth] Mode: ${mode}`);
-  console.log(`[OAuth] Available services: ${OAUTH_SERVICES.join(', ')}`);
-
   // Validate service parameter
   if (!service || typeof service !== 'string' || service.trim().length === 0) {
-    console.log(`[OAuth] ERROR: Invalid service parameter: "${service}"`);
     return res.status(400).json({
       error: 'Invalid service parameter',
       message: `Service parameter must be a non-empty string. Got: ${typeof service}`
@@ -6794,7 +8387,6 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
 
   // Check if service is in the list of supported OAuth services
   if (!OAUTH_SERVICES.includes(service)) {
-    console.log(`[OAuth] ERROR: Service "${service}" not in supported services. Available: ${OAUTH_SERVICES.join(', ')}`);
     return res.status(400).json({
       error: `Service "${service}" not supported`,
       availableServices: OAUTH_SERVICES,
@@ -6806,7 +8398,6 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
   if (!isOAuthServiceEnabled(service)) {
     const adapter = oauthAdapters[service];
     const isConfigured = adapter ? isAdapterConfigured(adapter) : false;
-    console.log(`[OAuth] ERROR: Service "${service}" is not enabled. Configured: ${isConfigured}`);
 
     return res.status(400).json({
       error: `Service "${service}" is not enabled or configured`,
@@ -6833,40 +8424,31 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
 
   // Try to authenticate the user to get ownerId
   // This checks session, Bearer token, and masterToken cookie
-  tryAuthenticate(req);
+  await tryAuthenticate(req);
 
   // Get ownerId from multiple sources (SAME priority as callback will use)
   let ownerId = null;
   if (req.session?.user?.id) {
     ownerId = String(req.session.user.id);
-    console.log(`[OAuth Authorize] Got ownerId from session: ${ownerId}`);
   } else if (req.tokenMeta?.ownerId) {
     ownerId = String(req.tokenMeta.ownerId);
-    console.log(`[OAuth Authorize] Got ownerId from Bearer token: ${ownerId}`);
   } else if (req.cookies?.myapi_master_token) {
     // FALLBACK: Extract ownerId from masterToken cookie
     try {
       const masterTokenRaw = req.cookies.myapi_master_token;
       const accessTokens = getAccessTokens() || [];
-      const tokenRecord = accessTokens.find(t => {
-        try {
-          return t.token && bcrypt.compareSync(masterTokenRaw, t.token);
-        } catch {
-          return false;
+      for (const t of accessTokens) {
+        if (t.hash && await bcrypt.compare(masterTokenRaw, t.hash).catch(() => false)) {
+          ownerId = String(t.ownerId);
+          break;
         }
-      });
-      if (tokenRecord) {
-        ownerId = String(tokenRecord.ownerId);
-        console.log(`[OAuth Authorize] Got ownerId from masterToken cookie: ${ownerId}`);
       }
     } catch (err) {
       console.warn(`[OAuth Authorize] Failed to extract ownerId from masterToken:`, err.message);
     }
   }
 
-  // Log the resolved ownerId
-  console.log(`[OAuth Authorize] Final ownerId: ${ownerId || 'NULL'} (from session=${req.session?.user?.id || 'null'}, Bearer=${req.tokenMeta?.ownerId || 'null'}, masterToken=${req.cookies?.myapi_master_token ? 'present' : 'absent'})`);
-  console.log(`[OAuth Authorize] ${service} flow initiated: req.session.user=${req.session?.user?.id || 'UNSET'}, req.tokenMeta.ownerId=${req.tokenMeta?.ownerId || 'UNSET'} -> ownerId=${ownerId || 'NULL'}`);
+  logger.debug('[OAuth Authorize] flow initiated', { service, hasOwnerId: !!ownerId });
   req.session.oauthStateMeta[state] = {
     mode,
     forcePrompt,
@@ -6929,7 +8511,6 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
   const wantsJson = String(req.query.json || '').toLowerCase() === '1';
 
   if (wantsJson) {
-    console.log(`[OAuth] Returning JSON response for ${service}`);
     // CRITICAL: Save session before responding, otherwise oauthStateMeta won't persist
     return req.session.save((err) => {
       if (err) {
@@ -6947,14 +8528,11 @@ app.get("/api/v1/oauth/authorize/:service", (req, res) => {
 
   // Default behavior: redirect to OAuth provider
   // CRITICAL: Save session before redirect, otherwise oauthStateMeta won't persist
-  console.log(`[OAuth] Redirecting to ${service} OAuth provider at: ${authUrl.split('?')[0]}`);
-  console.log(`[OAuth Authorize] Saving session with oauthStateMeta before redirect...`);
   return req.session.save((err) => {
     if (err) {
       console.error(`[OAuth Authorize] ❌ Session save failed:`, err);
       return res.status(500).json({ error: 'Failed to save session for OAuth flow' });
     }
-    console.log(`[OAuth Authorize] ✅ Session saved, redirecting to OAuth provider`);
     res.redirect(authUrl);
   });
 });
@@ -7043,10 +8621,17 @@ app.get([
   // Clean up state token from session after validation
   if (req.session?.oauthStateMeta) delete req.session.oauthStateMeta[state];
 
-  // Prevent open redirect
-  let safeReturnTo = stateMeta.returnTo || '/dashboard/';
-  if (!safeReturnTo.startsWith('/') || safeReturnTo.startsWith('//')) {
-    safeReturnTo = '/dashboard/';
+  // Prevent open redirect — validate using URL parsing, not string prefix checks
+  let safeReturnTo = '/dashboard/';
+  if (stateMeta.returnTo) {
+    try {
+      const parsed = new URL(stateMeta.returnTo, 'http://localhost');
+      if (parsed.hostname === 'localhost') {
+        safeReturnTo = parsed.pathname + (parsed.search || '') + (parsed.hash || '');
+      }
+    } catch {
+      // malformed URL — use default
+    }
   }
 
   try {
@@ -7111,6 +8696,12 @@ app.get([
 
       // NEW USER: Store OAuth data in session and route to explicit signup flow (no silent login/create)
       if (!appUser) {
+        // BETA cap: block new-user creation at the callback itself so the user never
+        // bounces through the signup wizard only to be rejected at the final step.
+        if (betaMode.isBetaMode() && betaMode.isBetaFull()) {
+          const waitlistEmail = email ? `&email=${encodeURIComponent(email)}` : '';
+          return res.redirect(`/?beta=full${waitlistEmail}`);
+        }
         req.session.oauth_signup = {
           service,
           providerUserId,
@@ -7190,7 +8781,7 @@ app.get([
 
       // Store BOTH in session AND in database as backup
       // Session: for normal case where cookies are sent
-      req.session.oauth_confirm_token = confirmToken;
+      req.session.oauth_confirm = { token: confirmToken, createdAt: Date.now() };
       // Note: req.session.oauth_login_pending is already set above with appUser data
       // No need to redefine it here
 
@@ -7229,21 +8820,16 @@ app.get([
       return req.session.save((err) => {
         if (err) {
           console.error('[OAuth Callback] ❌ Session save failed before confirm_login redirect:', err);
-        } else {
-          console.log(`[OAuth Callback] ✅ Session saved. ID=${req.sessionID}`);
         }
 
         const nextUrl = encodeURIComponent(safeReturnTo);
         const confirmUrl = `/dashboard/?oauth_service=${service}&oauth_status=confirm_login&next=${nextUrl}&token=${confirmToken}`;
-        console.log(`[OAuth Callback] Redirecting to confirm_login: ${confirmUrl}`);
         res.redirect(confirmUrl);
       });
     }
 
     // Store token for authenticated owner (connect flow and non-primary login flow)
     const oauthOwnerId = req.session?.user?.id ? String(req.session.user.id) : (stateMeta?.ownerId ? String(stateMeta.ownerId) : null);
-    console.log(`[OAuth Callback] Using oauthOwnerId: ${oauthOwnerId} (from session.user: ${req.session?.user?.id || 'null'}, from stateMeta: ${stateMeta?.ownerId || 'null'})`);
-    console.log(`[OAuth Callback] Determining oauthOwnerId: req.session.user.id=${req.session?.user?.id || 'UNSET'}, stateMeta.ownerId=${stateMeta?.ownerId || 'UNSET'} -> oauthOwnerId=${oauthOwnerId || 'NULL'}`);
 
     // Never auto-login users in connect mode.
     // If user is unauthenticated, abort to prevent unexpected account restoration.
@@ -7261,21 +8847,14 @@ app.get([
         return res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent('plan_limit_reached')}`);
       }
 
-      console.log(`[OAuth Callback] Storing ${service} token for owner: ${oauthOwnerId} (mode=${stateMeta.mode || 'connect'})`);
       const storeResult = storeOAuthToken(service, oauthOwnerId, tokenData.accessToken, tokenData.refreshToken || null, expiresAt, tokenData.scope);
       tokenStoredForUser = true;
-      console.log(`[OAuth Callback] ✅ Token stored:`, { service, userId: oauthOwnerId });
+      logger.info('[OAuth Callback] token stored', { service });
 
       // CRITICAL: Ensure req.session.user is populated for subsequent API calls
       // This is absolutely essential for /api/v1/oauth/status to find the user
-      console.log(`[OAuth Callback] Setting session.user for connect flow...`);
-      console.log(`[OAuth Callback]   Before: req.session.user = ${req.session.user ? req.session.user.id : 'NULL'}`);
-      console.log(`[OAuth Callback]   oauthOwnerId = ${oauthOwnerId}`);
-
       if (!req.session.user && oauthOwnerId) {
-        console.log(`[OAuth Callback]   Calling getUserById(${oauthOwnerId})...`);
         const ownerUser = getUserById(oauthOwnerId);
-        console.log(`[OAuth Callback]   getUserById returned:`, ownerUser ? `USER FOUND: ${ownerUser.id}` : 'NULL');
 
         if (ownerUser) {
           req.session.user = {
@@ -7286,14 +8865,9 @@ app.get([
             avatarUrl: ownerUser.avatarUrl || null,
             twoFactorEnabled: Boolean(ownerUser.twoFactorEnabled),
           };
-          console.log(`[OAuth Callback] ✅ SUCCESS: Set req.session.user = ${req.session.user.id}`);
         } else {
-          console.log(`[OAuth Callback] ❌ FAILURE: getUserById returned NULL for ${oauthOwnerId}`);
+          logger.warn('[OAuth Callback] getUserById returned null', { service });
         }
-      } else if (req.session.user) {
-        console.log(`[OAuth Callback]   Already set: ${req.session.user.id}`);
-      } else {
-        console.log(`[OAuth Callback] ❌ No oauthOwnerId to use`);
       }
     }
 
@@ -7352,7 +8926,7 @@ app.get([
     // Store in session if found so /api/v1/auth/me can return it to the frontend
     if (masterToken) {
       req.session.masterTokenRaw = masterToken;
-      console.log(`[OAuth Callback] Set req.session.masterTokenRaw = ${masterToken.slice(0, 20)}...`);
+      logger.debug('[OAuth] master token stored in session');
     } else {
       console.log(`[OAuth Callback] No existing master token found — frontend will bootstrap one if needed`);
     }
@@ -7360,7 +8934,7 @@ app.get([
     // Set master token as a persistent cookie so the dashboard can use it
     if (masterToken) {
       res.cookie('myapi_master_token', masterToken, {
-        httpOnly: false, // Required: JS reads this to set Authorization header
+        httpOnly: true,  // Not readable by JS; use GET /api/v1/auth/session-token instead
         secure: secureCookie,
         path: '/',
         maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
@@ -7381,14 +8955,10 @@ app.get([
 
     const redirectUrl = `/dashboard/?oauth_service=${service}&oauth_status=connected&mode=${encodeURIComponent(stateMeta.mode || 'connect')}&next=${next}`;
 
-    console.log(`[OAuth Callback] Before saving session: req.session.id=${req.sessionID}, req.session.user=${req.session.user ? req.session.user.id : 'UNSET'}`);
     req.session.save((err) => {
       if (err) {
         console.error('[OAuth] Session save error:', err);
-      } else {
-        console.log(`[OAuth Callback] ✅ Session saved successfully. ID=${req.sessionID}`);
       }
-      console.log(`[OAuth Callback] Redirecting to: ${redirectUrl}`);
       res.redirect(redirectUrl);
     });
   } catch (error) {
@@ -7399,22 +8969,16 @@ app.get([
       ip: req.ip,
       details: { service, error: error.message }
     });
-    res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent(error.message)}`);
+    const safeErrCode = (error.code || 'oauth_error').replace(/[^a-z0-9_]/gi, '').slice(0, 32) || 'oauth_error';
+    res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent(safeErrCode)}`);
   }
 });
 
 // Helper: Try to authenticate and populate tokenMeta, but don't fail if not present
-function tryAuthenticate(req) {
-  console.log(`[tryAuth] Attempting authentication...`);
-  console.log(`[tryAuth]   Session ID: ${req.sessionID}`);
-  console.log(`[tryAuth]   Session user: ${req.session?.user ? req.session.user.id : 'NONE'}`);
-  console.log(`[tryAuth]   Auth header: ${req.headers["authorization"] ? 'YES' : 'NO'}`);
-  console.log(`[tryAuth]   Cookies:`, Object.keys(req.cookies || {}));
-
+async function tryAuthenticate(req) {
   // Priority 1: Session user
   if (req.session?.user?.id) {
     req.tokenMeta = { tokenId: `sess_${req.session.user.id}`, scope: 'full', ownerId: String(req.session.user.id) };
-    console.log(`[tryAuth] ✅ Authenticated via session: ${req.session.user.id}`);
     return;
   }
 
@@ -7424,21 +8988,13 @@ function tryAuthenticate(req) {
   if (parts.length === 2 && parts[0] === "Bearer") {
     const rawToken = parts[1];
     const tokens = getAccessTokens() || [];
-    console.log(`[tryAuth] Checking Bearer token against ${tokens.length} stored tokens...`);
     for (const tokenMeta of tokens) {
-      if (!tokenMeta.revokedAt && bcrypt.compareSync(rawToken, tokenMeta.hash)) {
+      if (!tokenMeta.revokedAt && tokenMeta.hash && await bcrypt.compare(rawToken, tokenMeta.hash).catch(() => false)) {
         req.tokenMeta = { tokenId: tokenMeta.id, scope: tokenMeta.scope, ownerId: String(tokenMeta.ownerId) };
-        console.log(`[tryAuth] ✅ Authenticated via Bearer token: ${tokenMeta.ownerId}`);
         return;
       }
     }
-    console.log(`[tryAuth] ❌ Bearer token didn't match any stored tokens`);
-  } else {
-    console.log(`[tryAuth] ❌ No Bearer token in Authorization header`);
   }
-
-  // Not authenticated, but that's ok for this endpoint
-  console.log(`[tryAuth] Not authenticated, will show public view (all disconnected)`);
 }
 
 // GET /api/v1/oauth/status - Get all connected services
@@ -7446,7 +9002,7 @@ function tryAuthenticate(req) {
 app.get("/api/v1/oauth/status", async (req, res) => {
   // Note: This endpoint is PUBLIC because it's called from dashboard during OAuth flow
   // It needs to work even before user is fully authenticated
-  tryAuthenticate(req); // Best effort to identify user if logged in
+  await tryAuthenticate(req); // Best effort to identify user if logged in
   
   // Get user ID from available sources (in order of priority)
   let userId = null;
@@ -7454,8 +9010,22 @@ app.get("/api/v1/oauth/status", async (req, res) => {
     userId = String(req.session.user.id);
   } else if (req.tokenMeta?.ownerId) {
     userId = String(req.tokenMeta.ownerId);
+
+    // Bearer token caller: enforce services:read or master scope
+    const meta = req.tokenMeta;
+    const isMasterToken = meta.scope === 'full' || meta.tokenType === 'master';
+    if (!isMasterToken) {
+      let scopes = [];
+      try { const p = JSON.parse(meta.scope); scopes = Array.isArray(p) ? p : []; } catch { /* ignore */ }
+      const hasAccess = scopes.some(s =>
+        s === 'services:read' || s === 'services:write' || s.startsWith('services:')
+      );
+      if (!hasAccess) {
+        return res.status(403).json({ error: "Requires 'services:read' scope" });
+      }
+    }
   }
-  
+
   // If no user identified, return empty/all-disconnected status (public access)
   if (!userId) {
     const services = OAUTH_SERVICES.map(service => ({
@@ -7487,9 +9057,6 @@ app.get("/api/v1/oauth/status", async (req, res) => {
             setCachedOAuthToken(service, userId, token);
           }
         }
-        if (service === 'twitter' || service === 'discord') {
-          console.log(`[OAuth Status DEBUG] ${service}: userId=${userId}, token=${token ? 'FOUND' : 'NOT_FOUND'}`);
-        }
         // Source of truth: actual token existence, not oauth_status table (which can be stale)
         connectionStatus = token && !token.revoked_at ? "connected" : "disconnected";
       } catch (err) {
@@ -7499,7 +9066,6 @@ app.get("/api/v1/oauth/status", async (req, res) => {
         connectionStatus = "disconnected";
       }
     } else {
-      console.log(`[OAuth Status DEBUG] No userId found for ${service}`);
       connectionStatus = "disconnected";
     }
 
@@ -7530,28 +9096,29 @@ app.get("/api/v1/oauth/status", async (req, res) => {
 });
 
 // POST /api/v1/oauth/confirm - Confirm pending OAuth login
-app.post("/api/v1/oauth/confirm", (req, res) => {
+app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
   try {
     const { token } = req.body || {};
 
-    console.log(`[OAuth Confirm] Attempting confirmation:`);
-    console.log(`  - Session ID: ${req.sessionID}`);
-    console.log(`  - Session user: ${req.session?.user ? req.session.user.id : 'NONE'}`);
-    console.log(`  - Token provided: ${token ? token.slice(0, 20) + '...' : 'NONE'}`);
-    console.log(`  - oauth_confirm_token: ${req.session?.oauth_confirm_token ? req.session.oauth_confirm_token.slice(0, 20) + '...' : 'NONE'}`);
-    console.log(`  - oauth_login_pending: ${req.session?.oauth_login_pending ? 'YES' : 'NO'}`);
+    logger.debug('[OAuth Confirm] Attempting confirmation', { sessionId: req.sessionID, hasToken: !!token });
 
     if (!token || typeof token !== 'string') {
-      console.log(`[OAuth Confirm] ❌ FAILED: Invalid or missing confirmation token`);
       return res.status(400).json({ error: 'Invalid or missing confirmation token' });
     }
 
     // Check if token matches what's in the session
-    if (!req.session?.oauth_confirm_token || req.session.oauth_confirm_token !== token) {
+    const oauthConfirm = req.session?.oauth_confirm;
+    if (!oauthConfirm || oauthConfirm.token !== token) {
       console.log(`[OAuth Confirm] ❌ FAILED: Token mismatch or missing`);
-      console.log(`  - Expected: ${req.session?.oauth_confirm_token ? 'exists' : 'MISSING'}`);
-      console.log(`  - Match: ${req.session?.oauth_confirm_token === token ? 'YES' : 'NO'}`);
+      console.log(`  - Expected: ${oauthConfirm ? 'exists' : 'MISSING'}`);
+      console.log(`  - Match: ${oauthConfirm?.token === token ? 'YES' : 'NO'}`);
       return res.status(403).json({ error: 'Invalid confirmation token' });
+    }
+
+    // Check confirm token expiry (15 minutes)
+    if (Date.now() - oauthConfirm.createdAt > 15 * 60 * 1000) {
+      delete req.session.oauth_confirm;
+      return res.status(403).json({ error: 'Confirmation token expired. Please sign in again.' });
     }
 
     // Check if we have pending login credentials (try session first, then database as fallback)
@@ -7604,20 +9171,31 @@ app.post("/api/v1/oauth/confirm", (req, res) => {
 
     // Clear pending login and token
     delete req.session.oauth_login_pending;
-    delete req.session.oauth_confirm_token;
+    delete req.session.oauth_confirm;
+
+    // Proactively load the canonical master token into session so the frontend
+    // gets it immediately without a separate bootstrap round-trip
+    const existingMasterForConfirm = getExistingMasterToken(pending.userId);
+    if (existingMasterForConfirm) {
+      req.session.masterTokenRaw = existingMasterForConfirm.rawToken;
+      req.session.masterTokenId = existingMasterForConfirm.tokenId;
+    }
 
     // Save session and respond
     req.session.save((err) => {
       if (err) {
-        console.error('[OAuth Confirm] ❌ Session save failed:', err);
-        // FALLBACK: Even if session save fails, return the user data so frontend can proceed
-        // The session will eventually sync when the user navigates
-        console.log('[OAuth Confirm] Fallback: Returning user data despite session save error');
+        logger.error('[OAuth Confirm] Session save failed', { error: err.message });
         return res.status(200).json({ ok: true, user: req.session.user, warning: 'Session sync delayed' });
       }
 
-      console.log(`[OAuth Confirm] ✅ Login confirmed for user: ${pending.userId}, session saved`);
-      res.json({ ok: true, user: req.session.user });
+      logger.info('[OAuth Confirm] Login confirmed', { userId: pending.userId });
+      res.json({
+        ok: true,
+        user: req.session.user,
+        bootstrap: existingMasterForConfirm
+          ? { tokenId: existingMasterForConfirm.tokenId, hasToken: true }
+          : null,
+      });
     });
   } catch (err) {
     console.error('[OAuth Confirm] Error:', err);
@@ -7655,7 +9233,7 @@ app.post("/api/v1/oauth/disconnect/:service", authenticate, async (req, res) => 
     }
 
     if (!token) {
-      return res.status(404).json({ error: "No token found for this service" });
+      return res.json({ ok: true, message: `${service} was not connected` });
     }
 
     // Try to revoke on remote service (only if we have a valid token)
@@ -7674,6 +9252,13 @@ app.post("/api/v1/oauth/disconnect/:service", authenticate, async (req, res) => 
 
     // Update OAuth status
     updateOAuthStatus(service, "disconnected");
+
+    // Notify user of disconnection
+    const disconnectWs = getWorkspaces(userId);
+    if (disconnectWs?.length) {
+      NotificationDispatcher.onServiceDisconnected(disconnectWs[0].id, userId, service)
+        .catch(err => console.error('[OAuth Disconnect] Notification error:', err));
+    }
 
     // Log disconnection (with safety check for tokenMeta)
     const requesterId = req.tokenMeta?.tokenId || req.session?.user?.id || 'unknown';
@@ -7808,6 +9393,73 @@ app.get("/api/v1/keys/status", authenticate, adminOnly, (req, res) => {
   } catch (err) {
     console.error("Key status error:", err);
     res.status(500).json({ error: "Failed to get key status" });
+  }
+});
+
+// POST /api/v1/admin/security/rotate-key — SOC 2 Phase 3.1
+// Requires admin scope + TOTP code (when 2FA is enabled on the account)
+// Quarterly rotation schedule: Jan 1, Apr 1, Jul 1, Oct 1
+app.post('/api/v1/admin/security/rotate-key', authenticate, adminOnly, async (req, res) => {
+  try {
+    const { totpCode } = req.body;
+    const userId = req.tokenMeta?.ownerId || req.session?.user?.id;
+
+    // 2FA gate: if the account has 2FA enabled the caller must supply a valid TOTP code
+    if (userId) {
+      const owner = getUserById(userId);
+      if (owner && owner.twoFactorEnabled) {
+        if (!totpCode) {
+          return res.status(401).json({ error: '2FA code required for key rotation', requires2FA: true });
+        }
+        const verified = speakeasy.totp.verify({
+          secret: owner.totpSecret,
+          encoding: 'base32',
+          token: String(totpCode).replace(/\s+/g, ''),
+          window: 2,
+        });
+        if (!verified) {
+          createAuditLog({
+            requesterId: userId,
+            action: 'key_rotation_2fa_failed',
+            resource: '/admin/security/rotate-key',
+            scope: req.tokenMeta?.scope,
+            ip: req.ip,
+            details: { reason: 'invalid_totp' }
+          });
+          alerting.trackFailedLogin(req.ip);
+          return res.status(401).json({ error: 'Invalid 2FA code', requires2FA: true });
+        }
+      }
+    }
+
+    const { rotateEncryptionKey } = require('./database');
+    const newVaultKey = req.body.vaultKey || process.env.VAULT_KEY;
+
+    if (!newVaultKey) {
+      return res.status(400).json({ error: 'vaultKey required in request body or VAULT_KEY env var' });
+    }
+
+    const result = rotateEncryptionKey(newVaultKey);
+
+    createAuditLog({
+      requesterId: req.tokenMeta?.tokenId,
+      action: 'key_rotation',
+      resource: '/admin/security/rotate-key',
+      scope: req.tokenMeta?.scope,
+      ip: req.ip,
+      details: { newVersion: result.newVersion, tokensRotated: result.tokensRotated, initiatedBy: userId }
+    });
+
+    res.json({
+      ok: true,
+      message: 'Encryption keys rotated successfully. Next scheduled rotation: see KEY_ROTATION_POLICY.md.',
+      newVersion: result.newVersion,
+      tokensRotated: result.tokensRotated,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.error('Key rotation error:', { error: err.message });
+    res.status(500).json({ error: 'Key rotation failed', message: err.message });
   }
 });
 
@@ -8214,6 +9866,10 @@ app.post('/api/v1/services/:serviceName/proxy', authenticate, async (req, res) =
     const http = require('http');
     const targetUrl = new URL(apiPath.startsWith('/') ? `${apiRoot}${apiPath}` : `${apiRoot}/${apiPath}`);
 
+    if (isPrivateHost(targetUrl.hostname)) {
+      return res.status(400).json({ error: 'Target URL resolves to a private address' });
+    }
+
     // Phase 3: Auto-inject service preferences (defaults)
     let finalBody = reqBody ? JSON.parse(JSON.stringify(reqBody)) : {};  // Deep copy
     try {
@@ -8295,9 +9951,31 @@ app.post('/api/v1/services/:serviceName/proxy', authenticate, async (req, res) =
     };
 
     if (token.accessToken) {
-      if (serviceName === 'github') headers['Authorization'] = `token ${token.accessToken}`;
-      else if (serviceName === 'fal') headers['Authorization'] = `Key ${token.accessToken}`;
-      else headers['Authorization'] = `Bearer ${token.accessToken}`;
+      if (serviceName === 'github') {
+        headers['Authorization'] = `token ${token.accessToken}`;
+      } else if (serviceName === 'fal') {
+        headers['Authorization'] = `Key ${token.accessToken}`;
+      } else if (serviceName === 'discord') {
+        // Guild/channel endpoints require a bot token stored per-user in service preferences.
+        // User endpoints (/users/@me) use the OAuth bearer token as normal.
+        const isBotEndpoint = /^\/(guilds|channels)\//.test(apiPath);
+        if (isBotEndpoint) {
+          const discordPrefs = getServicePreference(userId, 'discord');
+          const botToken = String(discordPrefs?.preferences?.bot_token || '').trim();
+          if (!botToken) {
+            return res.status(503).json({
+              error: 'Discord bot token not configured',
+              message: 'Reading guild/channel data requires a personal bot token. Save it via PUT /api/v1/services/discord/preferences with {"bot_token":"<your-token>"}.',
+              hint: 'Get your bot token from: Discord Developer Portal → your app → Bot → Reset Token. The bot must be installed in the target server.'
+            });
+          }
+          headers['Authorization'] = `Bot ${botToken}`;
+        } else {
+          headers['Authorization'] = `Bearer ${token.accessToken}`;
+        }
+      } else {
+        headers['Authorization'] = `Bearer ${token.accessToken}`;
+      }
     }
 
     let bodyStr = null;
@@ -8587,15 +10265,19 @@ app.post('/api/v1/brain/chat', authenticate, async (req, res) => {
     const context = await contextEngine.assembleContext(convId, db);
 
     // Query global knowledge base
-    const relevantDocs = knowledgeBase.queryKnowledgeBase(message, 3, getRequestOwnerId(req));
+    let relevantDocs = knowledgeBase.queryKnowledgeBase(message, 3, getRequestOwnerId(req));
+    relevantDocs = (Array.isArray(relevantDocs) ? relevantDocs : [])
+      .filter((d) => isResourceAllowed(req, 'knowledge_docs', d.id));
 
     // Add persona-scoped docs + skills package when persona scope is active
     let personaDocs = [];
     let personaSkillPackages = [];
     if (personaScope.personaId !== null && personaScope.personaId !== undefined) {
       const ownerId = getRequestOwnerId(req);
-      personaDocs = getPersonaDocumentContents(personaScope.personaId, ownerId);
-      personaSkillPackages = Object.values(getPersonaSkillPackages(personaScope.personaId, ownerId));
+      personaDocs = getPersonaDocumentContents(personaScope.personaId, ownerId)
+        .filter((d) => isResourceAllowed(req, 'knowledge_docs', d.id));
+      personaSkillPackages = Object.values(getPersonaSkillPackages(personaScope.personaId, ownerId))
+        .filter((pkg) => isResourceAllowed(req, 'skills', pkg.id));
     }
 
     const rankedPersonaDocs = personaDocs
@@ -8791,6 +10473,11 @@ app.put('/api/v1/brain/knowledge-base/:id', authenticate, async (req, res) => {
 
     if (!content) return res.status(400).json({ error: 'content is required' });
 
+    // Per-resource allow-list gate (narrow-scoped token).
+    if (!isResourceAllowed(req, 'knowledge_docs', req.params.id)) {
+      return res.status(403).json({ error: 'Document not accessible with this token' });
+    }
+
     const existing = getKBDocumentById(req.params.id, ownerId);
     if (!existing) return res.status(404).json({ error: 'Document not found' });
 
@@ -8815,8 +10502,18 @@ app.put('/api/v1/brain/knowledge-base/:id', authenticate, async (req, res) => {
 // POST /api/v1/brain/knowledge-base/upsert - Create or update a document by title
 // Useful for agents that want to maintain a named document (e.g. "memory.md")
 app.post('/api/v1/brain/knowledge-base/upsert', authenticate, async (req, res) => {
-  if (!isMaster(req) && !hasScope(req, 'knowledge')) {
-    return res.status(403).json({ error: "Requires 'knowledge' scope or master token" });
+  // SECURITY FIX: KB write access restricted to master tokens only
+  // Non-master tokens with 'knowledge' scope can only READ, not modify/create
+  if (!isMaster(req)) {
+    createAuditLog({
+      requesterId: req.tokenMeta?.tokenId || 'unknown',
+      action: 'kb_document_upsert_denied',
+      resource: '/api/v1/brain/knowledge-base/upsert',
+      scope: req.tokenMeta?.scope || 'unknown',
+      ip: req.ip,
+      details: { reason: 'insufficient_scope_for_write' }
+    });
+    return res.status(403).json({ error: "Only master token can create or update knowledge base documents" });
   }
   try {
     const { title, content, source } = req.body;
@@ -8955,6 +10652,12 @@ app.get('/api/v1/brain/knowledge-base', authenticate, (req, res) => {
       documents = Array.isArray(documents) ? documents.filter(d => allowedIds.has(d.id)) : documents;
     }
 
+    // Per-resource allow-list filter: if the token specifies knowledge_docs,
+    // drop everything else. No-op for master tokens and tokens without an allow-list.
+    if (Array.isArray(documents)) {
+      documents = documents.filter((d) => isResourceAllowed(req, 'knowledge_docs', d.id));
+    }
+
     createAuditLog({
       requesterId: req.tokenMeta.tokenId,
       action: 'kb_documents_list',
@@ -8976,6 +10679,12 @@ app.get('/api/v1/brain/knowledge-base/:id', authenticate, (req, res) => {
   try {
     const { id } = req.params;
     const ownerId = getRequestOwnerId(req);
+
+    // Per-resource allow-list gate (narrow-scoped token).
+    if (!isResourceAllowed(req, 'knowledge_docs', id)) {
+      return res.status(403).json({ error: 'Document not accessible with this token' });
+    }
+
     const doc = getKBDocumentById(id, ownerId);
     if (!doc) return res.status(404).json({ error: 'Document not found' });
 
@@ -9003,6 +10712,12 @@ app.get('/api/v1/brain/knowledge-base/:id', authenticate, (req, res) => {
 
 // GET /api/v1/brain/knowledge-base/:id/attachments - list persona references
 app.get('/api/v1/brain/knowledge-base/:id/attachments', authenticate, (req, res) => {
+  if (!hasScope(req, 'knowledge') && !isMaster(req)) {
+    return res.status(403).json({ error: "Requires 'knowledge' scope" });
+  }
+  if (!isResourceAllowed(req, 'knowledge_docs', req.params.id)) {
+    return res.status(403).json({ error: 'Document not accessible with this token' });
+  }
   try {
     const { id } = req.params;
     const personaDocs = db.prepare(`
@@ -9061,6 +10776,7 @@ app.delete('/api/v1/brain/knowledge-base/:id', authenticate, (req, res) => {
 
 // GET /api/v1/memory - list all memories
 app.get('/api/v1/memory', authenticate, (req, res) => {
+  if (!hasScope(req, 'memory') && !isMaster(req)) return res.status(403).json({ error: "Insufficient scope — 'memory' scope required" });
   try {
     const ownerId = getRequestOwnerId(req);
     const memories = getMemories(ownerId, req.workspaceId || null);
@@ -9072,6 +10788,7 @@ app.get('/api/v1/memory', authenticate, (req, res) => {
 
 // POST /api/v1/memory - store a new memory
 app.post('/api/v1/memory', authenticate, (req, res) => {
+  if (!hasScope(req, 'memory') && !isMaster(req)) return res.status(403).json({ error: "Insufficient scope — 'memory' scope required" });
   try {
     const { content, source } = req.body;
     if (!content || typeof content !== 'string' || !content.trim()) {
@@ -9096,6 +10813,7 @@ app.post('/api/v1/memory', authenticate, (req, res) => {
 
 // PATCH /api/v1/memory/:id - update a memory
 app.patch('/api/v1/memory/:id', authenticate, (req, res) => {
+  if (!hasScope(req, 'memory') && !isMaster(req)) return res.status(403).json({ error: "Insufficient scope — 'memory' scope required" });
   try {
     const { content, source } = req.body;
     if (!content || typeof content !== 'string' || !content.trim()) {
@@ -9133,6 +10851,7 @@ app.delete('/api/v1/memory', authenticate, (req, res) => {
 
 // DELETE /api/v1/memory/:id - delete one memory
 app.delete('/api/v1/memory/:id', authenticate, (req, res) => {
+  if (!hasScope(req, 'memory') && !isMaster(req)) return res.status(403).json({ error: "Insufficient scope — 'memory' scope required" });
   try {
     const ownerId = getRequestOwnerId(req);
     const deleted = deleteMemory(req.params.id, ownerId);
@@ -9501,8 +11220,16 @@ app.delete('/api/v1/skills/:id', authenticate, (req, res) => {
   if (!hasScope(req, 'skills:write')) return res.status(403).json({ error: "Requires 'skills:write' scope" });
   try {
     const ownerId = getRequestOwnerId(req);
+    const skillToDelete = getSkillById(req.params.id, ownerId);
     const result = deleteSkill(req.params.id, ownerId);
     if (!result) return res.status(404).json({ error: 'Skill not found' });
+    if (skillToDelete) {
+      const skillDelWs = getWorkspaces(ownerId);
+      if (skillDelWs?.length) {
+        NotificationDispatcher.onSkillRemoved(skillDelWs[0].id, ownerId, skillToDelete.name, req.params.id)
+          .catch(() => {});
+      }
+    }
     res.json({ success: true });
   } catch (err) {
     console.error('Skill delete error:', err);
@@ -9931,6 +11658,13 @@ app.post('/api/v1/marketplace/:id/install', authenticate, (req, res) => {
           skillVersion: newSkill.version,
           skillCategory: newSkill.category,
         };
+
+        // Notify user of skill installation
+        const skillWsId = workspaceId || (getWorkspaces(ownerId)?.[0]?.id);
+        if (skillWsId) {
+          NotificationDispatcher.onSkillInstalled(skillWsId, ownerId, newSkill.name, newSkill.id)
+            .catch(() => {});
+        }
       }
     } else if (listing.type === 'token') {
       // Handle guest token installation
@@ -10012,9 +11746,9 @@ app.post('/api/v1/marketplace/:id/install', authenticate, (req, res) => {
             : null)
         );
 
-        // Add guest scope to the token's scopes
+        // Add guest scope to the token's scopes (column is granted_at, not created_at)
         db.prepare(`
-          INSERT INTO access_token_scopes (token_id, scope_name, created_at)
+          INSERT OR IGNORE INTO access_token_scopes (token_id, scope_name, granted_at)
           VALUES (?, 'guest', ?)
         `).run(guestTokenId, now);
 
@@ -10324,11 +12058,6 @@ const sendDashboardIndex = (req, res) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
-  const indexPath = path.join(__dirname, 'public', 'dist', 'index.html');
-  console.error(`[DEBUG] __dirname=${__dirname}, indexPath=${indexPath}`);
-  console.error(`[DEBUG] File exists: ${fs.existsSync(indexPath)}`);
-  const content = fs.readFileSync(indexPath, 'utf8');
-  console.error(`[DEBUG] File content has hash: ${content.includes('967lJ4z1') ? 'NEW (967lJ4z1)' : (content.includes('DVt2_1Di') ? 'OLD (DVt2_1Di)' : 'UNKNOWN')}`);
   res.sendFile('index.html', { root: path.join(__dirname, 'public', 'dist') }, (err) => {
     if (err) console.error(`[SPA Shell] sendFile error: ${err.message}`);
   });
@@ -10378,7 +12107,8 @@ const server = http.createServer(app);
 
 // Setup WebSocket server if available
 if (WebSocketServer) {
-  const wss = new WebSocketServer({ server });
+  // path: '/ws' lets nginx route WebSocket upgrades separately from HTTP traffic
+  const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws, req) => {
     console.log('New WebSocket connection');
@@ -10387,7 +12117,7 @@ if (WebSocketServer) {
     let isAuthenticated = false;
 
     // Handle WebSocket messages
-    ws.on('message', (message) => {
+    ws.on('message', async (message) => {
       try {
         const data = JSON.parse(message);
 
@@ -10409,6 +12139,52 @@ if (WebSocketServer) {
             message: 'WebSocket connection authenticated',
           }));
           console.log(`User ${userId} authenticated via WebSocket`);
+
+        // AFP daemon registration
+        } else if (data.type === 'afp:register') {
+          let device;
+          try { device = getAfpDeviceById(data.deviceId); } catch (_) {}
+          if (!device || device.revoked_at) {
+            ws.send(JSON.stringify({ type: 'afp:error', message: 'Unknown or revoked AFP device' }));
+            ws.close(4001, 'Unknown or revoked AFP device');
+            return;
+          }
+          const valid = await require('bcrypt').compare(String(data.deviceToken || ''), device.device_token_hash).catch(() => false);
+          if (!valid) {
+            ws.send(JSON.stringify({ type: 'afp:error', message: 'Invalid AFP device token' }));
+            ws.close(4002, 'Invalid AFP device token');
+            return;
+          }
+          // Close any stale WebSocket that was left over from a previous connection
+          // for this device. Without this, the old WS's close event would later
+          // delete the new entry from afpConnections, causing the next reconnect
+          // to be rejected as "offline".
+          const staleWs = afpConnections.get(data.deviceId);
+          if (staleWs && staleWs !== ws) {
+            try { staleWs.terminate(); } catch (_) {}
+          }
+          afpConnections.set(data.deviceId, ws);
+          updateAfpDeviceStatus(data.deviceId, 'online');
+          ws.afpDeviceId = data.deviceId;
+          ws.afpAlive = true;
+          ws.on('pong', () => { ws.afpAlive = true; });
+          ws.send(JSON.stringify({ type: 'afp:registered', deviceId: data.deviceId }));
+          console.log(`[AFP] Daemon connected: ${data.deviceId} (${data.hostname || 'unknown'})`);
+
+        // AFP result relay (daemon → waiting REST promise)
+        } else if (data.type === 'afp:result') {
+          const pending = afpPendingRequests.get(data.requestId);
+          if (pending) {
+            clearTimeout(pending.timer);
+            afpPendingRequests.delete(data.requestId);
+            if (data.ok) {
+              pending.resolve(data.data);
+            } else {
+              const e = new Error(data.error || 'Daemon error');
+              e.code = 'DAEMON_ERROR';
+              pending.reject(e);
+            }
+          }
         }
       } catch (err) {
         console.error('Error processing WebSocket message:', err);
@@ -10427,6 +12203,18 @@ if (WebSocketServer) {
           wsConnections.delete(userId);
         }
       }
+      // AFP daemon disconnect — only remove from map if this WS is still the active one.
+      // A newer reconnect may have already replaced it; deleting that entry would
+      // incorrectly mark the fresh connection offline.
+      if (ws.afpDeviceId) {
+        if (afpConnections.get(ws.afpDeviceId) === ws) {
+          afpConnections.delete(ws.afpDeviceId);
+          try { updateAfpDeviceStatus(ws.afpDeviceId, 'offline'); } catch (_) {}
+          console.log(`[AFP] Daemon disconnected: ${ws.afpDeviceId}`);
+        } else {
+          console.log(`[AFP] Stale WS disconnected (superseded): ${ws.afpDeviceId}`);
+        }
+      }
       console.log('WebSocket connection closed');
     });
 
@@ -10435,6 +12223,22 @@ if (WebSocketServer) {
       console.error('WebSocket error:', err);
     });
   });
+
+  // AFP heartbeat — ping every 30s, terminate and mark offline if no pong within 10s
+  setInterval(() => {
+    afpConnections.forEach((ws, deviceId) => {
+      if (ws.afpAlive === false) {
+        // No pong since last ping — connection is dead
+        afpConnections.delete(deviceId);
+        try { updateAfpDeviceStatus(deviceId, 'offline'); } catch (_) {}
+        console.log(`[AFP] Daemon timed out (no pong): ${deviceId}`);
+        try { ws.terminate(); } catch (_) {}
+        return;
+      }
+      ws.afpAlive = false;
+      try { ws.ping(); } catch (_) {}
+    });
+  }, 30_000);
 
   // Listen for device alert events and broadcast to connected users
   alertEmitter.on('device:pending_approval', (data) => {
@@ -10461,9 +12265,40 @@ if (WebSocketServer) {
   console.log('WebSocket server enabled');
 }
 
+// --- AI Discovery Hints ---
+// Intercept all 4xx JSON responses and append _hint so AI agents always know
+// where to look next, even when they land on the wrong endpoint.
+app.use((req, res, next) => {
+  const host = req.headers.host || 'www.myapiai.com';
+  const scheme = req.protocol || 'https';
+  const base = `${scheme}://${host}`;
+
+  const _hint = {
+    docs: `${base}/openapi.json`,
+    capabilities: `${base}/api/v1/tokens/me/capabilities`,
+    quickStart: `${base}/api/v1/quick-start`,
+    scopeHelp: `${base}/api/v1/scopes`
+  };
+
+  const originalJson = res.json.bind(res);
+  res.json = function (body) {
+    const status = res.statusCode;
+    if (status >= 400 && status < 500 && body && typeof body === 'object' && !Array.isArray(body)) {
+      // 403 → also point at capabilities so agent can see what scopes it has
+      const hint = status === 403
+        ? { ..._hint, message: 'Check capabilities to see what your token can access.' }
+        : _hint;
+      body = { ...body, _hint: hint };
+    }
+    return originalJson(body);
+  };
+
+  next();
+});
+
 // --- Error Handlers (must be last) ---
 
-// 404 handler - return JSON
+// 404 handler - return JSON (hint injected by middleware above)
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not Found',
@@ -10510,8 +12345,21 @@ function validateRequiredSecrets() {
     } else {
       console.warn('⚠️  Running in development mode with missing secrets. This is insecure!');
     }
-  } else if (isProd) {
-    console.log('✅ All required secrets validated');
+  }
+
+  // SOC2 Phase 1: Reject known insecure default key values in production
+  if (isProd) {
+    const BANNED_DEFAULT_KEYS = ['default-vault-key-change-me', 'change-me', 'changeme', 'secret', 'password'];
+    for (const envVar of ['VAULT_KEY', 'ENCRYPTION_KEY', 'JWT_SECRET', 'SESSION_SECRET']) {
+      const val = String(process.env[envVar] || '').trim().toLowerCase();
+      if (val && BANNED_DEFAULT_KEYS.includes(val)) {
+        console.error(`❌ FATAL: ${envVar} is set to a known insecure default value. Change it before starting in production.`);
+        process.exit(1);
+      }
+    }
+    if (missing.length === 0) {
+      console.log('✅ All required secrets validated');
+    }
   }
 }
 
@@ -10520,7 +12368,7 @@ function cleanupExpiredSessions() {
   if (!global.sessions) return;
 
   const now = Date.now();
-  const sessionTTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+  const sessionTTL = 8 * 60 * 60 * 1000; // 8 hours (SOC2 CC6)
   let cleanedCount = 0;
 
   for (const [sessionToken, sessionData] of Object.entries(global.sessions)) {
@@ -10534,7 +12382,7 @@ function cleanupExpiredSessions() {
   }
 
   if (cleanedCount > 0) {
-    console.log(`[Session Cleanup] Expired ${cleanedCount} old sessions (7-day TTL)`);
+    console.log(`[Session Cleanup] Expired ${cleanedCount} old sessions (8-hour TTL)`);
   }
 }
 
@@ -10584,6 +12432,45 @@ if (process.env.NODE_ENV !== 'test') {
       }
     })();
 
+    // Bootstrap MyApi AFP OAuth client (PKCE, localhost redirect)
+    (async () => {
+      try {
+        const afpClientId = 'myapi-afp';
+        // AFP uses PKCE — client secret is never sent by the daemon, but the DB requires a hash
+        const afpSecret = require('crypto').createHash('sha256').update('afp-pkce-placeholder:' + (process.env.ENCRYPTION_KEY || 'default')).digest('hex');
+        const afpSecretHash = await require('bcrypt').hash(afpSecret, 8);
+        upsertOAuthServerClient({
+          clientId: afpClientId,
+          clientSecretHash: afpSecretHash,
+          clientName: 'MyApi AFP',
+          redirectUris: ['http://localhost:*/callback'],
+          ownerId: null,
+        });
+        console.log('[OAuthServer] AFP client bootstrapped (client_id: myapi-afp, PKCE)');
+      } catch (e) {
+        console.error('[OAuthServer] Failed to bootstrap AFP client:', e.message);
+      }
+    })();
+
+    // Bootstrap myapi-agent public OAuth client (PKCE-only, localhost + HTTPS redirect)
+    (async () => {
+      try {
+        const agentSecret = require('crypto').createHash('sha256').update('agent-pkce-placeholder:' + (process.env.ENCRYPTION_KEY || 'default')).digest('hex');
+        const agentSecretHash = await require('bcrypt').hash(agentSecret, 8);
+        upsertOAuthServerClient({
+          clientId: 'myapi-agent',
+          clientSecretHash: agentSecretHash,
+          clientName: 'AI Agent',
+          // Allow localhost on any port (CLI/desktop agents) and any HTTPS callback (cloud agents)
+          redirectUris: ['http://localhost:*/callback', 'https://*/callback'],
+          ownerId: null,
+        });
+        console.log('[OAuthServer] myapi-agent public client bootstrapped (PKCE-only)');
+      } catch (e) {
+        console.error('[OAuthServer] Failed to bootstrap myapi-agent client:', e.message);
+      }
+    })();
+
     // BUG-11: Cleanup expired OAuth state tokens every hour
     // BUG-10: Also cleanup old rate limit records
     setInterval(() => {
@@ -10591,11 +12478,33 @@ if (process.env.NODE_ENV !== 'test') {
       cleanupOldRateLimits(24); // Keep 24 hours of history
     }, 60 * 60 * 1000); // 1 hour
 
-    // P0 Security Fix: Cleanup expired sessions every 15 minutes (7-day TTL)
+    // P0 Security Fix: Cleanup expired sessions every 15 minutes (8-hour TTL)
     setInterval(() => {
       cleanupExpiredSessions();
     }, 15 * 60 * 1000); // Every 15 minutes
-    console.log('✅ Session cleanup scheduled (7-day TTL, 15-min check interval)');
+    console.log('✅ Session cleanup scheduled (8-hour TTL, 15-min check interval)');
+
+    // SOC2 CC6/P: Execute retention cleanup on startup and daily (per workspace policies)
+    const runRetentionCleanup = () => {
+      try {
+        const workspaces = getWorkspaces() || [];
+        let totalDeleted = 0;
+        for (const ws of workspaces) {
+          const result = executeRetentionCleanup(ws.id);
+          totalDeleted += result.totalDeleted || 0;
+        }
+        createComplianceAuditLog(
+          'system', 'system', 'retention_cleanup_executed', 'system', null,
+          JSON.stringify({ workspacesProcessed: workspaces.length, totalDeleted }), null, null
+        );
+        console.log(`[Retention] Cleanup complete: ${workspaces.length} workspaces, ${totalDeleted} records removed`);
+      } catch (err) {
+        console.error('[Retention] Cleanup error:', err.message);
+      }
+    };
+    runRetentionCleanup();
+    setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily
+    console.log('✅ Retention cleanup scheduled (daily)');
     });
 
     // Global error handlers to prevent crashes

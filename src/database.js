@@ -52,6 +52,7 @@ try {
 }
 
 const MigrationRunner = require('./lib/migrationRunner');
+const { getCurrentRequestId } = require('./lib/request-context');
 const {
   encrypt,
   decrypt,
@@ -64,6 +65,7 @@ const {
 
 function normalizeOwnerId(ownerId) {
   const v = String(ownerId || '').trim();
+  if (!v) console.warn('[db] normalizeOwnerId: empty ownerId, falling back to "owner"');
   return v || 'owner';
 }
 
@@ -195,6 +197,18 @@ function initDatabase() {
       ip TEXT,
       details TEXT
     );
+
+    CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_update
+    BEFORE UPDATE ON audit_log
+    BEGIN
+      SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_audit_log_no_delete
+    BEFORE DELETE ON audit_log
+    BEGIN
+      SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
 
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
@@ -597,6 +611,17 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_service_preferences_user ON service_preferences(user_id);
     CREATE INDEX IF NOT EXISTS idx_service_preferences_service ON service_preferences(service_name);
 
+    CREATE TABLE IF NOT EXISTS waitlist (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      created_at TEXT NOT NULL,
+      notified_at TEXT,
+      invited_at TEXT,
+      status TEXT NOT NULL DEFAULT 'pending'
+    );
+    CREATE INDEX IF NOT EXISTS idx_waitlist_email ON waitlist(email);
+    CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status);
+
     -- Phase 1: Teams & Multi-Tenancy Tables
     CREATE TABLE IF NOT EXISTS workspaces (
       id TEXT PRIMARY KEY,
@@ -701,6 +726,9 @@ function initDatabase() {
   // 2FA columns
   safeMigration("ALTER TABLE users ADD COLUMN totp_secret TEXT");
   safeMigration("ALTER TABLE users ADD COLUMN two_factor_enabled INTEGER DEFAULT 0");
+
+  // Per-user extended identity storage (JSON blob for fields beyond the core users columns)
+  safeMigration("ALTER TABLE users ADD COLUMN profile_metadata TEXT DEFAULT NULL");
 
   // Migration tracking (non-destructive, rollback-friendly)
   try {
@@ -1172,6 +1200,14 @@ function initDatabase() {
   // Per-type notification settings stored as JSON in notification_preferences
   safeMigration("ALTER TABLE notification_preferences ADD COLUMN type_settings TEXT DEFAULT NULL");
 
+  // SOC 2 Phase 3.4 — Consent timestamp tracking (P criterion)
+  // Stores when users accepted terms and privacy policy; required for GDPR/SOC 2 P audit evidence.
+  safeMigration("ALTER TABLE users ADD COLUMN accepted_terms_at TEXT");
+  safeMigration("ALTER TABLE users ADD COLUMN accepted_privacy_policy_at TEXT");
+
+  // Onboarding flag: set to 1 for new OAuth signups, cleared when onboarding completes.
+  safeMigration("ALTER TABLE users ADD COLUMN needs_onboarding INTEGER DEFAULT 0");
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_access_tokens_shareable ON access_tokens(is_shareable);
     CREATE INDEX IF NOT EXISTS idx_access_tokens_guest ON access_tokens(is_guest_token);
@@ -1200,6 +1236,48 @@ function initDatabase() {
       );
     `);
   } catch (e) { /* tables already exist */ }
+
+  // AFP (API File Protocol) — PC filesystem/exec connector
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS afp_devices (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        hostname TEXT,
+        platform TEXT,
+        arch TEXT,
+        capabilities_json TEXT,
+        device_token_hash TEXT NOT NULL,
+        status TEXT DEFAULT 'offline',
+        last_seen_at TEXT,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_afp_devices_user ON afp_devices(user_id);
+      CREATE INDEX IF NOT EXISTS idx_afp_devices_status ON afp_devices(status);
+
+      CREATE TABLE IF NOT EXISTS afp_command_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        requester_token_id TEXT,
+        op TEXT NOT NULL,
+        path TEXT,
+        cmd TEXT,
+        status TEXT NOT NULL,
+        duration_ms INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (device_id) REFERENCES afp_devices(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_afp_command_log_device ON afp_command_log(device_id);
+      CREATE INDEX IF NOT EXISTS idx_afp_command_log_user ON afp_command_log(user_id);
+      CREATE INDEX IF NOT EXISTS idx_afp_command_log_created ON afp_command_log(created_at);
+    `);
+  } catch (e) { /* tables already exist */ }
+  // Add afp_root column if it doesn't exist yet (safe migration)
+  try { db.exec(`ALTER TABLE afp_devices ADD COLUMN afp_root TEXT`); } catch (_) {}
 
   // Seed initial pricing plans if table is empty
   seedDefaultPricingPlans();
@@ -1340,7 +1418,9 @@ function decryptVaultToken(id, ownerId = 'owner', workspaceId = null) {
 
     // Legacy format fallback (AES-256-CBC, iv:ciphertext)
     if (decrypted == null) {
-      const allowLegacyDefault = String(process.env.ALLOW_LEGACY_DEFAULT_VAULT_KEY || '').toLowerCase() === 'true';
+      // ALLOW_LEGACY_DEFAULT_VAULT_KEY is restricted to test environments only (SOC2 Phase 1)
+      const allowLegacyDefault = process.env.NODE_ENV !== 'production' &&
+        String(process.env.ALLOW_LEGACY_DEFAULT_VAULT_KEY || '').toLowerCase() === 'true';
       const encryptionKey = vaultKey || (allowLegacyDefault ? 'default-vault-key-change-me' : null);
       if (!encryptionKey) return null;
       const algorithm = 'aes-256-cbc';
@@ -1396,6 +1476,9 @@ function deleteVaultToken(id, ownerId = 'owner', workspaceId = null) {
 function getMasterTokenEncryptionKey() {
   const key = String(process.env.VAULT_KEY || process.env.ENCRYPTION_KEY || '').trim();
   if (key) return key;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('[Database] VAULT_KEY or ENCRYPTION_KEY is required in production — refusing to start without explicit encryption key.');
+  }
   const fallback = String(process.env.JWT_SECRET || '').trim();
   if (fallback) {
     console.warn('[Database] VAULT_KEY and ENCRYPTION_KEY are unset — falling back to JWT_SECRET for master-token encryption. Set VAULT_KEY or ENCRYPTION_KEY for production.');
@@ -1538,6 +1621,7 @@ function getAccessTokens(ownerId = null, workspaceId = null) {
     isShareable: row.is_shareable || 0,
     requiresApproval: row.requires_approval || 0,
     scopeBundle: row.scope_bundle ? (() => { try { return JSON.parse(row.scope_bundle); } catch { return null; } })() : null,
+    allowedResources: row.allowed_resources ? (() => { try { return JSON.parse(row.allowed_resources); } catch { return null; } })() : null,
     marketplaceListingId: row.marketplace_listing_id || null
   }));
 }
@@ -1557,6 +1641,7 @@ function seedDefaultScopes() {
     { name: 'personas',       category: 'personas',  description: 'Public persona profiles' },
     { name: 'knowledge',      category: 'brain',     description: 'Knowledge/context read access' },
     { name: 'chat',           category: 'brain',     description: 'Conversation and messaging' },
+    { name: 'memory',         category: 'brain',     description: 'Read and write memory entries' },
     { name: 'skills:read',    category: 'skills',    description: 'Read skills and metadata' },
     { name: 'skills:write',   category: 'skills',    description: 'Create and manage skills' },
     { name: 'services:read',  category: 'services',  description: 'Proxy GET requests to connected OAuth services' },
@@ -1583,6 +1668,10 @@ function seedDefaultScopes() {
 }
 
 function validateScope(scopeName) {
+  // Accept per-service granular scopes: services:<name>:(read|write|*)
+  // These are sub-scopes of services:read/services:write, not in scope_definitions
+  if (/^services:[a-z0-9_-]+:(read|write|\*)$/.test(scopeName)) return true;
+
   const stmt = db.prepare('SELECT * FROM scope_definitions WHERE scope_name = ?');
   const row = stmt.get(scopeName);
   return row !== undefined;
@@ -1605,10 +1694,11 @@ function getAllScopes() {
 
 function grantScopes(tokenId, scopeNames) {
   const now = new Date().toISOString();
+  // INSERT OR IGNORE handles UNIQUE conflicts only — NOT FK violations.
+  // Callers must pre-filter scopes to those that exist in scope_definitions.
   const insertStmt = db.prepare(`
-    INSERT INTO access_token_scopes (token_id, scope_name, granted_at)
+    INSERT OR IGNORE INTO access_token_scopes (token_id, scope_name, granted_at)
     VALUES (?, ?, ?)
-    ON CONFLICT DO NOTHING
   `);
 
   for (const scopeName of scopeNames) {
@@ -1706,15 +1796,19 @@ function getConnectors() {
 
 // Audit Log
 function createAuditLog(entry) {
-  const stmt = db.prepare(`
-    INSERT INTO audit_log (
-      timestamp, requester_id, workspace_id, actor_id, actor_type,
-      action, resource, endpoint, http_method, status_code, scope, ip, details
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  // Gracefully handle missing request_id column (before migration runs)
+  const hasRequestId = (() => {
+    try {
+      const cols = db.prepare('PRAGMA table_info(audit_log)').all();
+      return cols.some(c => c.name === 'request_id');
+    } catch { return false; }
+  })();
 
-  stmt.run(
+  const sql = hasRequestId
+    ? `INSERT INTO audit_log (timestamp, requester_id, workspace_id, actor_id, actor_type, action, resource, endpoint, http_method, status_code, scope, ip, details, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    : `INSERT INTO audit_log (timestamp, requester_id, workspace_id, actor_id, actor_type, action, resource, endpoint, http_method, status_code, scope, ip, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+  const params = [
     entry.timestamp || new Date().toISOString(),
     entry.requesterId || null,
     entry.workspaceId || null,
@@ -1727,8 +1821,11 @@ function createAuditLog(entry) {
     Number.isFinite(entry.statusCode) ? entry.statusCode : null,
     entry.scope || null,
     entry.ip || null,
-    entry.details ? JSON.stringify(entry.details) : null
-  );
+    entry.details ? JSON.stringify(entry.details) : null,
+  ];
+  if (hasRequestId) params.push(entry.requestId || getCurrentRequestId() || null);
+
+  db.prepare(sql).run(...params);
 }
 
 function getAuditLogs(limit = 50, offset = 0) {
@@ -1762,12 +1859,24 @@ function getAuditLogs(limit = 50, offset = 0) {
 }
 
 // Handshake support (new)
-function createUser(username, displayName, email, timezone, password, plan = 'free', avatarUrl = null) {
+function createUser(username, displayName, email, timezone, password, plan = 'free', avatarUrl = null, consentTimestamps = {}) {
   const id = 'usr_' + crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
   const hash = bcrypt.hashSync(password, 10);
-  const stmt = db.prepare(`INSERT INTO users (id, username, display_name, email, avatar_url, timezone, password_hash, created_at, status, plan) VALUES (?,?,?,?,?,?,?,?,?,?)`);
-  stmt.run(id, username, displayName || null, email || null, avatarUrl || null, timezone || null, hash, now, 'active', plan || 'free');
+
+  const cols = getUsersTableColumns();
+  const hasConsentCols = cols.has('accepted_terms_at') && cols.has('accepted_privacy_policy_at');
+
+  if (hasConsentCols) {
+    const acceptedTermsAt = consentTimestamps.acceptedTermsAt || now;
+    const acceptedPrivacyAt = consentTimestamps.acceptedPrivacyPolicyAt || now;
+    const stmt = db.prepare(`INSERT INTO users (id, username, display_name, email, avatar_url, timezone, password_hash, created_at, status, plan, accepted_terms_at, accepted_privacy_policy_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    stmt.run(id, username, displayName || null, email || null, avatarUrl || null, timezone || null, hash, now, 'active', plan || 'free', acceptedTermsAt, acceptedPrivacyAt);
+  } else {
+    const stmt = db.prepare(`INSERT INTO users (id, username, display_name, email, avatar_url, timezone, password_hash, created_at, status, plan) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    stmt.run(id, username, displayName || null, email || null, avatarUrl || null, timezone || null, hash, now, 'active', plan || 'free');
+  }
+
   return { id, username, displayName, email, avatarUrl: avatarUrl || null, timezone, createdAt: now, status: 'active', plan: plan || 'free' };
 }
 
@@ -1785,6 +1894,49 @@ function getUsersTableColumns() {
   } catch (_) {
     return new Set();
   }
+}
+
+function countTotalUsers() {
+  const cols = getUsersTableColumns();
+  if (cols.has('status')) {
+    const row = db.prepare("SELECT COUNT(*) AS n FROM users WHERE status IS NULL OR status != 'deleted'").get();
+    return row ? Number(row.n) : 0;
+  }
+  const row = db.prepare('SELECT COUNT(*) AS n FROM users').get();
+  return row ? Number(row.n) : 0;
+}
+
+function addToWaitlist(email) {
+  const now = new Date().toISOString();
+  const id = 'wl_' + crypto.randomBytes(12).toString('hex');
+  const existing = db.prepare('SELECT id, email, status, created_at FROM waitlist WHERE email = ?').get(email);
+  if (existing) {
+    return { entry: existing, created: false };
+  }
+  db.prepare('INSERT INTO waitlist (id, email, created_at, status) VALUES (?, ?, ?, ?)')
+    .run(id, email, now, 'pending');
+  return { entry: { id, email, status: 'pending', created_at: now }, created: true };
+}
+
+function listWaitlist({ limit = 100, offset = 0 } = {}) {
+  return db.prepare('SELECT id, email, status, created_at, notified_at, invited_at FROM waitlist ORDER BY created_at ASC LIMIT ? OFFSET ?')
+    .all(limit, offset);
+}
+
+function markWaitlistInvited(id) {
+  const now = new Date().toISOString();
+  const result = db.prepare("UPDATE waitlist SET status = 'invited', invited_at = ? WHERE id = ? AND status = 'pending'")
+    .run(now, id);
+  return result.changes > 0;
+}
+
+function markWaitlistNotified(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+  const now = new Date().toISOString();
+  const stmt = db.prepare('UPDATE waitlist SET notified_at = ? WHERE id = ?');
+  let changes = 0;
+  for (const id of ids) changes += stmt.run(now, id).changes;
+  return changes;
 }
 
 function getUsers() {
@@ -1842,14 +1994,17 @@ function getUserById(id) {
   const hasStripeCustomerId = cols.has('stripe_customer_id');
   const hasStripeSubscriptionId = cols.has('stripe_subscription_id');
   const hasTwoFactorEnabled = cols.has('two_factor_enabled');
+  const hasNeedsOnboarding = cols.has('needs_onboarding');
 
   const stripeStatusExpr = hasStripeStatus ? 'stripe_subscription_status' : 'NULL';
   const planExpr = hasPlan ? "COALESCE(plan, 'free')" : "'free'";
   const planActiveExpr = `CASE WHEN LOWER(COALESCE(${planExpr}, 'free')) IN ('free','enterprise') THEN 1 WHEN LOWER(COALESCE(${stripeStatusExpr}, '')) IN ('canceled','unpaid','past_due','incomplete_expired') THEN 0 WHEN LOWER(COALESCE(${stripeStatusExpr}, '')) IN ('active','trialing') THEN 1 ELSE 1 END`;
-  const stmt = db.prepare(`SELECT id, username, display_name as displayName, email, avatar_url as avatarUrl, timezone, ${hasTwoFactorEnabled ? 'COALESCE(two_factor_enabled, 0)' : '0'} as twoFactorEnabled, created_at as createdAt, status, ${planExpr} as plan, ${stripeStatusExpr} as stripeSubscriptionStatus, ${hasStripeCustomerId ? 'stripe_customer_id' : 'NULL'} as stripeCustomerId, ${hasStripeSubscriptionId ? 'stripe_subscription_id' : 'NULL'} as stripeSubscriptionId, ${planActiveExpr} as planActive FROM users WHERE id = ?`);
+  const needsOnboardingExpr = hasNeedsOnboarding ? 'COALESCE(needs_onboarding, 0)' : '0';
+  const hasProfileMetadata = cols.has('profile_metadata');
+  const stmt = db.prepare(`SELECT id, username, display_name as displayName, email, avatar_url as avatarUrl, timezone, ${hasTwoFactorEnabled ? 'COALESCE(two_factor_enabled, 0)' : '0'} as twoFactorEnabled, created_at as createdAt, status, ${planExpr} as plan, ${stripeStatusExpr} as stripeSubscriptionStatus, ${hasStripeCustomerId ? 'stripe_customer_id' : 'NULL'} as stripeCustomerId, ${hasStripeSubscriptionId ? 'stripe_subscription_id' : 'NULL'} as stripeSubscriptionId, ${planActiveExpr} as planActive, ${needsOnboardingExpr} as needsOnboarding${hasProfileMetadata ? ', profile_metadata' : ''} FROM users WHERE id = ?`);
   const u = stmt.get(id);
   if (!u) return null;
-  return { ...u, twoFactorEnabled: Boolean(u.twoFactorEnabled), planActive: Boolean(u.planActive) };
+  return { ...u, twoFactorEnabled: Boolean(u.twoFactorEnabled), planActive: Boolean(u.planActive), needsOnboarding: Boolean(u.needsOnboarding) };
 }
 
 function getPiiMasterKey() {
@@ -1915,13 +2070,20 @@ function getUserPiiSecure(userId) {
   }
 }
 
-function updateUserOAuthProfile(userId, { displayName, email, avatarUrl } = {}) {
+function updateUserOAuthProfile(userId, { displayName, email, avatarUrl, timezone, profileMetadata } = {}) {
   const current = getUserById(userId);
   if (!current) return null;
   const nextDisplay = (displayName || '').trim() || current.displayName || current.username;
   const nextEmail = (email || '').trim() || current.email || null;
   const nextAvatar = (avatarUrl || '').trim() || current.avatarUrl || null;
-  db.prepare('UPDATE users SET display_name = ?, email = ?, avatar_url = ? WHERE id = ?').run(nextDisplay, nextEmail, nextAvatar, userId);
+  const nextTimezone = (timezone || '').trim() || current.timezone || null;
+  db.prepare('UPDATE users SET display_name = ?, email = ?, avatar_url = ?, timezone = ? WHERE id = ?').run(nextDisplay, nextEmail, nextAvatar, nextTimezone, userId);
+
+  // Persist extended identity fields (bio, location, github, website, etc.)
+  if (profileMetadata !== undefined) {
+    const json = profileMetadata ? JSON.stringify(profileMetadata) : null;
+    db.prepare('UPDATE users SET profile_metadata = ? WHERE id = ?').run(json, userId);
+  }
 
   // Store PII snapshot encrypted (email, displayName, avatarUrl, timezone)
   try {
@@ -3060,13 +3222,13 @@ function getKBDocumentByTitle(title, ownerId = 'owner') {
 
 function deleteKBDocument(id, ownerId = 'owner') {
   const owner = normalizeOwnerId(ownerId);
-  const tx = db.transaction((docId, docOwner) => {
-    db.prepare('DELETE FROM persona_documents WHERE document_id = ? AND persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(docId, docOwner);
-    db.prepare('DELETE FROM skill_documents WHERE document_id = ? AND skill_id IN (SELECT id FROM skills WHERE owner_id = ?)').run(docId, docOwner);
-    const result = db.prepare('DELETE FROM kb_documents WHERE id = ? AND owner_id = ?').run(docId, docOwner);
+  const rawDb = db.getRawDB ? db.getRawDB() : db;
+  return rawDb.transaction((docId, docOwner) => {
+    rawDb.prepare('DELETE FROM persona_documents WHERE document_id = ? AND persona_id IN (SELECT id FROM personas WHERE owner_id = ?)').run(docId, docOwner);
+    rawDb.prepare('DELETE FROM skill_documents WHERE document_id = ? AND skill_id IN (SELECT id FROM skills WHERE owner_id = ?)').run(docId, docOwner);
+    const result = rawDb.prepare('DELETE FROM kb_documents WHERE id = ? AND owner_id = ?').run(docId, docOwner);
     return result.changes > 0;
-  });
-  return tx(id, owner);
+  })(id, owner);
 }
 
 // ─── Memory ──────────────────────────────────────────────────────────────────
@@ -3278,7 +3440,7 @@ function createSkill(name, description, version, author, category, scriptContent
   return getSkillById(row?.id ?? null, owner);
 }
 
-function getSkills(ownerId = 'owner', workspaceId = null) {
+function getSkills(ownerId = 'owner', workspaceId = null, filters = {}) {
   const owner = normalizeOwnerId(ownerId);
   let query = 'SELECT * FROM skills WHERE owner_id = ?';
   const params = [owner];
@@ -3289,12 +3451,75 @@ function getSkills(ownerId = 'owner', workspaceId = null) {
     params.push(workspaceId);
   }
 
+  if (filters.category) {
+    query += ' AND lower(category) = lower(?)';
+    params.push(filters.category);
+  }
+
+  if (filters.slug) {
+    query += ' AND lower(name) = lower(?)';
+    params.push(filters.slug);
+  }
+
+  if (filters.q) {
+    const like = `%${filters.q}%`;
+    query += ' AND (name LIKE ? OR description LIKE ? OR category LIKE ?)';
+    params.push(like, like, like);
+  }
+
   query += ' ORDER BY created_at DESC';
-  
+
+  if (filters.limit && Number.isInteger(filters.limit) && filters.limit > 0) {
+    query += ' LIMIT ?';
+    params.push(filters.limit);
+  }
+
   return db.prepare(query).all(...params).map(row => ({
     ...row, active: Boolean(row.active),
     config_json: row.config_json ? (() => { try { return JSON.parse(row.config_json); } catch { return row.config_json; } })() : null,
   }));
+}
+
+function getSkillBySlug(slug, ownerId = 'owner') {
+  const owner = normalizeOwnerId(ownerId);
+  const row = db.prepare('SELECT * FROM skills WHERE lower(name) = lower(?) AND owner_id = ?').get(slug, owner);
+  if (!row) return null;
+  return {
+    ...row, active: Boolean(row.active),
+    config_json: row.config_json ? (() => { try { return JSON.parse(row.config_json); } catch { return row.config_json; } })() : null,
+  };
+}
+
+function getSkillsByIds(ids, ownerId = 'owner') {
+  if (!ids || ids.length === 0) return [];
+  const owner = normalizeOwnerId(ownerId);
+  const placeholders = ids.map(() => '?').join(',');
+  return db.prepare(`SELECT * FROM skills WHERE id IN (${placeholders}) AND owner_id = ?`)
+    .all(...ids, owner)
+    .map(row => ({
+      ...row, active: Boolean(row.active),
+      config_json: row.config_json ? (() => { try { return JSON.parse(row.config_json); } catch { return row.config_json; } })() : null,
+    }));
+}
+
+function getSkillsBySlugList(slugs, ownerId = 'owner') {
+  if (!slugs || slugs.length === 0) return [];
+  const owner = normalizeOwnerId(ownerId);
+  const placeholders = slugs.map(() => 'lower(?)').join(',');
+  return db.prepare(`SELECT * FROM skills WHERE lower(name) IN (${placeholders}) AND owner_id = ?`)
+    .all(...slugs.map(s => s.toLowerCase()), owner)
+    .map(row => ({
+      ...row, active: Boolean(row.active),
+      config_json: row.config_json ? (() => { try { return JSON.parse(row.config_json); } catch { return row.config_json; } })() : null,
+    }));
+}
+
+function suggestSkills(q, ownerId = 'owner', limit = 10) {
+  const owner = normalizeOwnerId(ownerId);
+  const like = `%${q}%`;
+  return db.prepare(
+    `SELECT id, name, description, category FROM skills WHERE owner_id = ? AND (name LIKE ? OR description LIKE ? OR category LIKE ?) ORDER BY created_at DESC LIMIT ?`
+  ).all(owner, like, like, like, limit);
 }
 
 function getSkillById(id, ownerId = 'owner') {
@@ -3734,10 +3959,14 @@ function getMarketplaceListings({ type, sort, search, tags, provider, price, rat
   `;
   const params = [status];
 
-  // Type filter
+  // Type filter — 'token' matches both 'token' and legacy 'api' listings
   if (type && type !== 'all') {
-    query += ' AND ml.type = ?';
-    params.push(type);
+    if (type === 'token') {
+      query += " AND ml.type IN ('token', 'api')";
+    } else {
+      query += ' AND ml.type = ?';
+      params.push(type);
+    }
   }
 
   // Search filter
@@ -4270,8 +4499,12 @@ function createApprovedDevice(tokenId, userId, fingerprintHash, deviceName, devi
   `).run(id, tokenId, userId, deviceFingerprintRaw, fingerprintHash, deviceName, JSON.stringify(deviceInfo), ipAddress, now, now);
 
   if (result.changes === 0) {
-    // Already exists — return the existing device's id
-    const existing = db.prepare('SELECT id FROM approved_devices WHERE user_id = ? AND device_fingerprint_hash = ?').get(userId, fingerprintHash);
+    // Already exists for this (token, device) pair — return that row's id.
+    // Scope by token_id so we don't silently return a row belonging to a
+    // different token (prevents master→guest approval leakage).
+    const existing = db.prepare(
+      'SELECT id FROM approved_devices WHERE user_id = ? AND device_fingerprint_hash = ? AND token_id = ?'
+    ).get(userId, fingerprintHash, tokenId);
     return existing?.id || id;
   }
   return id;
@@ -4292,9 +4525,19 @@ function getApprovedDevices(userId, tokenId = null) {
 
 function getApprovedDeviceByHash(userId, fingerprintHash) {
   return db.prepare(`
-    SELECT * FROM approved_devices 
+    SELECT * FROM approved_devices
     WHERE user_id = ? AND device_fingerprint_hash = ? AND revoked_at IS NULL
   `).get(userId, fingerprintHash);
+}
+
+// Token-scoped lookup: an approval for one token must NOT authorize a different
+// token on the same device. Use this when enforcing requires_approval on
+// guest tokens so master-token approvals can't leak across.
+function getApprovedDeviceByHashAndToken(userId, fingerprintHash, tokenId) {
+  return db.prepare(`
+    SELECT * FROM approved_devices
+    WHERE user_id = ? AND device_fingerprint_hash = ? AND token_id = ? AND revoked_at IS NULL
+  `).get(userId, fingerprintHash, tokenId);
 }
 
 function updateDeviceLastUsed(deviceId) {
@@ -4379,10 +4622,16 @@ function approvePendingDevice(approvalId, deviceName) {
   const now = new Date().toISOString();
   const resolvedName = deviceName || 'Approved Device';
 
-  // Check for any existing device with this fingerprint (including revoked ones)
+  // Check for an existing device row for THIS token (including revoked ones).
+  // Must be token-scoped so re-approval updates the right row and doesn't
+  // accidentally reuse a row belonging to a different token.
   const anyExisting = db.prepare(
-    'SELECT id, revoked_at FROM approved_devices WHERE user_id = ? AND device_fingerprint_hash = ?'
-  ).get(approval.user_id, approval.device_fingerprint_hash);
+    'SELECT id, revoked_at FROM approved_devices WHERE user_id = ? AND device_fingerprint_hash = ? AND token_id = ?'
+  ).get(approval.user_id, approval.device_fingerprint_hash, approval.token_id);
+
+  let deviceInfo;
+  try { deviceInfo = JSON.parse(approval.device_info_json || '{}'); } catch { deviceInfo = {}; }
+  const isASC = deviceInfo.type === 'asc';
 
   let deviceId;
   if (anyExisting) {
@@ -4391,13 +4640,23 @@ function approvePendingDevice(approvalId, deviceName) {
       UPDATE approved_devices SET revoked_at = NULL, device_name = ?, approved_at = ? WHERE id = ?
     `).run(resolvedName, now, anyExisting.id);
     deviceId = anyExisting.id;
+  } else if (isASC) {
+    deviceId = createApprovedDeviceASC(
+      approval.token_id,
+      approval.user_id,
+      approval.device_fingerprint_hash,
+      deviceInfo.public_key || '',
+      resolvedName,
+      deviceInfo,
+      approval.ip_address
+    );
   } else {
     deviceId = createApprovedDevice(
       approval.token_id,
       approval.user_id,
       approval.device_fingerprint_hash,
       resolvedName,
-      JSON.parse(approval.device_info_json || '{}'),
+      deviceInfo,
       approval.ip_address
     );
   }
@@ -4414,11 +4673,89 @@ function approvePendingDevice(approvalId, deviceName) {
 
 function denyPendingApproval(approvalId, reason = null) {
   const now = new Date().toISOString();
-  db.prepare(`
-    UPDATE device_approvals_pending 
-    SET status = 'denied', denied_at = ?, denial_reason = ? 
+  const result = db.prepare(`
+    UPDATE device_approvals_pending
+    SET status = 'denied', denied_at = ?, denial_reason = ?
     WHERE id = ?
   `).run(now, reason, approvalId);
+  return result.changes > 0;
+}
+
+// ─── OAuth Device Flow (RFC 8628) ────────────────────────────────────────────
+
+function createDeviceCode({ id, deviceCode, userCode, clientId, scope, expiresAt }) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO oauth_device_codes (id, device_code, user_code, client_id, scope, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, deviceCode, userCode, clientId, scope || null, expiresAt, now);
+  return id;
+}
+
+function getDeviceCodeByDeviceCode(deviceCode) {
+  return db.prepare('SELECT * FROM oauth_device_codes WHERE device_code = ?').get(deviceCode);
+}
+
+function getDeviceCodeByUserCode(userCode) {
+  return db.prepare('SELECT * FROM oauth_device_codes WHERE UPPER(user_code) = UPPER(?)').get(userCode);
+}
+
+function getPendingDeviceCodes(userId) {
+  return db.prepare(
+    "SELECT * FROM oauth_device_codes WHERE user_id = ? AND status = 'pending' AND expires_at > ? ORDER BY created_at DESC"
+  ).all(String(userId), new Date().toISOString());
+}
+
+function approveDeviceCode(id, userId, accessTokenId) {
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    UPDATE oauth_device_codes SET status = 'approved', user_id = ?, access_token_id = ?, approved_at = ?
+    WHERE id = ? AND status = 'pending' AND expires_at > ?
+  `).run(userId, accessTokenId, now, id, now);
+  return result.changes > 0;
+}
+
+function denyDeviceCode(id) {
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    UPDATE oauth_device_codes SET status = 'denied', denied_at = ?
+    WHERE id = ? AND status = 'pending'
+  `).run(now, id);
+  return result.changes > 0;
+}
+
+function expireOldDeviceCodes() {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE oauth_device_codes SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?").run(now);
+}
+
+// ─── ASC: approved device with public key ────────────────────────────────────
+
+function createApprovedDeviceASC(tokenId, userId, keyFingerprint, publicKey, deviceName, summary, ipAddress) {
+  const id = `device_${crypto.randomBytes(16).toString('hex')}`;
+  const now = new Date().toISOString();
+  // Use key_fingerprint as the device_fingerprint_hash so existing lookup paths work
+  db.prepare(`
+    INSERT INTO approved_devices
+      (id, token_id, user_id, device_fingerprint, device_fingerprint_hash, device_name,
+       device_info_json, ip_address, approved_at, created_at, connection_type, public_key, key_fingerprint)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'asc', ?, ?)
+  `).run(
+    id, tokenId, userId,
+    keyFingerprint, keyFingerprint,
+    deviceName || 'ASC Agent',
+    JSON.stringify(summary || {}),
+    ipAddress || 'unknown',
+    now, now,
+    publicKey, keyFingerprint
+  );
+  return id;
+}
+
+function getApprovedDeviceByKeyFingerprint(userId, keyFingerprint) {
+  return db.prepare(
+    'SELECT * FROM approved_devices WHERE user_id = ? AND key_fingerprint = ?'
+  ).get(userId, keyFingerprint);
 }
 
 function cleanupExpiredApprovals() {
@@ -5516,11 +5853,6 @@ function getUsageDaily(workspaceId, fromDate, toDate) {
 function seedDefaultPricingPlans() {
   try {
     // Check if plans already exist
-    const existing = db.prepare('SELECT COUNT(*) as count FROM pricing_plans').get();
-    if (existing && existing.count > 0) {
-      return; // Plans already seeded
-    }
-
     const now = new Date().toISOString();
     const plans = [
       {
@@ -5529,7 +5861,7 @@ function seedDefaultPricingPlans() {
         price_cents: 0,
         description: 'Perfect for individuals getting started',
         features: [
-          '1 AI Persona',
+          '2 AI Personas',
           '3 Service Connections',
           '10 MB Knowledge Base',
           '5 Token Vault entries',
@@ -5595,7 +5927,9 @@ function seedDefaultPricingPlans() {
       }
     ];
 
-    const stmt = db.prepare(`
+    const existingPlans = db.prepare('SELECT id FROM pricing_plans').all().map((row) => row.id);
+
+    const insertStmt = db.prepare(`
       INSERT INTO pricing_plans (
         id, name, price_cents, description, features,
         monthly_api_call_limit, max_services, max_team_members, max_skills_per_persona,
@@ -5604,26 +5938,62 @@ function seedDefaultPricingPlans() {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    const updateStmt = db.prepare(`
+      UPDATE pricing_plans
+      SET name = ?,
+          price_cents = ?,
+          description = ?,
+          features = ?,
+          monthly_api_call_limit = ?,
+          max_services = ?,
+          max_team_members = ?,
+          max_skills_per_persona = ?,
+          stripe_product_id = ?,
+          active = ?,
+          display_order = ?,
+          updated_at = ?
+      WHERE id = ?
+    `);
+
     for (const plan of plans) {
-      stmt.run(
-        plan.id,
-        plan.name,
-        plan.price_cents,
-        plan.description,
-        JSON.stringify(plan.features),
-        plan.monthly_api_call_limit,
-        plan.max_services,
-        plan.max_team_members,
-        plan.max_skills_per_persona,
-        plan.stripe_product_id,
-        plan.active,
-        plan.display_order,
-        now,
-        now
-      );
+      const serializedFeatures = JSON.stringify(plan.features);
+      if (existingPlans.includes(plan.id)) {
+        updateStmt.run(
+          plan.name,
+          plan.price_cents,
+          plan.description,
+          serializedFeatures,
+          plan.monthly_api_call_limit,
+          plan.max_services,
+          plan.max_team_members,
+          plan.max_skills_per_persona,
+          plan.stripe_product_id,
+          plan.active,
+          plan.display_order,
+          now,
+          plan.id
+        );
+      } else {
+        insertStmt.run(
+          plan.id,
+          plan.name,
+          plan.price_cents,
+          plan.description,
+          serializedFeatures,
+          plan.monthly_api_call_limit,
+          plan.max_services,
+          plan.max_team_members,
+          plan.max_skills_per_persona,
+          plan.stripe_product_id,
+          plan.active,
+          plan.display_order,
+          now,
+          now
+        );
+      }
     }
 
-    console.log('[Pricing] Seeded 3 default pricing plans (Free, Pro, Enterprise)');
+    console.log('[Pricing] Synced default pricing plans (Free, Pro, Enterprise)');
   } catch (err) {
     if (!err.message?.includes('already exists')) {
       console.warn('[Pricing] Error seeding default plans:', err.message);
@@ -6116,21 +6486,35 @@ function updateRetentionPolicy(policyId, updates) {
 /**
  * Create compliance audit log (immutable)
  */
-function createComplianceAuditLog(workspaceId, userId, action, entityType, entityId, dataAccessed = null, ipAddress = null, userAgent = null) {
+function createComplianceAuditLog(workspaceId, userId, action, entityType, entityId, dataAccessed = null, ipAddress = null, userAgent = null, requestId = null) {
+  // Compliance audit logs are workspace-scoped SOC2 records. Skip system-level
+  // events (workspaceId === 'system' or missing) — they would fail the FK
+  // constraint and belong in the regular audit_log instead.
+  if (!workspaceId || workspaceId === 'system') return null;
+
   const id = 'audit_' + crypto.randomBytes(12).toString('hex');
   const timestamp = Math.floor(Date.now() / 1000);
-  
+
+  const hasRequestId = (() => {
+    try {
+      const cols = db.prepare('PRAGMA table_info(compliance_audit_logs)').all();
+      return cols.some(c => c.name === 'request_id');
+    } catch { return false; }
+  })();
+
   try {
-    const stmt = db.prepare(`
-      INSERT INTO compliance_audit_logs (id, workspace_id, user_id, action, entity_type, entity_id, data_accessed, ip_address, user_agent, status, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    stmt.run(id, workspaceId, userId, action, entityType, entityId, dataAccessed, ipAddress, userAgent, 'success', timestamp);
+    const sql = hasRequestId
+      ? `INSERT INTO compliance_audit_logs (id, workspace_id, user_id, action, entity_type, entity_id, data_accessed, ip_address, user_agent, status, timestamp, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      : `INSERT INTO compliance_audit_logs (id, workspace_id, user_id, action, entity_type, entity_id, data_accessed, ip_address, user_agent, status, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+    const params = [id, workspaceId, userId, action, entityType, entityId, dataAccessed, ipAddress, userAgent, 'success', timestamp];
+    if (hasRequestId) params.push(requestId || getCurrentRequestId() || null);
+
+    db.prepare(sql).run(...params);
     return { id, workspaceId, userId, action, timestamp };
   } catch (error) {
+    // Swallow — compliance log must never crash the caller
     console.error('[Compliance] Audit log error:', error.message);
-    throw error;
   }
 }
 
@@ -6191,17 +6575,8 @@ function executeRetentionCleanup(workspaceId, options = {}) {
       }
 
       if (entityType === 'activity_logs' || entityType === 'audit_log') {
-        const cutoffIso = new Date(cutoffSec * 1000).toISOString();
-        const countStmt = db.prepare(`SELECT COUNT(*) as c FROM audit_log WHERE workspace_id = ? AND timestamp < ?`);
-        const row = countStmt.get(workspaceId, cutoffIso) || { c: 0 };
-        const count = Number(row.c || 0);
-
-        if (!dryRun && count > 0) {
-          db.prepare(`DELETE FROM audit_log WHERE workspace_id = ? AND timestamp < ?`).run(workspaceId, cutoffIso);
-        }
-
-        summary.totalDeleted += count;
-        summary.results.push({ entityType, retentionDays, deleted: count, status: 'ok' });
+        // audit_log is now append-only (SOC2 CC7) — deletion is prohibited.
+        summary.results.push({ entityType, retentionDays, deleted: 0, status: 'skipped', reason: 'immutable_append_only' });
         continue;
       }
 
@@ -6342,12 +6717,14 @@ function getOAuthServerClient(clientId) {
   return { ...row, redirectUris: JSON.parse(row.redirect_uris || '[]') };
 }
 
-function createOAuthServerAuthCode({ code, clientId, userId, redirectUri, scope }) {
+function createOAuthServerAuthCode({ code, clientId, userId, redirectUri, scope, codeChallenge }) {
   const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  // Add code_challenge column for PKCE if not present
+  try { db.exec('ALTER TABLE oauth_server_auth_codes ADD COLUMN code_challenge TEXT'); } catch (_) {}
   db.prepare(`
-    INSERT INTO oauth_server_auth_codes (code, client_id, user_id, redirect_uri, scope, expires_at, used)
-    VALUES (?, ?, ?, ?, ?, ?, 0)
-  `).run(code, clientId, userId, redirectUri, scope || 'full', expiresAt);
+    INSERT INTO oauth_server_auth_codes (code, client_id, user_id, redirect_uri, scope, expires_at, used, code_challenge)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+  `).run(code, clientId, userId, redirectUri, scope || 'full', expiresAt, codeChallenge || null);
 }
 
 function consumeOAuthServerAuthCode(code) {
@@ -6356,6 +6733,86 @@ function consumeOAuthServerAuthCode(code) {
   if (row.expires_at < Date.now()) return null;
   db.prepare('UPDATE oauth_server_auth_codes SET used = 1 WHERE code = ?').run(code);
   return row;
+}
+
+function peekOAuthServerAuthCode(code) {
+  const row = db.prepare('SELECT * FROM oauth_server_auth_codes WHERE code = ? AND used = 0').get(code);
+  if (!row || row.expires_at < Date.now()) return null;
+  return row;
+}
+
+// ── AFP (API File Protocol) helpers ───────────────────────────────────────────
+
+function createAfpDevice(userId, deviceName, hostname, platform, arch, capabilities, tokenHash, afpRoot) {
+  const id = 'afp_' + crypto.randomBytes(16).toString('hex');
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO afp_devices
+      (id, user_id, device_name, hostname, platform, arch, capabilities_json, device_token_hash, afp_root, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'offline', ?)
+  `).run(id, userId, deviceName, hostname || null, platform || null, arch || null,
+         JSON.stringify(capabilities || []), tokenHash, afpRoot || null, now);
+  return id;
+}
+
+function getAfpDevices(userId) {
+  return db.prepare(
+    `SELECT * FROM afp_devices WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at DESC`
+  ).all(userId);
+}
+
+function getAfpDeviceById(deviceId) {
+  return db.prepare(`SELECT * FROM afp_devices WHERE id = ?`).get(deviceId);
+}
+
+// Returns the first non-revoked device matching this user + hostname + platform.
+// Used by the register endpoint to avoid creating duplicate rows for the same machine.
+function findAfpDeviceByHostname(userId, hostname, platform) {
+  return db.prepare(
+    `SELECT * FROM afp_devices WHERE user_id = ? AND hostname = ? AND platform = ? AND revoked_at IS NULL LIMIT 1`
+  ).get(userId, hostname || null, platform || null);
+}
+
+function rotateAfpDeviceToken(deviceId, deviceName, arch, capabilities, tokenHash, afpRoot) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE afp_devices
+      SET device_token_hash = ?, device_name = ?, arch = ?,
+          capabilities_json = ?, afp_root = ?, status = 'offline', last_seen_at = ?
+      WHERE id = ?
+  `).run(tokenHash, deviceName, arch || null, JSON.stringify(capabilities || []), afpRoot || null, now, deviceId);
+}
+
+function revokeAfpDevice(deviceId) {
+  db.prepare(`UPDATE afp_devices SET revoked_at = ?, status = 'offline' WHERE id = ?`)
+    .run(new Date().toISOString(), deviceId);
+}
+
+function updateAfpDeviceStatus(deviceId, status) {
+  db.prepare(`UPDATE afp_devices SET status = ?, last_seen_at = ? WHERE id = ?`)
+    .run(status, new Date().toISOString(), deviceId);
+}
+
+function logAfpCommand(deviceId, userId, requesterTokenId, op, path, cmd, status, durationMs) {
+  db.prepare(`
+    INSERT INTO afp_command_log
+      (device_id, user_id, requester_token_id, op, path, cmd, status, duration_ms, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(deviceId, userId, requesterTokenId || null, op,
+         path || null, cmd || null, status, durationMs || null,
+         new Date().toISOString());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function setUserNeedsOnboarding(userId, value) {
+  try {
+    db.prepare('UPDATE users SET needs_onboarding = ? WHERE id = ?').run(value ? 1 : 0, userId);
+  } catch (_) {}
+}
+
+function clearUserOnboarding(userId) {
+  setUserNeedsOnboarding(userId, false);
 }
 
 module.exports = {
@@ -6387,11 +6844,18 @@ module.exports = {
   getAuditLogs,
   createUser,
   getUsers,
+  countTotalUsers,
+  addToWaitlist,
+  listWaitlist,
+  markWaitlistInvited,
+  markWaitlistNotified,
   getUserByUsername,
   getUserByEmail,
   getUserById,
   updateUserPlan,
   updateUserOAuthProfile,
+  setUserNeedsOnboarding,
+  clearUserOnboarding,
   upsertUserPiiSecure,
   getUserPiiSecure,
   updateUserSubscriptionStatus,
@@ -6456,6 +6920,10 @@ module.exports = {
   createSkill,
   getSkills,
   getSkillById,
+  getSkillBySlug,
+  getSkillsByIds,
+  getSkillsBySlugList,
+  suggestSkills,
   updateSkill,
   deleteSkill,
   setActiveSkill,
@@ -6512,6 +6980,7 @@ module.exports = {
   createApprovedDevice,
   getApprovedDevices,
   getApprovedDeviceByHash,
+  getApprovedDeviceByHashAndToken,
   updateDeviceLastUsed,
   revokeDevice,
   renameDevice,
@@ -6522,6 +6991,17 @@ module.exports = {
   denyPendingApproval,
   cleanupExpiredApprovals,
   getDeviceApprovalHistory,
+  // OAuth Device Flow (RFC 8628)
+  createDeviceCode,
+  getDeviceCodeByDeviceCode,
+  getDeviceCodeByUserCode,
+  getPendingDeviceCodes,
+  approveDeviceCode,
+  denyDeviceCode,
+  expireOldDeviceCodes,
+  // ASC (Agentic Secure Connection)
+  createApprovedDeviceASC,
+  getApprovedDeviceByKeyFingerprint,
   // Service Preferences (Phase 3)
   createServicePreference,
   getServicePreference,
@@ -6622,4 +7102,14 @@ module.exports = {
   getOAuthServerClient,
   createOAuthServerAuthCode,
   consumeOAuthServerAuthCode,
+  peekOAuthServerAuthCode,
+  // AFP (API File Protocol)
+  createAfpDevice,
+  getAfpDevices,
+  getAfpDeviceById,
+  findAfpDeviceByHostname,
+  rotateAfpDeviceToken,
+  revokeAfpDevice,
+  updateAfpDeviceStatus,
+  logAfpCommand,
 };

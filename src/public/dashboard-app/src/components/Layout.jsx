@@ -85,6 +85,7 @@ function NavDropdown({ label, items, isActiveFn, onMobileClick }) {
 function Layout({ children, onLogout }) {
   const location = useLocation();
   const { user } = useAuthStore();
+  const masterToken = useAuthStore((state) => state.masterToken);
   const unreadCount = useNotificationStore(state => state.unreadCount);
   const fetchUnreadCount = useNotificationStore(state => state.fetchUnreadCount);
   const toasts = useNotificationStore(state => state.toasts) || [];
@@ -107,15 +108,15 @@ function Layout({ children, onLogout }) {
 
   // Fetch unread notification count on mount and periodically
   useEffect(() => {
-    fetchUnreadCount();
-    const interval = setInterval(() => fetchUnreadCount(), 30000); // Poll every 30s
+    fetchUnreadCount(masterToken);
+    const interval = setInterval(() => fetchUnreadCount(masterToken), 30000); // Poll every 30s
     return () => clearInterval(interval);
-  }, [fetchUnreadCount]);
+  }, [fetchUnreadCount, masterToken]);
 
   const tokenData = (() => {
     try { return JSON.parse(localStorage.getItem('tokenData') || '{}'); } catch { return {}; }
   })();
-  const isPowerUser = Boolean(user?.isPowerUser);
+  const isPowerUser = !!user?.isPowerUser;
   const effectivePlan = String(user?.plan || tokenData?.plan || 'free').toLowerCase();
   const hasEnterpriseAccess = effectivePlan === 'enterprise';
 
@@ -180,7 +181,8 @@ function Layout({ children, onLogout }) {
     navGroups.push({
       label: 'Admin',
       items: [
-        { path: '/users', label: 'Users' }
+        { path: '/users', label: 'Users' },
+        { path: '/beta', label: 'Beta' }
       ]
     });
   }
@@ -235,6 +237,19 @@ function Layout({ children, onLogout }) {
 
             {/* Right side controls */}
             <div className="flex items-center gap-1">
+              {/* Marketplace Icon */}
+              <Link
+                to="/marketplace"
+                className={`relative flex items-center justify-center w-9 h-9 rounded-lg transition-colors ${
+                  isActive('/marketplace')
+                    ? 'text-amber-400 bg-amber-500/10 ring-1 ring-amber-500/40'
+                    : 'text-amber-500 hover:text-amber-400 hover:bg-amber-500/10'
+                }`}
+                title="Marketplace"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z"></path></svg>
+              </Link>
+
               {/* Notification Bell */}
               <div className="relative">
                 <button

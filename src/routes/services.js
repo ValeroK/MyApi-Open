@@ -1,6 +1,8 @@
+const logger = require('../utils/logger');
 const express = require('express');
 const https = require('https');
 const bcrypt = require('bcrypt');
+const SERVICE_METHODS = require('./service-methods');
 const {
   getServicePreference,
   getServicePreferences,
@@ -80,7 +82,7 @@ function createServicesRoutes() {
     if (req.session?.user || req.tokenMeta) return next();
 
     const authHeader = req.headers.authorization || '';
-    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.query.token || '');
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
     if (!rawToken) return res.status(401).json({ error: 'Unauthorized' });
 
     try {
@@ -88,14 +90,48 @@ function createServicesRoutes() {
       for (const t of tokens) {
         if (t.revokedAt) continue;
         if (t.expiresAt && new Date(t.expiresAt) <= new Date()) continue;
-        if (t.hash && bcrypt.compareSync(rawToken, t.hash)) {
+        if (t.hash && await bcrypt.compare(rawToken, t.hash).catch(() => false)) {
           req.tokenMeta = t;
           req.user = req.user || { id: t.ownerId };
+
+// Service methods registry — documents what operations available for each service
+const SERVICE_METHODS = {
+  google: [
+    {
+      name: 'gmail.messages.list',
+      description: 'List Gmail messages from inbox',
+      method: 'GET',
+      endpoint: '/services/google/gmail/messages',
+      scope: 'services:read or services:google:read or master',
+      parameters: {
+        maxResults: { type: 'number', description: 'Max messages to return (default: 10)', optional: true },
+        pageToken: { type: 'string', description: 'Pagination token from previous response', optional: true }
+      },
+      returns: 'messages array with id, subject, from, to, date, snippet, threadId'
+    },
+    {
+      name: 'gmail.messages.get',
+      description: 'Get full Gmail message by ID',
+      method: 'GET',
+      endpoint: '/services/google/gmail/messages/:messageId',
+      scope: 'services:read or services:google:read or master',
+      parameters: {
+        messageId: { type: 'string', description: 'Message ID from messages.list', optional: false }
+      },
+      returns: 'full message object with body, headers, attachments, labels'
+    }
+  ],
+  github: [],
+  slack: [],
+  discord: [],
+  notion: [],
+  microsoft365: [],
+};
           return next();
         }
       }
     } catch (e) {
-      console.error('[services] requireAuth error:', e.message);
+      logger.error('[services] requireAuth error:', e.message);
     }
 
     res.status(401).json({ error: 'Unauthorized' });
@@ -103,6 +139,53 @@ function createServicesRoutes() {
 
   function resolveUserId(req) {
     return String(req.session?.user?.id || req.user?.id || req.tokenMeta?.ownerId || req.tokenMeta?.userId || 'owner');
+  }
+
+  // Returns true if the caller has sufficient scope to access a service endpoint.
+  // Session users always pass (they are the account owner); master tokens always pass;
+  // guest/scoped bearer tokens need services:* scope.
+  function hasServiceScope(req, serviceName, operation = 'read') {
+    // Session users own their data — always allow.
+    if (req.session?.user) return true;
+    const meta = req.tokenMeta;
+    if (!meta) return false;
+    if (meta.scope === 'full' || meta.tokenType === 'master') return true;
+
+    let scopes = [];
+    try {
+      const parsed = JSON.parse(meta.scope);
+      scopes = Array.isArray(parsed) ? parsed : [];
+    } catch { return false; }
+
+    return scopes.some(s =>
+      s === `services:${operation}` ||
+      s === 'services:write' ||                                    // write implies read
+      (serviceName && s === `services:${serviceName}:${operation}`) ||
+      (serviceName && s === `services:${serviceName}:*`) ||
+      s === 'services:*'
+    );
+  }
+
+  function requireServiceScope(serviceName, operation = 'read') {
+    return (req, res, next) => {
+      if (hasServiceScope(req, serviceName, operation)) return next();
+      const needed = serviceName
+        ? `services:${operation}' or 'services:${serviceName}:${operation}`
+        : `services:${operation}`;
+      return res.status(403).json({ error: `Requires '${needed}' scope` });
+    };
+  }
+
+  // Per-param variant: resolves the service name from req.params at request time
+  // so a scoped token can only touch the specific service it's scoped for.
+  function requireServiceScopeParam(paramName, operation = 'read') {
+    return (req, res, next) => {
+      const serviceName = String(req.params[paramName] || '').toLowerCase();
+      if (hasServiceScope(req, serviceName, operation)) return next();
+      return res.status(403).json({
+        error: `Requires 'services:${operation}' or 'services:${serviceName}:${operation}' scope`,
+      });
+    };
   }
 
   async function getConnectionMetadata(serviceId, userId) {
@@ -148,7 +231,7 @@ function createServicesRoutes() {
   }
 
   // GET /api/v1/services - List all services with their connection status
-  router.get('/', requireAuth, async (req, res) => {
+  router.get('/', requireAuth, requireServiceScope(null, 'read'), async (req, res) => {
     try {
       const userId = resolveUserId(req);
 
@@ -172,13 +255,13 @@ function createServicesRoutes() {
         connected: servicesWithStatus.filter((s) => s.status === 'connected').length,
       });
     } catch (error) {
-      console.error('[Services] Error fetching services:', error);
+      logger.error('[Services] Error fetching services:', error);
       res.status(500).json({ error: 'Failed to fetch services' });
     }
   });
 
   // GET /api/v1/services/categories
-  router.get('/categories', (req, res) => {
+  router.get('/categories', requireAuth, (req, res) => {
     try {
       const map = new Map();
       for (const svc of SERVICE_CATALOG) {
@@ -189,18 +272,23 @@ function createServicesRoutes() {
       }
       res.json({ success: true, data: Array.from(map.values()) });
     } catch (error) {
-      console.error('[Services] Error fetching categories:', error);
+      logger.error('[Services] Error fetching categories:', error);
       res.status(500).json({ error: 'Failed to fetch categories' });
     }
   });
 
-  // GET /api/v1/services/:serviceName - Service detail
-  router.get('/:serviceName', async (req, res, next) => {
+  // GET /api/v1/services/:serviceName - Service detail.
+  // Reserved names (available/preferences/categories) must short-circuit to the
+  // next matching route BEFORE the broad scope middleware runs — otherwise a
+  // narrow-scoped token (e.g. services:gmail:read) would hit 403 here when it
+  // actually wanted /preferences, which has its own scope handling downstream.
+  router.get('/:serviceName', requireAuth, (req, res, next) => {
     const blocked = new Set(['available', 'preferences', 'categories']);
     if (blocked.has(String(req.params.serviceName || '').toLowerCase())) {
-      return next();
+      return next('route');
     }
-
+    return requireServiceScope(null, 'read')(req, res, next);
+  }, async (req, res, next) => {
     try {
       const userId = resolveUserId(req);
       const serviceName = String(req.params.serviceName || '').toLowerCase();
@@ -222,13 +310,33 @@ function createServicesRoutes() {
         },
       });
     } catch (error) {
-      console.error('[Services] Error fetching service detail:', error);
+      logger.error('[Services] Error fetching service detail:', error);
       return res.status(500).json({ error: 'Failed to fetch service detail' });
     }
   });
 
   // GET /api/v1/services/available - List available services
-  router.get('/available', (req, res) => {
+
+
+  // GET /api/v1/services/:serviceId/methods - List available methods for a service
+  router.get('/:serviceId/methods', requireAuth, requireServiceScope(':serviceId', 'read'), async (req, res) => {
+    try {
+      const { serviceId } = req.params;
+      const methods = SERVICE_METHODS[serviceId] || [];
+      
+      res.json({
+        success: true,
+        serviceId,
+        data: methods,
+        count: methods.length,
+        note: methods.length === 0 ? 'No methods documented yet for this service' : `Use these methods under /api/v1/services/`
+      });
+    } catch (error) {
+      logger.error(`[Services] Error fetching methods for ${req.params.serviceId}:`, error);
+      res.status(500).json({ error: 'Failed to fetch service methods' });
+    }
+  });
+  router.get('/available', requireAuth, (req, res) => {
     try {
       res.json({
         success: true,
@@ -236,24 +344,34 @@ function createServicesRoutes() {
         total: SERVICE_CATALOG.length,
       });
     } catch (error) {
-      console.error('[Services] Error fetching available services:', error);
+      logger.error('[Services] Error fetching available services:', error);
       res.status(500).json({ error: 'Failed to fetch available services' });
     }
   });
 
-  router.get('/preferences', (req, res) => {
+  router.get('/preferences', requireAuth, (req, res) => {
     try {
       const userId = req.session?.user?.id || req.user?.id || req.tokenMeta?.userId || 'owner';
       const preferences = getServicePreferences(userId);
 
-      res.json({ success: true, data: preferences });
+      // Filter down to the services this token is actually scoped for.
+      // Master tokens, session users, and broad 'services:*'/'services:read' all pass
+      // every row via hasServiceScope(); narrow `services:{id}:read` tokens see only
+      // their one service; tokens with no services scope at all see an empty array.
+      // Prevents a narrow-scoped token from enumerating every connected OAuth
+      // provider (and any API keys stored in preferences JSON).
+      const filtered = Array.isArray(preferences)
+        ? preferences.filter((p) => hasServiceScope(req, String(p.service_name || p.serviceName || '').toLowerCase(), 'read'))
+        : preferences;
+
+      res.json({ success: true, data: filtered });
     } catch (error) {
-      console.error('[ServicePreferences] Error fetching preferences:', error);
+      logger.error('[ServicePreferences] Error fetching preferences:', error);
       res.status(500).json({ error: 'Failed to fetch service preferences' });
     }
   });
 
-  router.get('/preferences/:serviceName', (req, res) => {
+  router.get('/preferences/:serviceName', requireAuth, requireServiceScopeParam('serviceName', 'read'), (req, res) => {
     try {
       const userId = req.session?.user?.id || req.user?.id || req.tokenMeta?.userId || 'owner';
       const { serviceName } = req.params;
@@ -266,12 +384,12 @@ function createServicesRoutes() {
 
       res.json({ success: true, data: preference });
     } catch (error) {
-      console.error('[ServicePreferences] Error fetching preference:', error);
+      logger.error('[ServicePreferences] Error fetching preference:', error);
       res.status(500).json({ error: 'Failed to fetch service preference' });
     }
   });
 
-  router.post('/preferences/:serviceName', requireAuth, (req, res) => {
+  router.post('/preferences/:serviceName', requireAuth, requireServiceScopeParam('serviceName', 'write'), (req, res) => {
     try {
       const userId = req.session?.user?.id || req.user?.id || req.tokenMeta?.ownerId || 'owner';
       const { serviceName } = req.params;
@@ -293,12 +411,12 @@ function createServicesRoutes() {
 
       res.status(201).json({ success: true, data: result });
     } catch (error) {
-      console.error('[ServicePreferences] Error updating preference:', error);
+      logger.error('[ServicePreferences] Error updating preference:', error);
       res.status(500).json({ error: 'Failed to update service preference' });
     }
   });
 
-  router.put('/preferences/:serviceName', requireAuth, (req, res) => {
+  router.put('/preferences/:serviceName', requireAuth, requireServiceScopeParam('serviceName', 'write'), (req, res) => {
     try {
       const userId = req.user?.id || req.tokenMeta?.ownerId || 'owner';
       const { serviceName } = req.params;
@@ -320,12 +438,12 @@ function createServicesRoutes() {
 
       res.json({ success: true, data: result });
     } catch (error) {
-      console.error('[ServicePreferences] Error updating preference:', error);
+      logger.error('[ServicePreferences] Error updating preference:', error);
       res.status(500).json({ error: 'Failed to update service preference' });
     }
   });
 
-  router.delete('/preferences/:serviceName', requireAuth, (req, res) => {
+  router.delete('/preferences/:serviceName', requireAuth, requireServiceScopeParam('serviceName', 'write'), (req, res) => {
     try {
       const userId = req.session?.user?.id || req.user?.id || req.tokenMeta?.userId || 'owner';
       const { serviceName } = req.params;
@@ -346,7 +464,7 @@ function createServicesRoutes() {
 
       res.json({ success: true, message: 'Service preferences deleted' });
     } catch (error) {
-      console.error('[ServicePreferences] Error deleting preference:', error);
+      logger.error('[ServicePreferences] Error deleting preference:', error);
       res.status(500).json({ error: 'Failed to delete service preference' });
     }
   });
@@ -396,7 +514,7 @@ function createServicesRoutes() {
 
   // GET /api/v1/services/google/gmail/messages
   // Query params: maxResults (default 5, max 20), q (Gmail search query), pageToken
-  router.get('/google/gmail/messages', requireAuth, async (req, res) => {
+  router.get('/google/gmail/messages', requireAuth, requireServiceScope('google', 'read'), async (req, res) => {
     try {
       const userId = resolveUserId(req);
       const accessToken = await getGoogleAccessToken(userId);
@@ -458,14 +576,14 @@ function createServicesRoutes() {
         resultSizeEstimate: resultSizeEstimate || details.length,
       });
     } catch (error) {
-      console.error('[Gmail] Error fetching messages:', error);
+      logger.error('[Gmail] Error fetching messages:', error);
       res.status(500).json({ error: 'Failed to fetch Gmail messages', message: error.message });
     }
   });
 
   // GET /api/v1/services/google/gmail/messages/:messageId
   // Returns the full email (plain text body extracted)
-  router.get('/google/gmail/messages/:messageId', requireAuth, async (req, res) => {
+  router.get('/google/gmail/messages/:messageId', requireAuth, requireServiceScope('google', 'read'), async (req, res) => {
     try {
       const userId = resolveUserId(req);
       const accessToken = await getGoogleAccessToken(userId);
@@ -524,8 +642,128 @@ function createServicesRoutes() {
         },
       });
     } catch (error) {
-      console.error('[Gmail] Error fetching message:', error);
+      logger.error('[Gmail] Error fetching message:', error);
       res.status(500).json({ error: 'Failed to fetch Gmail message', message: error.message });
+    }
+  });
+
+  // ── Google Drive ─────────────────────────────────────────────────────────────
+
+  function driveRequest(accessToken, method, path, body, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+      const url = new URL('https://www.googleapis.com' + path);
+      const payload = body ? JSON.stringify(body) : null;
+      const options = {
+        hostname: url.hostname,
+        path: url.pathname + url.search,
+        method,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}),
+          ...extraHeaders,
+        },
+      };
+      const req = https.request(options, (res) => {
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => {
+          const raw = Buffer.concat(chunks);
+          try { resolve({ status: res.statusCode, body: JSON.parse(raw.toString()) }); }
+          catch { resolve({ status: res.statusCode, body: raw }); }
+        });
+      });
+      req.on('error', reject);
+      if (payload) req.write(payload);
+      req.end();
+    });
+  }
+
+  // GET /api/v1/services/google/drive/files?q=&pageSize=
+  router.get('/google/drive/files', requireAuth, requireServiceScope('google', 'read'), async (req, res) => {
+    try {
+      const userId = resolveUserId(req);
+      const accessToken = await getGoogleAccessToken(userId);
+      if (!accessToken) return res.status(401).json({ error: 'Google account not connected', hint: 'Connect via /api/v1/oauth/connect/google' });
+
+      const pageSize = Math.min(Number(req.query.pageSize) || 20, 100);
+      const q = req.query.q || '';
+      const pageToken = req.query.pageToken || '';
+      let path = `/drive/v3/files?pageSize=${pageSize}&fields=nextPageToken,files(id,name,mimeType,size,modifiedTime,parents,webViewLink,webContentLink)`;
+      if (q) path += `&q=${encodeURIComponent(q)}`;
+      if (pageToken) path += `&pageToken=${encodeURIComponent(pageToken)}`;
+
+      const r = await driveRequest(accessToken, 'GET', path);
+      if (r.status !== 200) return res.status(r.status).json({ error: 'Drive API error', details: r.body });
+      res.json({ success: true, files: r.body.files, nextPageToken: r.body.nextPageToken || null });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to list Drive files', message: e.message });
+    }
+  });
+
+  // POST /api/v1/services/google/drive/upload  body: { name, content, mimeType?, folderId? }
+  router.post('/google/drive/upload', requireAuth, requireServiceScope('google', 'write'), async (req, res) => {
+    try {
+      const userId = resolveUserId(req);
+      const accessToken = await getGoogleAccessToken(userId);
+      if (!accessToken) return res.status(401).json({ error: 'Google account not connected', hint: 'Connect via /api/v1/oauth/connect/google' });
+
+      const { name, content, mimeType = 'text/plain', encoding = 'utf8', folderId } = req.body;
+      if (!name || content === undefined) return res.status(400).json({ error: 'name and content are required' });
+
+      const fileBuffer = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf8');
+      const metadata = { name, mimeType, ...(folderId ? { parents: [folderId] } : {}) };
+      const metaJson = JSON.stringify(metadata);
+
+      // Multipart upload
+      const boundary = '-------MyApiUpload';
+      const body = Buffer.concat([
+        Buffer.from(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${metaJson}\r\n--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`),
+        fileBuffer,
+        Buffer.from(`\r\n--${boundary}--`),
+      ]);
+
+      const r = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'www.googleapis.com',
+          path: '/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size,webViewLink',
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': `multipart/related; boundary=${boundary}`,
+            'Content-Length': body.length,
+          },
+        };
+        const req2 = https.request(options, (res2) => {
+          const chunks = [];
+          res2.on('data', c => chunks.push(c));
+          res2.on('end', () => {
+            try { resolve({ status: res2.statusCode, body: JSON.parse(Buffer.concat(chunks).toString()) }); }
+            catch (e) { resolve({ status: res2.statusCode, body: {} }); }
+          });
+        });
+        req2.on('error', reject);
+        req2.write(body);
+        req2.end();
+      });
+
+      if (r.status !== 200) return res.status(r.status).json({ error: 'Upload failed', details: r.body });
+      res.json({ success: true, file: r.body });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to upload to Drive', message: e.message });
+    }
+  });
+
+  // DELETE /api/v1/services/google/drive/files/:fileId
+  router.delete('/google/drive/files/:fileId', requireAuth, requireServiceScope('google', 'write'), async (req, res) => {
+    try {
+      const userId = resolveUserId(req);
+      const accessToken = await getGoogleAccessToken(userId);
+      if (!accessToken) return res.status(401).json({ error: 'Google account not connected' });
+      const r = await driveRequest(accessToken, 'DELETE', `/drive/v3/files/${req.params.fileId}`);
+      if (r.status !== 204 && r.status !== 200) return res.status(r.status).json({ error: 'Delete failed', details: r.body });
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to delete Drive file', message: e.message });
     }
   });
 
