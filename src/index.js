@@ -772,12 +772,12 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "https://unpkg.com", "https://static.cloudflareinsights.com", (req, res) => `'nonce-${res.locals.cspNonce}'`],
+      scriptSrc: ["'self'", "https://unpkg.com", "https://static.cloudflareinsights.com", "https://cdn.tailwindcss.com", (req, res) => `'nonce-${res.locals.cspNonce}'`],
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://unpkg.com"],
       imgSrc: ["'self'", "data:", "https:", "blob:"],
       fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
       connectSrc: ["'self'", "https:", "wss:"],
-      frameSrc: ["'self'"],
+      frameSrc: ["'self'", "https://www.youtube.com", "https://www.youtube-nocookie.com"],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
       formAction: ["'self'", "https://chat.openai.com", "https://chatgpt.com"],
@@ -1266,7 +1266,11 @@ app.get('/', (req, res) => {
   // Serve the marketing landing page for browser visitors
   const landingPath = path.join(__dirname, 'public', 'landing', 'index.html');
   if (fs.existsSync(landingPath)) {
-    return res.sendFile(landingPath);
+    const nonce = res.locals.cspNonce;
+    let html = fs.readFileSync(landingPath, 'utf8');
+    html = html.replace(/<script/g, `<script nonce="${nonce}"`);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(html);
   }
   res.redirect('/dashboard/');
 });
@@ -4520,6 +4524,47 @@ app.get('/openapi.json', (req, res) => {
             },
           },
         },
+        delete: {
+          operationId: 'trashGmailMessage',
+          summary: 'Move a Gmail message to Trash',
+          description: 'Moves a Gmail message to the Trash folder (not permanent deletion).',
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            { name: 'messageId', in: 'path', required: true, schema: { type: 'string' } },
+          ],
+          responses: {
+            '200': { description: 'Message trashed', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, messageId: { type: 'string' }, trashed: { type: 'boolean' } } } } } },
+          },
+        },
+      },
+      '/api/v1/services/google/gmail/send': {
+        post: {
+          operationId: 'sendGmailMessage',
+          summary: 'Send an email via Gmail',
+          description: 'Send an email from the connected Gmail account.',
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['to', 'subject', 'body'],
+                  properties: {
+                    to: { type: 'string', description: 'Recipient email address' },
+                    subject: { type: 'string', description: 'Email subject' },
+                    body: { type: 'string', description: 'Plain text email body' },
+                    cc: { type: 'string', description: 'CC email address(es)', nullable: true },
+                    bcc: { type: 'string', description: 'BCC email address(es)', nullable: true },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { description: 'Email sent', content: { 'application/json': { schema: { type: 'object', properties: { success: { type: 'boolean' }, messageId: { type: 'string' }, threadId: { type: 'string' } } } } } },
+          },
+        },
       },
 
       // ── Google Drive ──────────────────────────────────────────
@@ -5672,10 +5717,10 @@ app.post("/api/v1/tokens/validate", authRateLimit, async (req, res) => {
 const BILLING_PLANS = {
   free: {
     id: 'free',
-    name: 'Free',
-    price_cents: 0,
-    priceMonthly: 0, // deprecated, kept for backwards compat
-    description: 'Perfect for individuals getting started',
+    name: 'Starter',
+    price_cents: 1000,
+    priceMonthly: 10, // deprecated, kept for backwards compat
+    description: 'Perfect for personal use and getting started.',
     features: [
       '2 AI Personas',
       '3 Service Connections',
@@ -5689,9 +5734,9 @@ const BILLING_PLANS = {
     maxServices: 3,
     maxTeamMembers: 2,
     maxSkillsPerPersona: 4,
-    stripe_product_id: null,
-    stripePriceId: null,
-    stripePaymentLinkEnv: null,
+    stripe_product_id: process.env.STRIPE_PRODUCT_ID_STARTER_LIVE || 'prod_UE1qwjLE5Sfyqs',
+    stripePriceId: process.env.STRIPE_PRICE_ID_STARTER_LIVE,
+    stripePaymentLinkEnv: 'STRIPE_PAYMENT_LINK_STARTER',
   },
   pro: {
     id: 'pro',
@@ -6047,10 +6092,10 @@ app.post('/api/v1/billing/checkout', authenticate, async (req, res) => {
       customer = upsertBillingCustomer(workspaceId, created.id, ownerEmail);
     }
 
-    // SECURITY: Only auto-upgrade to free plan. For paid plans, wait for Stripe webhook confirmation
-    if (selectedPlan === 'free') {
+    // During beta, Starter (free) is complimentary — activate without payment
+    if (selectedPlan === 'free' && betaMode.isBetaMode()) {
       upsertBillingSubscription(workspaceId, {
-        stripe_subscription_id: `free_${Date.now()}`,
+        stripe_subscription_id: `beta_starter_${Date.now()}`,
         plan_id: 'free',
         status: 'active',
       });
@@ -6058,7 +6103,7 @@ app.post('/api/v1/billing/checkout', authenticate, async (req, res) => {
         url: null,
         plan: 'free',
         provider: 'stripe',
-        message: 'Free plan activated'
+        message: 'Starter plan activated (free during beta)'
       });
     }
 
@@ -6412,8 +6457,10 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
         description: 'Google — Gmail, Calendar, Drive',
         proxy_note: 'All Google calls go through POST /api/v1/services/google/proxy with {path, method, body}.',
         actions: [
-          { action: 'List Gmail messages',          method: 'GET',  path: '/gmail/v1/users/me/messages?maxResults=10' },
-          { action: 'Get a Gmail message',          method: 'GET',  path: '/gmail/v1/users/me/messages/{messageId}' },
+          { action: 'List Gmail messages',          method: 'GET',    path: '/gmail/v1/users/me/messages?maxResults=10' },
+          { action: 'Get a Gmail message',          method: 'GET',    path: '/gmail/v1/users/me/messages/{messageId}' },
+          { action: 'Send a Gmail message',         method: 'POST',   path: '/api/v1/services/google/gmail/send' },
+          { action: 'Trash a Gmail message',        method: 'DELETE', path: '/api/v1/services/google/gmail/messages/{messageId}' },
           { action: 'List calendar events',         method: 'GET',  path: '/calendar/v3/calendars/primary/events?maxResults=10' },
           { action: 'List Drive files',             method: 'GET',  path: '/drive/v3/files?pageSize=10' },
         ],
@@ -6542,7 +6589,7 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
 app.get("/api/v1/audit", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can view audit log" });
   const page = parseInt(req.query.page) || 1;
-  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+  const limit = Math.min(parseInt(req.query.limit) || 50, 500);
   const offset = (page - 1) * limit;
   const { logs, total } = getAuditLogs(limit, offset);
   res.json({ data: logs, meta: { total, page, limit } });
