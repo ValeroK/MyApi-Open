@@ -29,6 +29,28 @@ const PBKDF2_ITERATIONS = 600000; // ≥600k per NIST standard
 const PBKDF2_SALT_LENGTH = 32; // 256 bits
 const PBKDF2_DIGEST = 'sha256';
 
+// HKDF Parameters (RFC 5869)
+const HKDF_DIGEST = 'sha256';
+const HKDF_ROOT_MIN_LENGTH = 32; // 256 bits — enforced for production callers
+const HKDF_OUT_MIN_LENGTH = 16;
+const HKDF_OUT_MAX_LENGTH = 64;
+
+/**
+ * Whitelisted HKDF "info" labels for `deriveSubkey`. The label is part of
+ * the HKDF expand step (info parameter), so adding or changing a label
+ * changes the derived key for that purpose. Use a `:vN` suffix when
+ * rotating; never re-use a retired label.
+ *
+ * Domain-separation contract (T2.1, ADR-0013):
+ *   - oauth:v1   — AES-256-GCM key for OAuth token + state encryption.
+ *   - session:v1 — Signing key for session cookies / session payloads.
+ *   - audit:v1   — Key for audit-log MAC / append-only chaining.
+ *
+ * The list is deliberately frozen so the existence test can pin it.
+ */
+const SUBKEY_PURPOSES = Object.freeze(['oauth:v1', 'session:v1', 'audit:v1']);
+const SUBKEY_PURPOSE_SET = new Set(SUBKEY_PURPOSES);
+
 // Security limits
 const MAX_PLAINTEXT_SIZE = 100 * 1024 * 1024; // 100MB max
 const MAX_CIPHERTEXT_SIZE = 100 * 1024 * 1024; // 100MB max
@@ -66,6 +88,106 @@ function deriveKey(masterKey, salt) {
     KEY_LENGTH,
     PBKDF2_DIGEST
   );
+}
+
+/**
+ * Derive a purpose-scoped subkey from a high-entropy root key using
+ * HKDF-SHA-256 (RFC 5869, expand-then-extract).
+ *
+ * Use this to give every subsystem its own key without storing extra
+ * key material, and without ever passing the root key to call sites
+ * that don't need it. Domain separation is enforced via the `purpose`
+ * label, which is fed into HKDF's `info` parameter, so two purposes
+ * produce statistically independent outputs even from the same root.
+ *
+ * @param {Buffer|string} root - Root key (≥ 32 bytes, hex string OK).
+ * @param {string} purpose - Whitelisted label from `SUBKEY_PURPOSES`.
+ * @param {Object} [opts]
+ * @param {number} [opts.length=32] - Output size in bytes (16..64).
+ * @param {Buffer} [opts.salt] - Optional HKDF salt (defaults to a
+ *     zeroed `HashLen` buffer per RFC 5869 §2.2). Provide a non-secret
+ *     stable value if you need a third axis of separation.
+ * @param {boolean} [opts.allowUnregisteredPurpose=false] - Escape hatch
+ *     for tests + KAT vectors. Production callers must not set this.
+ * @param {boolean} [opts.allowShortRoot=false] - Escape hatch for
+ *     tests + KAT vectors. Production callers must not set this.
+ * @returns {Buffer} Derived subkey.
+ * @throws {Error} Generic "Subkey derivation failed" — never echoes
+ *     the root or purpose.
+ */
+function deriveSubkey(root, purpose, opts = {}) {
+  try {
+    const {
+      length = KEY_LENGTH,
+      salt,
+      allowUnregisteredPurpose = false,
+      allowShortRoot = false,
+    } = opts || {};
+
+    if (typeof purpose !== 'string' || purpose.length === 0) {
+      throw new Error('invalid purpose');
+    }
+    if (!allowUnregisteredPurpose && !SUBKEY_PURPOSE_SET.has(purpose)) {
+      throw new Error('invalid purpose');
+    }
+
+    if (
+      !Number.isInteger(length) ||
+      length < HKDF_OUT_MIN_LENGTH ||
+      length > HKDF_OUT_MAX_LENGTH
+    ) {
+      throw new Error('invalid length');
+    }
+
+    let rootBuffer;
+    if (Buffer.isBuffer(root)) {
+      rootBuffer = root;
+    } else if (typeof root === 'string') {
+      // Reject anything that isn't a clean hex string of even length.
+      if (!/^[0-9a-fA-F]+$/.test(root) || root.length % 2 !== 0) {
+        throw new Error('invalid root');
+      }
+      rootBuffer = Buffer.from(root, 'hex');
+    } else {
+      throw new Error('invalid root');
+    }
+
+    if (!allowShortRoot && rootBuffer.length < HKDF_ROOT_MIN_LENGTH) {
+      throw new Error('invalid root');
+    }
+    if (rootBuffer.length === 0) {
+      throw new Error('invalid root');
+    }
+
+    let saltBuffer;
+    if (salt === undefined || salt === null) {
+      // RFC 5869 §2.2: when salt is not provided, use HashLen zeroed bytes.
+      saltBuffer = Buffer.alloc(32, 0);
+    } else if (Buffer.isBuffer(salt)) {
+      saltBuffer = salt;
+    } else if (typeof salt === 'string') {
+      saltBuffer = Buffer.from(salt, 'utf8');
+    } else {
+      throw new Error('invalid salt');
+    }
+
+    // info encoding: utf8 for the whitelisted labels keeps the wire form
+    // byte-identical to what humans read; KAT mode stays binary-safe via
+    // the test passing the RFC info as a binary string.
+    const infoBuffer = Buffer.from(purpose, 'binary');
+
+    const out = crypto.hkdfSync(
+      HKDF_DIGEST,
+      rootBuffer,
+      saltBuffer,
+      infoBuffer,
+      length,
+    );
+
+    return Buffer.isBuffer(out) ? out : Buffer.from(out);
+  } catch {
+    throw new Error('Subkey derivation failed');
+  }
 }
 
 /**
@@ -261,6 +383,7 @@ module.exports = {
   generateEncryptionKey,
   generateSalt,
   deriveKey,
+  deriveSubkey,
   hashKey,
 
   // Encrypt/decrypt
@@ -287,4 +410,5 @@ module.exports = {
   PBKDF2_SALT_LENGTH,
   MAX_PLAINTEXT_SIZE,
   MAX_CIPHERTEXT_SIZE,
+  SUBKEY_PURPOSES,
 };
