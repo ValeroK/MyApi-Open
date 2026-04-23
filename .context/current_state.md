@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **26 / 26 suites, 351 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **27 / 27 suites, 363 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,43 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — Frontend open-redirect hardening in
+- **2026-04-21 (latest)** — **M3 Step 1 / T3.0: execution playbook +
+  inventory regression gate.** New `ADR-0014-m3-oauth-state-hardening-plan.md`
+  ratifies the 8-commit execution path for M3 (target design is frozen
+  at ADR-0006 — DB-backed single-use state rows, random 32-byte PKCE
+  verifier stored in-row, no Discord bypass). The ADR pins a
+  per-step test-first contract: every step files a red-first test
+  suite *before* the implementation and ships the green gate in the
+  same commit, with `npm test` exit 0 + no new lint/typecheck
+  findings on touched files as hard commit gates. Companion
+  `src/tests/oauth-state-inventory.test.js` (12 assertions) locks
+  the four broken-today facts as `TODO(M3 Step N)`-labelled gates:
+  - **schema gap (flips in Step 2 / T3.1).** `oauth_state_tokens`
+    has only the 5 legacy columns; each of `user_id`, `mode`,
+    `return_to`, `code_verifier`, `used_at` is asserted MISSING
+    today; each assertion is paired with its ADR-0006 rationale
+    and the exact step that will flip it to `toBe(true)`.
+  - **deterministic PKCE verifier (flips in Step 5 / T3.5).**
+    `src/index.js` contains `function buildPkcePairFromState(` AND
+    the literal `createHmac('sha256', secret).update(`pkce:${state}`)`
+    — the H1 finding from plan.md §6.3. Step 5 deletes both.
+  - **in-memory state map (flips in Steps 4+5).** `src/index.js`
+    contains ≥ 4 occurrences of `oauthStateMeta` (the session-Map
+    replaced by the DB row in Step 4).
+  - **Discord carve-out (flips in Step 5 / T3.6).** `src/index.js`
+    contains `isDiscordBotInstall`, C6 in plan.md §6.3.
+  - **domain module (flips in Step 3 / T3.2).**
+    `src/domain/oauth/state.js` does not exist on disk today.
+  Rationale for textual gates on (b)–(d): the broken primitives are
+  module-scope private symbols in the monolith (not exported), so
+  textual gates on unique identifier names give a clean signal
+  without the cost of booting the full server for reflection.
+  Same pattern used successfully in M2 Step 2 / `legacy-vault-inventory`.
+  Ran green against HEAD today (12/12). Full `npm test` →
+  **27 / 27 suites, 363 pass, 18 skip, exit 0** (was 26/351 at end
+  of M2 wrap-up; +1 suite / +12 assertions). No production code
+  touched in this commit — pure test-first pre-work per ADR-0012.
+- **2026-04-21** — Frontend open-redirect hardening in
   `src/public/dashboard-app/src/pages/LogIn.jsx` (folded into the M2
   wrap-up commit). The mid-session merge from the upstream dashboard
   rewrite had introduced a same-origin guard regression: four
@@ -365,16 +401,27 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M2 complete.** All eight in-scope tasks closed (T2.0, T2.1,
-  T2.4, T2.5, T2.7, T2.8, T2.9, T2.10). Three tasks cancelled per
-  ADR-0013 (T2.2, T2.3, T2.6 — the "vault migration" half became
-  dead-code deletion once the subsystem was proven orphan). Net
-  outcome: the weak-crypto path and every silent default-key fallback
-  are gone, the HKDF domain-separation primitive is in place, the
-  boot-time secret gate runs fail-closed in every environment, and
-  the public-facing docs (CLAUDE / SECURITY / README) match the code.
-- **Next:** M3 OAuth state + PKCE hardening (DB-backed `state_tokens`,
-  random PKCE verifier, remove Discord bypass).
+- **Now:** **M3 in progress.** Execution playbook (ADR-0014) filed
+  and Step 1 / T3.0 (inventory regression gate) shipped green. The
+  12 inventory assertions lock today's broken behaviour so Steps 2–8
+  (T3.1–T3.9) each have to flip a labelled gate — no silent skipping.
+  Target design is ADR-0006 (unchanged): DB-backed single-use state
+  rows with a random 32-byte PKCE verifier stored in-row, no Discord
+  bypass. Next up: Step 2 / T3.1 (expand `oauth_state_tokens` schema
+  via an additive, backfill-safe migration).
+- **Recently closed:** **M2 complete.** All eight in-scope tasks
+  (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
+  per ADR-0013 (T2.2, T2.3, T2.6). Weak-crypto path and silent
+  default-key fallbacks removed, HKDF domain-separation primitive
+  live, boot-time secret gate fail-closed in every environment,
+  public-facing docs (CLAUDE / SECURITY / README) match the code.
+  Plus the M2 wrap-up commit folded in a frontend open-redirect
+  hardening for `LogIn.jsx` (`isSafeInternalRedirect` + 61
+  behavioural + 10 textual-gate assertions).
+- **Next:** M3 Steps 2–8 per ADR-0014 (schema migration → domain
+  module → authorize rewire → callback rewire + Discord bypass
+  deletion → user-gesture confirm screen → replay/expired/missing
+  regression matrix → background prune).
 - **Blocked / waiting on a human:**
   - **Google OAuth credential rotation** at the provider — tracked for M3
     hardening. Not urgent since `REMOVED_…` fallbacks are gone and
