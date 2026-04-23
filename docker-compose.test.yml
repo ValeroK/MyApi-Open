@@ -1,0 +1,92 @@
+# =============================================================================
+# MyApi — Test Runner (Docker)
+# =============================================================================
+#
+# Purpose
+# -------
+# Run the full Jest suite (`npm test`) inside a throw-away container. Use
+# this any time you want to verify a change WITHOUT installing Node,
+# better-sqlite3 toolchain, or any devDependency on the host.
+#
+# Quick start
+# -----------
+#   # Full suite (29/29 suites at time of writing):
+#   docker-compose -f docker-compose.test.yml up --build --abort-on-container-exit
+#
+#   # Or, via the npm alias (defined in package.json):
+#   npm run docker:test
+#
+#   # Narrower runs:
+#   npm run docker:test:integration   # supertest-driven handler tests
+#   npm run docker:test:oauth         # M3 OAuth state / PKCE suites
+#
+# What it does
+# ------------
+#   - Builds an image off `src/Dockerfile` exactly once (layer cache saves
+#     you a full rebuild on subsequent runs unless source changed).
+#   - Bind-mounts `./src:/app/src` so editing a test file doesn't need
+#     `--build` again; the container picks the fresh files up on restart.
+#     Node_modules are kept as an anonymous volume so the host's absence of
+#     `better-sqlite3` native bindings doesn't pollute the container.
+#   - Uses an in-memory SQLite DB (`DB_PATH=:memory:`) — no host files are
+#     touched, no cleanup required, and the Windows `EBUSY` flake we
+#     sometimes see on `tmp-*.sqlite` unlinks simply can't happen in here.
+#   - Fails closed: `--abort-on-container-exit` + `--exit-code-from` cause
+#     `docker-compose up` to return non-zero if any test failed, which is
+#     exactly what CI needs.
+#
+# Why inline env vars instead of `.env`?
+# --------------------------------------
+# These are test-grade secrets ONLY. The actual secret validation
+# (`src/lib/validate-secrets.js`) runs in every NODE_ENV since M2 T2.5,
+# and it rejects the full family of default / example literals. The
+# inline values below are the same ones the host-side Jest tests use
+# (see `src/tests/security-regression.test.js:17-23` and every other
+# suite) — keeping them in sync here lets the container reproduce the
+# host run bit-for-bit.
+#
+# =============================================================================
+
+services:
+  myapi-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: myapi:test
+    container_name: myapi-test
+    # tty + init keep Jest's output readable and make Ctrl-C clean.
+    tty: true
+    init: true
+    environment:
+      NODE_ENV: test
+      DB_PATH: ":memory:"
+      JWT_SECRET: test-jwt-secret-ci
+      ENCRYPTION_KEY: test-encryption-key-32chars!!
+      SESSION_SECRET: test-session-secret-ci
+      VAULT_KEY: test-vault-key-ci-32characters!
+      CI: "true"
+    volumes:
+      # Mount the source tree so iterating on tests does not require
+      # `--build`. `/app/node_modules` is an anonymous volume so the host's
+      # (potentially absent / mismatched) node_modules never shadows the
+      # container's freshly-installed ones.
+      - ./src:/app/src:cached
+      # `./connectors/` is referenced by a handful of tests — most notably
+      # `src/tests/critical-security-fixes.test.js` which requires
+      # `../../connectors/afp-daemon/lib/daemon.js`. Mount it read-only so
+      # tests resolve it exactly like on the host.
+      - ./connectors:/app/connectors:ro
+      - /app/node_modules
+    # Default: run the full suite. Override with `command: npm run test:oauth`
+    # at the CLI or via the package.json aliases for narrower runs.
+    command: npm test
+    # Tests need no network and should not be allowed to reach the outside
+    # world. `network_mode: none` would be ideal but breaks Jest workers on
+    # some Docker versions; `internal` is a safer middle ground.
+    networks:
+      - myapi-test
+
+networks:
+  myapi-test:
+    driver: bridge
+    internal: true

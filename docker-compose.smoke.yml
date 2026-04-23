@@ -1,0 +1,128 @@
+# =============================================================================
+# MyApi — Manual Smoke Harness (Docker)
+# =============================================================================
+#
+# Purpose
+# -------
+# Boot the live application inside Docker so you can click-through the
+# dashboard, curl endpoints, and verify new behaviour end-to-end BEFORE
+# merging a feature. Optimised for "iterate on source, see the change
+# immediately" — edits under `./src/` trigger nodemon to restart the
+# backend inside the container.
+#
+# This is NOT the production compose — it runs with `NODE_ENV=development`,
+# permissive cookies, log level `debug`, and uses test-grade secrets from
+# `.env.smoke` (copied from `.env.smoke.example`). Never point this at a
+# production DB or production OAuth client IDs.
+#
+# Quick start
+# -----------
+#   # One-time setup:
+#   cp .env.smoke.example .env.smoke
+#   # (edit .env.smoke if you want to add real OAuth client IDs, else leave
+#   # the placeholders — the app still boots and the health endpoints work.)
+#
+#   npm run docker:smoke          # bring it up in the background
+#   npm run docker:smoke:init     # seed the access_tokens row — prints your master token
+#   npm run docker:smoke:logs     # follow nodemon output
+#   npm run docker:smoke:shell    # exec into the container for ad-hoc commands
+#
+#   # Then, from the host, hit the API:
+#   curl -s http://localhost:4500/health
+#   curl -s http://localhost:4500/api/v1/health
+#   curl -s -H "Authorization: Bearer $MASTER_TOKEN" http://localhost:4500/api/v1/me
+#
+#   # Tear down when done:
+#   npm run docker:smoke:down
+#
+# Data persistence
+# ----------------
+# `./data/` on the host is bind-mounted to `/app/data/` in the container.
+# The SQLite file lives at `/app/data/myapi.db` inside the container, so
+# it survives restarts and rebuilds. Delete the file from the host to
+# reset.
+#
+# Volume layout
+# -------------
+#   ./src           -> /app/src         (cached)   live-reload sources
+#   ./data          -> /app/data                   SQLite + uploads
+#   ./connectors    -> /app/connectors  (ro)       OAuth scopes / specs
+#   myapi-smoke-logs -> /app/logs                  server log files
+#   /app/node_modules (anon)                       shielded from the host
+#
+# Ports
+# -----
+#   4500 -> 4500      backend API + built dashboard at /dashboard/
+#
+# Frontend hot-reload: the Vite dev server is NOT started here. The
+# container serves the *built* dashboard from the last `npm run build`
+# baked into the image. For frontend iteration, run
+# `npm run dev` inside `src/public/dashboard-app/` on the host (port 5173)
+# and point it at `http://localhost:4500` via Vite's proxy config.
+#
+# =============================================================================
+
+services:
+  myapi-smoke:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: myapi:smoke
+    container_name: myapi-smoke
+    restart: unless-stopped
+    init: true
+
+    env_file:
+      - .env.smoke
+
+    environment:
+      NODE_ENV: development
+      PORT: 4500
+      DB_PATH: /app/data/myapi.db
+      LOG_LEVEL: debug
+      SESSION_COOKIE_SECURE: "false"
+
+    ports:
+      - "4500:4500"
+
+    volumes:
+      - ./src:/app/src:cached
+      - ./data:/app/data
+      - ./connectors:/app/connectors:ro
+      - myapi-smoke-logs:/app/logs
+      # Anonymous volume shields the container's node_modules from whatever
+      # (if anything) the host has at ./node_modules — especially the native
+      # better-sqlite3 build which is platform-specific.
+      - /app/node_modules
+
+    # Override the Dockerfile's CMD to use Node 22's built-in `--watch` flag
+    # against the live-mounted source. This keeps the container image free
+    # of nodemon (which is in `src/package.json`'s devDependencies but NOT
+    # the root `package.json` that the image installs). `NODE_OPTIONS` for
+    # the underlying watcher isn't needed — `--watch src/index.js` tracks
+    # the whole loaded-module graph by default.
+    #
+    # Windows + Docker Desktop note: file-change events on bind mounts use
+    # polling. Node's --watch respects polling automatically; if you still
+    # hit missed reloads, `docker restart myapi-smoke` is the fallback.
+    command: >
+      sh -c "node --watch --watch-path=/app/src src/index.js"
+
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:4500/health', r => { if (r.statusCode !== 200) throw new Error(r.statusCode) })"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    networks:
+      - myapi-smoke
+
+volumes:
+  myapi-smoke-logs:
+    driver: local
+
+networks:
+  myapi-smoke:
+    driver: bridge

@@ -1,0 +1,63 @@
+# =============================================================================
+# Dockerfile.dev — Development + test image for MyApi
+# =============================================================================
+#
+# Purpose
+# -------
+# Small image that runs the backend Node API for tests and manual smoke
+# testing. Used by:
+#   - docker-compose.test.yml  (npm test)
+#   - docker-compose.smoke.yml (node --watch)
+#
+# Intentionally does NOT build the React/Vite dashboard. If you need to
+# exercise the dashboard UI, run its Vite dev server on the host:
+#
+#     cd src/public/dashboard-app && npm install && npm run dev
+#
+# Vite listens on :5173 by default and proxies API calls at `/api/*` to the
+# containerised backend on :4500 (the proxy is already configured in
+# src/public/dashboard-app/vite.config.ts — or add one if missing).
+#
+# Why not reuse `src/Dockerfile` or the root `Dockerfile`?
+# --------------------------------------------------------
+# Both of the existing production Dockerfiles are optimised for shipping a
+# single container with the built dashboard baked in, and both have
+# side-effects that hurt dev iteration:
+#   - root `Dockerfile` uses `npm ci --only=production`, so jest / supertest /
+#     every devDep is absent — tests can't run.
+#   - `src/Dockerfile` does `npm install` at /app (root package.json) and
+#     then `cd src/public/dashboard-app && npm run build`, but that second
+#     step requires vite from the *nested* package.json which was never
+#     installed. From-scratch builds of `src/Dockerfile` fail with
+#     `sh: 1: vite: not found` (observed 2026-04-21).
+#
+# This file sidesteps both problems: install root package.json (incl.
+# devDeps), no frontend build, no production-only pruning. The smoke and
+# test compose files bind-mount `./src/` at runtime so image size stays
+# small and source edits are instantly visible.
+#
+# When the `src/Dockerfile` production-build bug is fixed in a future
+# cleanup commit, this file stays — it serves a different purpose (dev
+# speed vs. production shipping).
+# =============================================================================
+
+FROM node:22
+
+WORKDIR /app
+
+# Install root package dependencies (dependencies + devDependencies). We
+# install ALL deps because the test container needs jest, supertest, etc.,
+# and the smoke container benefits from the same environment as tests for
+# parity.
+COPY package*.json ./
+RUN npm install --no-audit --no-fund
+
+# Ensure runtime directories exist. `data` will be overridden by a bind
+# mount in the smoke compose; `logs` is used by the winston-style logger.
+RUN mkdir -p data logs
+
+EXPOSE 4500
+
+# Default command: boot the API in watch mode. The smoke compose overrides
+# this; the test compose overrides this with `npm test`.
+CMD ["node", "src/index.js"]

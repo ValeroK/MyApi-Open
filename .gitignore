@@ -48,6 +48,11 @@ src/public/*.zip
 src/.env*
 !src/.env.example
 .env.local
+.env.smoke
+
+# Docker smoke harness bind-mount — SQLite DB + uploads persist here.
+# Always git-ignored; re-seed with `npm run docker:smoke:init`.
+/data/
 logs/
 
 # Backups (may contain sensitive data)

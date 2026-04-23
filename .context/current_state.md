@@ -76,7 +76,112 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — **M3 Step 3 / T3.2 + T3.3: pure
+- **2026-04-21 (latest)** — **Docker-first integration scaffolding
+  (pre-Step 4).** Addresses the "I want to actually boot the app and
+  run integration tests — and I want all of it in Docker, not on my
+  PC" request surfaced during M3 review. Artefacts:
+    - `Dockerfile.dev` — small dev/test image that installs the
+      root `package.json` (incl. devDeps so jest is present) and
+      skips the dashboard build entirely. Needed because
+      `src/Dockerfile`'s from-scratch build is broken today
+      (runs `vite build` without installing vite — observed
+      `sh: 1: vite: not found`), and the root `Dockerfile` uses
+      `npm ci --only=production` so it can't run tests. This
+      file sidesteps both issues for dev iteration; the
+      production Dockerfiles stay untouched (cleanup tracked
+      for M3 wrap-up).
+    - `docker-compose.test.yml` — one-shot container that runs
+      `npm test` against an in-memory SQLite DB with test-grade
+      inline secrets. `--abort-on-container-exit` + `--exit-code-from`
+      make it CI-safe. Bind-mounts `./src/` so iterating on a test
+      file does not require `--build`. Network is `internal: true`
+      so tests cannot reach the outside world (parity with CI).
+    - `docker-compose.smoke.yml` — hot-reload smoke harness on
+      port 4500. Bind-mounts `./src/` (Node 22's built-in
+      `--watch --watch-path=/app/src` — no nodemon needed, which
+      matters because nodemon is in `src/package.json` devDeps
+      but NOT in the root `package.json` the image installs),
+      `./data/` (SQLite persistence across restarts), and
+      `./connectors/` (ro). Uses `.env.smoke` (git-ignored)
+      copied from the new committed template.
+    - `.env.smoke.example` — committed template with non-banned
+      test-grade JWT / SESSION / ENCRYPTION / VAULT values. Chosen
+      to satisfy `src/lib/validate-secrets.js` without polluting
+      the ban-list; `cp .env.smoke.example .env.smoke` and the
+      app boots. Explicit warning: not production-safe.
+    - `package.json` — 9 new scripts: `test:integration`,
+      `test:oauth`, `docker:test`, `docker:test:integration`,
+      `docker:test:oauth`, `docker:smoke`, `docker:smoke:down`,
+      `docker:smoke:logs`, `docker:smoke:shell`,
+      `docker:smoke:init`. `test:integration` covers the
+      supertest-driven handler suites; `test:oauth` covers the
+      five OAuth-specific files (M3 state + schema + inventory +
+      security hardening + signup flow).
+    - `.context/runbooks/manual-smoke.md` — Docker-first runbook
+      covering one-time setup, boot, master-token seeding, HTTP
+      smoke curls, post-Step-4 OAuth state verification via the
+      live `oauth_state_tokens` table, tear-down, and gotchas
+      (Windows bind-mount polling, `:memory:` vs file DB, which
+      compose file is for what). Replaces ad-hoc tribal knowledge.
+    - `.gitignore` — `.env.smoke` and `/data/` added (template
+      `.env.smoke.example` stays tracked).
+  **Zero-risk on source:** no file under `src/` was touched, so
+  `npm test` remains at 29/29 suites / 394 pass / 18 skip. The
+  commit is pure test-infrastructure + documentation.
+  **What this unlocks for M3:**
+    - Step 4 (authorize rewire) ships its own supertest
+      integration suite that `npm run docker:test:oauth` picks up
+      automatically — no further scaffolding needed.
+    - Step 5 (callback rewire) can add an end-to-end
+      authorize → simulated-upstream → callback round-trip test
+      that runs identically in `docker:test` and in CI.
+    - Manual QA has a single documented sequence
+      (`docker:smoke` → `docker:smoke:init` → curl → exec-in for
+      `sqlite3` inspection) — no more "wait, what env do I need?"
+      every time.
+  Intentionally out of scope (deferred to M3 wrap-up `m3-wrap`):
+  retiring `docker-compose.dev.yml` (still mentions MongoDB
+  deleted in M1) and reconciling root `Dockerfile` vs
+  `src/Dockerfile` (docker-compose.yml references the former,
+  every other compose file references the latter).
+  **Live validation before commit (2026-04-21):**
+    - `docker-compose.smoke.yml` build + boot → clean. Server
+      logs `✅ All required secrets validated`, migrations
+      applied (11 including the M3 Step 2 oauth_state_tokens
+      migration), `Server ready on http://0.0.0.0:4500`.
+    - `GET /health` → `200` with `{"status":"ok","database":{"healthy":true}}`.
+    - `GET /api/v1/health` → `401` without auth, correct JSON
+      error body.
+    - `docker:smoke:init --force` → created new master token;
+      `GET /api/v1/services` with `Authorization: Bearer ...`
+      → `200` / 7.7 KB payload. Confirms auth middleware
+      works end-to-end in the container.
+    - Inspected `/app/data/myapi.db` from inside the container
+      via `better-sqlite3` REPL: `oauth_state_tokens` has all
+      10 M3 columns (`user_id`, `mode`, `return_to`,
+      `code_verifier`, `used_at` present) and all 3 required
+      indexes (`idx_oauth_state_tokens_state` / `_expires` /
+      `_used`). **The M3 Step 2 schema migration is now
+      verified not just in :memory: but against a real
+      file-backed SQLite DB the container creates at first
+      boot.**
+    - `docker-compose -f docker-compose.test.yml up` on the
+      first run hit 9 failures in `critical-security-fixes.test.js`
+      with `Cannot find module '../../connectors/afp-daemon/lib/daemon.js'`
+      — connectors dir was not mounted. Added
+      `./connectors:/app/connectors:ro` to the test compose;
+      rerun went **29 passed / 29 suites / 394 tests pass /
+      18 skipped**, identical to the host baseline.
+  **One pre-existing bug surfaced (not in scope for this commit):**
+  `GET /api/v1/me` returns `403 DEVICE_APPROVAL_FAILED` with
+  `details: FOREIGN KEY constraint failed`. The device-approval
+  middleware tries to insert an approval row referencing a FK
+  that doesn't exist. Reproduces on the host too. Documented in
+  the runbook's "Known gotchas" table. Scheduled for a separate
+  fix once M3 is complete.
+  **Commit:** (see git log once pushed).
+
+- **2026-04-21** — **M3 Step 3 / T3.2 + T3.3: pure
   `src/domain/oauth/state.js` module.** The single entry point for
   OAuth state lifecycle is now on disk; no route handler needs to
   hand-roll SQL against `oauth_state_tokens`, and no route handler
