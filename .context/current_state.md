@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **28 / 28 suites, 371 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **29 / 29 suites, 394 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,70 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — **M3 Step 2 / T3.1: additive schema
+- **2026-04-21 (latest)** — **M3 Step 3 / T3.2 + T3.3: pure
+  `src/domain/oauth/state.js` module.** The single entry point for
+  OAuth state lifecycle is now on disk; no route handler needs to
+  hand-roll SQL against `oauth_state_tokens`, and no route handler
+  needs to keep state metadata in `req.session`. Closes H1
+  (deterministic PKCE verifier) at the primitive level — the broken
+  `buildPkcePairFromState` in `src/index.js` stays on disk but
+  unused until Steps 4 + 5 remove the call-sites and declaration.
+  Exported surface (documented in the file header):
+    - `createStateToken({ db, serviceName, mode, returnTo?,
+      userId?, ttlSec?=600, now? })` → `{ id, state, codeVerifier,
+      codeChallenge, expiresAt, createdAt }`. `state` and
+      `codeVerifier` are each 32 random bytes base64url-encoded
+      (43 chars, 256 bits of entropy each, drawn independently).
+      `codeChallenge` is PKCE S256 (`base64url(sha256(verifier))`).
+    - `consumeStateToken({ db, state, serviceName, now? })` →
+      consumed row, or throws `StateTokenError` with one of five
+      symbolic codes (`STATE_NOT_FOUND` / `STATE_EXPIRED` /
+      `STATE_REUSED` / `STATE_SERVICE_MISMATCH` /
+      `STATE_INVALID_MODE` / `STATE_INVALID_SERVICE`). Uses a
+      guarded UPDATE (`WHERE state_token = ? AND used_at IS NULL`)
+      rather than `db.transaction(fn)` — this repo's
+      `SQLiteAdapter.transaction()` is an async-Promise wrapper
+      (see `src/lib/db-abstraction.js:132`), not the native
+      better-sqlite3 sync API, so the single-statement UPDATE guard
+      gives the same "first wins, losers see REUSED" invariant
+      without coupling to the adapter shape. Service mismatch
+      intentionally does NOT consume the row (benign retry succeeds).
+    - `pruneExpiredStateTokens({ db, now?, graceSec?=3600 })` →
+      `{ removed }`. Deletes rows where `expires_at < now-grace`
+      OR `used_at < now-grace`. Consumed by the Step 8 / T3.9
+      scheduler.
+    - `computeCodeChallenge(verifier)`, `StateTokenError.CODES`,
+      `VALID_MODES` also exported for HTTP handlers / tests.
+  **Red-first discipline:** `src/tests/oauth-state-domain.test.js`
+  (22 assertions) was filed in its red state with 22/22 fail
+  (MODULE_NOT_FOUND against HEAD), then the implementation landed
+  in the same commit and flipped it to 22/22 green. Suite
+  includes:
+    - Module surface (3 functions + StateTokenError + CODES enum).
+    - **RFC 7636 Appendix B known-answer test** for `S256`
+      (`verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"` →
+      `challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"`).
+      A silent drift off the PKCE S256 spec is a user-facing
+      OAuth break; this KAT catches it.
+    - Happy path, uniqueness, shape, row persistence,
+      NULL-when-unset for `user_id` / `return_to`.
+    - Reject paths: invalid mode, missing serviceName.
+    - `ttlSec` honoured with an injected clock.
+    - `consumeStateToken`: happy path with `used_at` populated,
+      replay → REUSED, unknown → NOT_FOUND, expired → EXPIRED,
+      service mismatch → SERVICE_MISMATCH (+ row NOT consumed,
+      benign retry still works).
+    - `pruneExpiredStateTokens`: expired past grace pruned,
+      used past grace pruned, `graceSec=0` override, fresh rows
+      kept, `{ removed: 0 }` when nothing qualifies.
+  The Step 3 inventory gate ("domain module does not exist") was
+  flipped to two assertions ("exists" + "exports the ADR-0006
+  surface") in the same commit. Full `npm test` →
+  **29 / 29 suites, 394 pass, 18 skip, exit 0** (+1 suite, +23
+  assertions vs Step 2). No handler code rewritten in this commit
+  — the broken primitives in `src/index.js` still ship and run;
+  Steps 4 + 5 wire the new module in and delete them.
+- **2026-04-21** — **M3 Step 2 / T3.1: additive schema
   migration on `oauth_state_tokens`.** The table gains five columns and
   two indexes that collectively let the row carry everything a flow
   needs (so the in-memory `oauthStateMeta` map can be deleted in Steps

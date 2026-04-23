@@ -168,10 +168,16 @@ describe('[M3 / Steps 4–5] legacy OAuth-state primitives still live in src/ind
 // 3. Domain module is NOT yet present (flips in Step 3)
 // -------------------------------------------------------------------------
 
-describe('[M3 / Step 3] src/domain/oauth/state.js does not exist yet (T3.2 + T3.3)', () => {
-  test('domain module is absent today (flips to present in Step 3)', () => {
+describe('[M3 / Step 3] src/domain/oauth/state.js is the single entry point (T3.2 + T3.3)', () => {
+  test('domain module exists (flipped from absent in Step 3 / T3.2)', () => {
     const target = path.join(srcDir, 'domain', 'oauth', 'state.js');
-    // TODO(M3 Step 3 / T3.2): flip to `expect(fs.existsSync(target)).toBe(true)`.
-    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.existsSync(target)).toBe(true);
+  });
+
+  test('domain module exports the ADR-0006 surface', () => {
+    const mod = require('../domain/oauth/state');
+    expect(typeof mod.createStateToken).toBe('function');
+    expect(typeof mod.consumeStateToken).toBe('function');
+    expect(typeof mod.pruneExpiredStateTokens).toBe('function');
   });
 });
