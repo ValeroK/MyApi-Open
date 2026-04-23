@@ -31,7 +31,6 @@ import Connectors from './pages/Connectors';
 import Memory from './pages/Memory';
 import OAuthAuthorize from './pages/OAuthAuthorize';
 import LogIn from './pages/LogIn';
-import Login from './pages/Login';
 import SignUp from './pages/SignUp';
 import Onboarding from './pages/Onboarding';
 import Activate from './pages/Activate';
@@ -132,48 +131,14 @@ function App() {
     }
 
     if (oauthStatus === 'confirm_login' && confirmToken) {
-      // Step 1: Confirm the OAuth login with the backend
-      fetch('/api/v1/oauth/confirm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ token: confirmToken })
-      })
-        .then(res => res.ok ? res.json() : null)
-        .then(result => {
-          if (result?.ok) {
-            // Step 2: Confirmation succeeded, now fetch user data
-            return fetch('/api/v1/auth/me', { credentials: 'include' })
-              .then(res => res.ok ? res.json() : null);
-          }
-          // Confirm failed — fall through with null so the failure path runs
-          return null;
-        })
-        .then((sessionUser) => {
-          if (sessionUser?.user) {
-            const { setMasterToken, setUser } = useAuthStore.getState();
-            // /auth/me always returns the platform-generated master token in
-            // bootstrap.masterToken (creating it on first login if needed).
-            if (sessionUser.bootstrap?.masterToken) {
-              setMasterToken(sessionUser.bootstrap.masterToken);
-            }
-            setUser(sessionUser.user);
-            // If login was initiated from an OAuth consent page (e.g. agent-auth installer),
-            // redirect back there instead of dropping the user on the dashboard home.
-            const nextUrl = urlParams.get('next');
-            if (nextUrl && (nextUrl.startsWith('/dashboard/') || nextUrl === '/dashboard')) {
-              window.location.replace(nextUrl);
-            } else {
-              window.history.replaceState({}, document.title, '/dashboard/');
-            }
-          } else {
-            // Confirm or auth/me failed — send user back to landing to re-authenticate
-            window.location.replace('/');
-          }
-        })
-        .catch(() => {
-          window.location.replace('/');
-        });
+      // M3 / T3.7 — the landing-page auto-confirm was deleted because it
+      // silently set `req.session.user` without any user gesture (C3
+      // session-fixation variant). The `LogIn` page now owns the
+      // gesture flow end-to-end: it calls `/api/v1/oauth/confirm/preview`
+      // to render "Continue as X?", and only POSTs `/api/v1/oauth/confirm`
+      // after the user clicks Continue. We stay on the login route; do
+      // NOT strip the query params here — the LogIn page component
+      // consumes them on its own `useEffect`.
     } else if (oauthStatus === 'pending_2fa') {
       // User has 2FA enabled — redirect to the login page which has the 2FA input form.
       // Guard: if already on /login, don't redirect again (prevents infinite loop).
@@ -250,7 +215,7 @@ function App() {
               <Route path="/signup" element={<SignUp />} />
               <Route path="/platform-docs" element={<PlatformDocs />} />
               <Route path="/api-docs" element={<ApiDocs />} />
-              <Route path="/" element={<Login />} />
+              <Route path="/" element={<LogIn />} />
               <Route path="*" element={
                 <div className="min-h-screen grid place-items-center bg-slate-950 text-slate-300">
                   <div className="text-center">

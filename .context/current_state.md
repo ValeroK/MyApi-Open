@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-23**
+> - Last updated: **2026-04-24**
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **32 / 32 suites, 422 pass / 18 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **34 / 34 suites, 470 pass / 18 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,139 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-23 (latest)** — **M3 Steps 4 + 5 / T3.4 + T3.5 + T3.6
+- **2026-04-24 (latest)** — **M3 Step 6 / T3.7 landed: user-facing
+  OAuth confirm-gesture screen + first-seen gating + row-as-SSOT
+  refactor.** Closes the session-fixation variant of C3 end-to-end.
+  ADR-0016 records the first-seen keying decision
+  (`{service, user_id, provider_subject}`, not just
+  `{service, user_id}`). Shape of the change:
+    - **Schema.** `oauth_pending_logins` gains
+      `used_at TEXT NULL` + `outcome TEXT NULL` (mirrors the
+      `oauth_state_tokens` "first-write-wins burn" pattern from Step
+      2); `oauth_tokens` gains `provider_subject TEXT NULL` +
+      `first_confirmed_at TEXT NULL`. All additive, all idempotent
+      via `safeMigration()`.
+    - **New domain module** `src/domain/oauth/pending-confirm.js`
+      — single entry point for `createPendingConfirm`,
+      `previewPendingConfirm`, `consumePendingConfirm`,
+      `hasConfirmedBefore`, `recordFirstConfirmation`,
+      `pruneExpiredPendingConfirms`. Handlers and the scheduler
+      (Step 8) MUST go through this module — no hand-rolled SQL,
+      no `req.session.oauth_*` state. Mirrors the `state.js`
+      module shipped in Step 3.
+    - **`src/index.js` callback handler** now consults
+      `hasConfirmedBefore({db, userId, serviceName,
+      providerSubject})` after provider-token exchange. On `true`
+      (returning user with an already-confirmed
+      `{service, user, subject}` tuple): `storeOAuthToken(...)`
+      refresh-rotates the token, establishes the session, and
+      302s to the safe `returnTo` — zero gesture. On `false`
+      (first-seen or subject changed): `createPendingConfirm(...)`
+      mints a row, 302s to
+      `/dashboard/?oauth_service=…&oauth_status=confirm_login&next=…&token=…`.
+      **No code path sets `req.session.user` pre-gesture anymore.**
+    - **Three new endpoints.**
+      `GET /api/v1/oauth/confirm/preview?token=…` is a read-only
+      surface the SPA calls to render "Continue as X?"; it maps
+      `PendingConfirmError` codes (`NOT_FOUND` / `EXPIRED` /
+      `REUSED`) to HTTP 400 with discriminated error strings.
+      `POST /api/v1/oauth/confirm` (rewritten) consumes the row
+      with `outcome='accepted'`, calls `storeOAuthToken(...)`
+      including `providerSubject`, calls
+      `recordFirstConfirmation(...)` to stamp
+      `first_confirmed_at`, then establishes the session
+      (`req.session.user` / `currentWorkspace` / masterTokenRaw).
+      `POST /api/v1/oauth/confirm/reject` consumes the row with
+      `outcome='rejected'` without setting session — explicit
+      cancel path so the short-lived token cannot be replayed
+      out-of-band.
+    - **`storeOAuthToken`** now accepts an optional
+      `providerSubject`. On UPDATE it resets
+      `first_confirmed_at → NULL` iff the incoming subject
+      differs from the stored one (same local account, different
+      provider identity — ADR-0016 §Case B). Callers that don't
+      know the subject pass `null` and `COALESCE` preserves the
+      existing value; this keeps backward compatibility with
+      pre-T3.7 call sites (signup-mode / connect-mode paths —
+      hardened in `m3-wrap`).
+    - **Frontend rewired.**
+      `src/public/dashboard-app/src/App.jsx` deletes the
+      landing-page auto-POST `useEffect` (the handler that
+      silently set `req.session.user` with no user gesture —
+      the C3 session-fixation variant we are closing).
+      `src/public/dashboard-app/src/pages/LogIn.jsx` now owns
+      the gesture end-to-end: a new `pendingConfirm` state
+      machine (`loading` → `ready` → `accepting | rejecting`)
+      renders a dedicated screen above every other login/signup
+      branch; a preview fetch calls `/confirm/preview` on
+      mount, and only user-driven **Continue** / **Cancel**
+      clicks reach `/confirm` or `/confirm/reject`. URL params
+      are stripped on mount so a reload / bookmark cannot
+      replay the confirm token.
+    - **NTFS duplicate `Login.jsx` deleted.** The repo tracked
+      both `LogIn.jsx` and `Login.jsx` (git is case-sensitive,
+      NTFS is not) — deleting `Login.jsx` on Windows had the
+      byproduct of wiping `LogIn.jsx` too, which had to be
+      restored from HEAD and the gesture edits re-applied. The
+      inventory gate uses `fs.readdirSync()` (NOT
+      `fs.existsSync()`) to detect the duplicate, because
+      Docker bind-mounts on Windows inherit NTFS's
+      case-insensitivity and `existsSync('Login.jsx')` returns
+      `true` even when only `LogIn.jsx` is on disk. Root
+      `<Route path="/">` now renders `LogIn` (was `Login`).
+    - **Inventory gates added** in
+      `src/tests/oauth-state-inventory.test.js`: absence of
+      `session.oauth_confirm` / `session.oauth_login_pending`
+      references in `src/index.js` (comment-stripped so the
+      deletion rationale prose doesn't re-trigger them),
+      presence of the `pending-confirm.js` module with its
+      T3.7 export surface, absence of executable
+      `fetch('/api/v1/oauth/confirm'…)` in `App.jsx`
+      (comment-stripped again), `readdirSync`-based duplicate
+      `Login.jsx` gate, and four schema-column gates on
+      `oauth_pending_logins.used_at` /
+      `oauth_pending_logins.outcome` /
+      `oauth_tokens.provider_subject` /
+      `oauth_tokens.first_confirmed_at`. **+10 assertions
+      vs end of Step 5.**
+    - **New test suites (red-first, 2026-04-24).**
+      `src/tests/oauth-pending-confirm-domain.test.js` — 24
+      domain-level assertions covering the full lifecycle
+      (create → preview → consume-accept / consume-reject,
+      error taxonomy, `hasConfirmedBefore` /
+      `recordFirstConfirmation` semantics including Case B
+      subject-change reset, prune grace window).
+      `src/tests/oauth-confirm-handler.test.js` — 15
+      supertest assertions covering `/confirm/preview`
+      (happy / NOT_FOUND / EXPIRED / REUSED), `/confirm`
+      (happy-sets-session + stamps `first_confirmed_at` +
+      persists token with subject, error mapping,
+      session-free behaviour), and `/confirm/reject` (happy
+      does NOT set session, errors map cleanly).
+    - **Full Docker regression GREEN.**
+      `docker compose -f docker-compose.test.yml run --rm
+      myapi-test npm test -- --forceExit` → **34 suites,
+      470 pass / 18 skipped / 0 fail** (+2 suites / +48 tests
+      vs Step 5's 32/422). ~7s.
+    - **Intentionally out of scope (→ `m3-wrap`):** threading
+      `provider_subject` through signup-mode and connect-mode
+      code paths (both still pass `null`, which the
+      `COALESCE` branch tolerates); one live Google E2E
+      smoke; retirement of the now-unreferenced legacy
+      `createStateToken` / `validateStateToken` exports from
+      `src/database.js`.
+  **What this unlocks:**
+    - Step 7 / T3.8 (replay / missing / expired / valid
+      regression matrix) can now reshape BOTH the callback
+      tests AND the new confirm tests into the §5.4
+      security-regression frame. Everything it needs is on disk.
+    - Step 8 / T3.9 (background prune scheduler) just needs
+      to wire `pruneExpiredStateTokens(...)` (shipped in T3.2)
+      AND `pruneExpiredPendingConfirms(...)` (shipped in
+      T3.7) into the scheduler — no new primitives required.
+  ADR: `.context/decisions/ADR-0016-oauth-confirm-first-seen-keying.md`.
+
+- **2026-04-23** — **M3 Steps 4 + 5 / T3.4 + T3.5 + T3.6
   paired in one atomic commit.** Collapsed per explicit direction to
   preserve `oauth-signup-flow.test.js`'s end-to-end coverage across
   the refactor — splitting 4 and 5 would have left that suite
@@ -785,24 +917,27 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 Steps 1–5 landed** (T3.0–T3.6 / 7 of 10). C3
-  ("OAuth state not DB-validated") and C6 ("Discord state bypass")
-  from `plan.md` §6.3 are **closed at the handler level** as of the
-  2026-04-23 paired commit. H1 (deterministic PKCE verifier) is now
-  closed at both the primitive level (Step 3) *and* the handler
-  level (Step 5) — `buildPkcePairFromState` is off disk entirely.
-- **Next:** **M3 Step 6 / T3.7** — `LogIn.jsx` confirm-screen gesture
-  + `/api/v1/oauth/confirm/preview` endpoint. The callback now
-  redirects to `?oauth_status=confirm_login` in every login-mode
-  flow; Step 6 closes the loop by refusing to complete the login
-  without a user-triggered button press showing the OAuth subject
-  email (mitigates the session-fixation variant of C3). Followed
-  by Step 7 / T3.8 (replay / missing / expired / valid regression
-  matrix — mostly a reshape of existing callback tests into the
-  §5.4 security-regression frame) and Step 8 / T3.9 (background
-  prune scheduler around the already-shipping
-  `pruneExpiredStateTokens`), then the M3 wrap-up commit +
-  one live smoke on real Google.
+- **Now:** **M3 Steps 1–6 landed** (T3.0–T3.7 / 8 of 10). C3
+  ("OAuth state not DB-validated" + the session-fixation variant
+  that rode on top of it) and C6 ("Discord state bypass") from
+  `plan.md` §6.3 are now **fully closed** end-to-end. H1
+  (deterministic PKCE verifier) remains closed. The OAuth
+  callback can no longer set `req.session.user` without a
+  user-driven gesture, and the first-seen key
+  (`{service, user, provider_subject}`) prevents both
+  gesture-fatigue on returning users and silent aliasing of a
+  different provider identity onto an existing local account.
+- **Next:** **M3 Step 7 / T3.8** — replay / missing / expired /
+  valid regression matrix. Mostly a reshape of the existing
+  `oauth-callback-handler.test.js` + `oauth-confirm-handler.test.js`
+  assertions into the §5.4 security-regression frame; no new
+  primitives, no new schema. Followed by Step 8 / T3.9
+  (background prune scheduler wiring
+  `pruneExpiredStateTokens` and
+  `pruneExpiredPendingConfirms` — both primitives are already
+  on disk), then the M3 wrap-up commit (docs, signup/connect
+  mode `provider_subject` threading, legacy export retirement,
+  one live smoke on real Google).
 - **Recently closed:** **M2 complete.** All eight in-scope tasks
   (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
   per ADR-0013 (T2.2, T2.3, T2.6). Plus the M2 wrap-up commit

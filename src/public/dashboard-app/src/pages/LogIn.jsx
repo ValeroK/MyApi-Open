@@ -40,6 +40,12 @@ function Login() {
   const [oauthSignupNonce, setOauthSignupNonce] = useState('');
   const [signupCompleting, setSignupCompleting] = useState(false);
   const [termsAccepted, setTermsAccepted] = useState(false);
+  // M3 / T3.7 — user-facing OAuth confirm gesture. When set, the gesture
+  // screen takes precedence over every other login/signup render branch.
+  // `status` walks: 'loading' (preview in flight) → 'ready' (user sees
+  // Continue/Cancel) → 'accepting' | 'rejecting' (terminal action in
+  // flight). `preview` is populated on 'ready'; `error` on any failure.
+  const [pendingConfirm, setPendingConfirm] = useState(null);
   const { setMasterToken, setUser, isAuthenticated } = useAuthStore();
 
   useEffect(() => {
@@ -62,39 +68,42 @@ function Login() {
     const callback = handleOAuthCallback();
     if (callback) {
       if (callback.status === 'confirm_login') {
+        // M3 / T3.7 — the server no longer auto-logs-in. We fetch the
+        // preview (read-only) so the user can see which provider-side
+        // identity they're about to approve, and we render a gesture
+        // screen with explicit Continue / Cancel buttons. The actual
+        // POST /api/v1/oauth/confirm happens in `handleConfirmAccept`
+        // after the user clicks — closing the session-fixation C3
+        // variant that existed when App.jsx / this page auto-POSTed.
         const confirmToken = callback.token;
-        fetch('/api/v1/oauth/confirm', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+        // Strip the URL params immediately so a reload / bookmark can't
+        // replay the confirm token out-of-band.
+        window.history.replaceState({}, document.title, '/dashboard/');
+        setPendingConfirm({ status: 'loading', token: confirmToken, preview: null, error: null });
+        fetch(`/api/v1/oauth/confirm/preview?token=${encodeURIComponent(confirmToken)}`, {
           credentials: 'include',
-          body: JSON.stringify({ token: confirmToken }),
         })
           .then(async (res) => {
-            if (!res.ok) return null;
+            if (!res.ok) {
+              const body = await res.json().catch(() => ({}));
+              throw new Error(body?.error || 'preview_failed');
+            }
             return res.json();
           })
-          .then((confirmResult) => {
-            if (confirmResult?.ok) {
-              return fetch('/api/v1/auth/me', { credentials: 'include' })
-                .then(async (res) => {
-                  if (!res.ok) return null;
-                  return res.json();
-                });
-            }
-            return null;
+          .then((preview) => {
+            setPendingConfirm({ status: 'ready', token: confirmToken, preview, error: null });
           })
-          .then((sessionUser) => {
-            if (sessionUser) {
-              if (sessionUser?.bootstrap?.masterToken) {
-                setMasterToken(sessionUser.bootstrap.masterToken);
-              }
-              setUser(sessionUser.user || sessionUser);
-              redirectAfterLogin();
-            }
-          })
-          .catch(() => {
-            setError('Failed to complete login. Please try again.');
-            window.history.replaceState({}, document.title, '/dashboard/');
+          .catch((err) => {
+            setPendingConfirm({
+              status: 'ready',
+              token: confirmToken,
+              preview: null,
+              error: err?.message === 'pending_confirm_expired'
+                ? 'This sign-in request has expired. Please try again.'
+                : err?.message === 'pending_confirm_reused'
+                ? 'This sign-in request has already been used.'
+                : 'Unable to load sign-in confirmation. Please try again.',
+            });
           });
       } else if (callback.status === 'connected') {
         fetch('/api/v1/auth/me', { credentials: 'include' })
@@ -172,6 +181,68 @@ function Login() {
     const forcePrompt = mode === 'login' ? '1' : '0';
     const params = new URLSearchParams({ mode, forcePrompt, returnTo: '/dashboard/', redirect: '1' });
     window.location.href = `/api/v1/oauth/authorize/${serviceId}?${params.toString()}`;
+  };
+
+  // M3 / T3.7 — user pressed "Continue" on the confirm-gesture screen.
+  // This is the ONLY path that sends a POST /api/v1/oauth/confirm — no
+  // auto-confirm is permitted anywhere in the SPA.
+  const handleConfirmAccept = async () => {
+    if (!pendingConfirm || pendingConfirm.status !== 'ready') return;
+    setPendingConfirm((prev) => ({ ...prev, status: 'accepting', error: null }));
+    try {
+      const res = await fetch('/api/v1/oauth/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token: pendingConfirm.token }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(body?.error || 'confirm_failed');
+      }
+      if (body?.bootstrap?.masterToken) {
+        setMasterToken(body.bootstrap.masterToken);
+      }
+      if (body?.user) setUser(body.user);
+      // Hydrate from /auth/me so any server-side derived fields (plan,
+      // feature flags, workspace, etc.) land in the store before render.
+      try {
+        const meRes = await fetch('/api/v1/auth/me', { credentials: 'include' });
+        if (meRes.ok) {
+          const me = await meRes.json();
+          if (me?.bootstrap?.masterToken) setMasterToken(me.bootstrap.masterToken);
+          if (me?.user || me?.id) setUser(me.user || me);
+        }
+      } catch (_) { /* best effort */ }
+      redirectAfterLogin();
+    } catch (err) {
+      setPendingConfirm((prev) => ({
+        ...prev,
+        status: 'ready',
+        error: err?.message === 'pending_confirm_expired'
+          ? 'This sign-in request has expired. Please try again.'
+          : err?.message === 'pending_confirm_reused'
+          ? 'This sign-in request has already been used.'
+          : 'Unable to complete sign-in. Please try again.',
+      }));
+    }
+  };
+
+  // M3 / T3.7 — user pressed "Cancel". We explicitly burn the row on the
+  // server (outcome='rejected') so the short-lived confirm token can't
+  // be replayed, then drop back to the login-method picker.
+  const handleConfirmReject = async () => {
+    if (!pendingConfirm || pendingConfirm.status !== 'ready') return;
+    setPendingConfirm((prev) => ({ ...prev, status: 'rejecting', error: null }));
+    try {
+      await fetch('/api/v1/oauth/confirm/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token: pendingConfirm.token }),
+      });
+    } catch (_) { /* best effort — token is single-use either way */ }
+    setPendingConfirm(null);
   };
 
   const handleTwoFactorChallenge = async (e) => {
@@ -279,7 +350,84 @@ function Login() {
               </div>
             )}
 
-            {isSignup ? (
+            {/* M3 / T3.7 — confirm-gesture screen. Takes precedence over
+                every other render branch; the server has already
+                authenticated the OAuth provider, but will NOT log the
+                user in until they explicitly press Continue below. */}
+            {pendingConfirm ? (
+              <div className="space-y-5">
+                {pendingConfirm.status === 'loading' ? (
+                  <div className="text-center text-sm text-slate-300 py-6">
+                    Loading sign-in request…
+                  </div>
+                ) : (
+                  <>
+                    {pendingConfirm.error && (
+                      <div className="rounded-xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+                        {pendingConfirm.error}
+                      </div>
+                    )}
+                    {pendingConfirm.preview && (
+                      <div className="space-y-2 text-center">
+                        <h2 className="text-xl font-semibold">Confirm sign-in</h2>
+                        <p className="text-sm text-slate-400">
+                          You're about to sign in via{' '}
+                          <span className="font-medium text-slate-200">
+                            {pendingConfirm.preview.serviceName}
+                          </span>
+                          {pendingConfirm.preview.displayName ? (
+                            <>
+                              {' '}as{' '}
+                              <span className="font-medium text-slate-200">
+                                {pendingConfirm.preview.displayName}
+                              </span>
+                            </>
+                          ) : null}
+                          {pendingConfirm.preview.email ? (
+                            <>
+                              {' '}(
+                              <span className="font-mono text-slate-300">
+                                {pendingConfirm.preview.email}
+                              </span>
+                              )
+                            </>
+                          ) : null}
+                          .
+                        </p>
+                        <p className="text-xs text-slate-500 pt-2">
+                          If you didn't initiate this sign-in, press Cancel.
+                        </p>
+                      </div>
+                    )}
+                    <div className="flex gap-3 pt-2">
+                      <button
+                        type="button"
+                        onClick={handleConfirmReject}
+                        disabled={
+                          pendingConfirm.status === 'accepting' ||
+                          pendingConfirm.status === 'rejecting'
+                        }
+                        className="min-h-[48px] flex-1 rounded-xl border border-slate-600 px-4 py-3 text-sm font-semibold text-slate-200 transition-colors hover:bg-slate-800 disabled:opacity-60"
+                      >
+                        {pendingConfirm.status === 'rejecting' ? 'Cancelling…' : 'Cancel'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConfirmAccept}
+                        disabled={
+                          !pendingConfirm.preview ||
+                          pendingConfirm.status === 'accepting' ||
+                          pendingConfirm.status === 'rejecting'
+                        }
+                        className="min-h-[48px] flex-1 rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:opacity-60"
+                      >
+                        {pendingConfirm.status === 'accepting' ? 'Signing in…' : 'Continue'}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : isSignup ? (
               // SIGNUP FLOW
               <>
                 {signupStep === 1 && (

@@ -259,7 +259,14 @@ function initDatabase() {
       expires_at TEXT,
       scope TEXT,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      -- M3 / T3.7 (ADR-0016): first-seen keying on {service, user, subject}.
+      -- provider_subject is the provider stable id (Google sub, GitHub id,
+      -- ...); first_confirmed_at IS NOT NULL means the user has gone
+      -- through the OAuth confirm-gesture screen at least once for this
+      -- subject and further logins can skip the screen.
+      provider_subject TEXT,
+      first_confirmed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS oauth_status (
@@ -291,6 +298,13 @@ function initDatabase() {
       used_at TEXT
     );
 
+    -- M3 / T3.7 (ADR-0014 Step 6): row is the single source of truth
+    -- for the post-callback "did the user consent to log in as X?"
+    -- gesture. used_at/outcome form a two-state machine set inside
+    -- the same guarded UPDATE that burns the row, giving us replay
+    -- resistance identical to oauth_state_tokens. outcome is
+    -- 'accepted' or 'rejected'; a NULL outcome means the row has
+    -- neither been consumed nor expired yet.
     CREATE TABLE IF NOT EXISTS oauth_pending_logins (
       id TEXT PRIMARY KEY,
       service_name TEXT NOT NULL,
@@ -298,7 +312,9 @@ function initDatabase() {
       token TEXT NOT NULL UNIQUE,
       user_data TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      outcome TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_oauth_pending_logins_token ON oauth_pending_logins(token);
     CREATE INDEX IF NOT EXISTS idx_oauth_pending_logins_expires ON oauth_pending_logins(expires_at);
@@ -812,6 +828,18 @@ function initDatabase() {
   // The two new indexes live in the CREATE INDEX IF NOT EXISTS block
   // above; SQLite is idempotent for CREATE INDEX IF NOT EXISTS so no
   // extra safeMigration call is needed here.
+
+  // M3 / T3.7 (ADR-0014 §Step 6 + ADR-0016): extend `oauth_pending_logins`
+  // with a used_at/outcome two-state machine, and extend `oauth_tokens`
+  // with the {provider_subject, first_confirmed_at} first-seen markers
+  // that gate the confirm-gesture short-circuit. All columns are nullable
+  // so existing deployments migrate cleanly — behaviour for old rows
+  // falls back to "treat as first-seen on the next login", which is the
+  // safe default (one-time gesture per existing connection post-deploy).
+  safeMigration("ALTER TABLE oauth_pending_logins ADD COLUMN used_at TEXT");
+  safeMigration("ALTER TABLE oauth_pending_logins ADD COLUMN outcome TEXT");
+  safeMigration("ALTER TABLE oauth_tokens ADD COLUMN provider_subject TEXT");
+  safeMigration("ALTER TABLE oauth_tokens ADD COLUMN first_confirmed_at TEXT");
 
   // Encryption key management table
   try {
@@ -2547,7 +2575,7 @@ function encryptOAuthTokenValue(plainText, keyBytes) {
   return JSON.stringify(payload);
 }
 
-function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expiresAt, scope) {
+function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expiresAt, scope, providerSubject = null) {
   const id = 'oauth_' + crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
 
@@ -2565,25 +2593,46 @@ function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expires
   if (refreshToken) {
     refreshTokenEncrypted = encryptOAuthTokenValue(refreshToken, key);
   }
-  
-  // Upsert: replace existing token for same service+user instead of creating duplicates
-  const existing = db.prepare('SELECT id FROM oauth_tokens WHERE service_name = ? AND user_id = ?').get(serviceName, userId);
-  
+
+  // Upsert: replace existing token for same service+user instead of creating duplicates.
+  // M3 / T3.7: on UPDATE we also keep `provider_subject` in sync and reset
+  // `first_confirmed_at` to NULL whenever the incoming provider_subject
+  // differs from the stored one. That ensures a subsequent login-mode
+  // callback correctly re-gates on the confirm-gesture screen instead of
+  // silently aliasing a DIFFERENT provider account onto a pre-confirmed
+  // row (ADR-0016 Case B). Callers that don't know the provider_subject
+  // (pre-T3.7 callers) pass null — COALESCE keeps the existing value.
+  const existing = db.prepare('SELECT id, provider_subject FROM oauth_tokens WHERE service_name = ? AND user_id = ?').get(serviceName, userId);
+
   if (existing) {
-    db.prepare(`
-      UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?
-      WHERE service_name = ? AND user_id = ?
-    `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, serviceName, userId);
+    const providerSubjectChanged =
+      providerSubject !== null &&
+      existing.provider_subject !== null &&
+      existing.provider_subject !== providerSubject;
+
+    if (providerSubjectChanged) {
+      db.prepare(`
+        UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
+                                provider_subject = ?, first_confirmed_at = NULL
+        WHERE service_name = ? AND user_id = ?
+      `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
+    } else {
+      db.prepare(`
+        UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
+                                provider_subject = COALESCE(?, provider_subject)
+        WHERE service_name = ? AND user_id = ?
+      `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
+    }
     return { id: existing.id, serviceName, userId, expiresAt, scope, createdAt: now, updated: true };
   }
-  
+
   const stmt = db.prepare(`
-    INSERT INTO oauth_tokens (id, service_name, user_id, access_token, refresh_token, expires_at, scope, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO oauth_tokens (id, service_name, user_id, access_token, refresh_token, expires_at, scope, created_at, updated_at, provider_subject)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  
-  stmt.run(id, serviceName, userId, accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, now);
-  
+
+  stmt.run(id, serviceName, userId, accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, now, providerSubject);
+
   return {
     id,
     serviceName,

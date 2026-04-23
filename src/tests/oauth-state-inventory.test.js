@@ -180,3 +180,124 @@ describe('[M3 / Step 3] src/domain/oauth/state.js is the single entry point (T3.
     expect(typeof mod.pruneExpiredStateTokens).toBe('function');
   });
 });
+
+// -------------------------------------------------------------------------
+// 4. M3 Step 6 / T3.7 gates — confirm-screen gesture + row-as-SSOT
+// -------------------------------------------------------------------------
+//
+// These gates encode the invariants established by the M3 Step 6 refactor:
+//
+//   a. The server no longer stashes pending-login metadata on
+//      `req.session.oauth_confirm` or `req.session.oauth_login_pending`.
+//      The `oauth_pending_logins` DB row is the single source of truth
+//      (closes the C3 session-fixation variant — see ADR-0014 §Step 6).
+//
+//   b. A dedicated domain module (`src/domain/oauth/pending-confirm.js`)
+//      owns the lifecycle. Handlers MUST NOT hand-roll SQL against the
+//      `oauth_pending_logins` table.
+//
+//   c. The SPA landing page (`App.jsx`) does NOT auto-POST the confirm
+//      token — the user-facing gesture screen in `pages/LogIn.jsx` is
+//      the only path that can set `req.session.user` post-OAuth.
+//
+//   d. Schema carries the two audit columns (`used_at`, `outcome`) on
+//      `oauth_pending_logins` and the first-seen keying columns
+//      (`provider_subject`, `first_confirmed_at`) on `oauth_tokens`.
+
+describe('[M3 / Step 6] confirm-screen gesture + row-as-SSOT (T3.7)', () => {
+  let source;
+  beforeAll(() => {
+    source = fs.readFileSync(SERVER_ENTRY, 'utf8');
+  });
+
+  test('req.session.oauth_confirm is NO LONGER referenced (flipped in Step 6 / T3.7)', () => {
+    // We permit the literal string inside comments only. The filter
+    // below strips /* ... */ and // ... lines before grepping.
+    const stripped = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(stripped).not.toMatch(/\bsession\.oauth_confirm\b/);
+  });
+
+  test('req.session.oauth_login_pending is NO LONGER referenced (flipped in Step 6 / T3.7)', () => {
+    const stripped = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(stripped).not.toMatch(/\bsession\.oauth_login_pending\b/);
+  });
+
+  test('pending-confirm domain module exists and exports the T3.7 surface', () => {
+    const target = path.join(srcDir, 'domain', 'oauth', 'pending-confirm.js');
+    expect(fs.existsSync(target)).toBe(true);
+    const mod = require('../domain/oauth/pending-confirm');
+    expect(typeof mod.createPendingConfirm).toBe('function');
+    expect(typeof mod.previewPendingConfirm).toBe('function');
+    expect(typeof mod.consumePendingConfirm).toBe('function');
+    expect(typeof mod.hasConfirmedBefore).toBe('function');
+    expect(typeof mod.recordFirstConfirmation).toBe('function');
+    expect(typeof mod.pruneExpiredPendingConfirms).toBe('function');
+  });
+
+  test('App.jsx does NOT auto-POST /api/v1/oauth/confirm (flipped in Step 6 / T3.7)', () => {
+    const appJsx = path.resolve(
+      srcDir,
+      'public',
+      'dashboard-app',
+      'src',
+      'App.jsx'
+    );
+    expect(fs.existsSync(appJsx)).toBe(true);
+    const src = fs.readFileSync(appJsx, 'utf8');
+    // Strip comments so the prose explaining the deletion doesn't
+    // re-trigger the gate.
+    const stripped = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    // Any executable `fetch('/api/v1/oauth/confirm'`  (with or without
+    // /preview or /reject) would fail — only LogIn.jsx is allowed to
+    // call the accept endpoint, and only after a user gesture.
+    expect(stripped).not.toMatch(/fetch\s*\(\s*['"`]\/api\/v1\/oauth\/confirm['"`]/);
+  });
+
+  test('duplicate src/public/dashboard-app/src/pages/Login.jsx is REMOVED (flipped in Step 6 / T3.7)', () => {
+    // NOTE: `fs.existsSync` cannot be trusted here — on Windows hosts the
+    // NTFS filesystem is case-insensitive and a Docker bind-mount faithfully
+    // inherits that behaviour, so `existsSync('Login.jsx')` returns `true`
+    // even when only `LogIn.jsx` is on disk. We instead list the directory
+    // and compare names byte-exactly, which matches how git + the build
+    // pipeline see the repo.
+    const pagesDir = path.resolve(
+      srcDir,
+      'public',
+      'dashboard-app',
+      'src',
+      'pages'
+    );
+    const names = fs.readdirSync(pagesDir);
+    expect(names).toContain('LogIn.jsx');
+    expect(names).not.toContain('Login.jsx');
+  });
+});
+
+describe('[M3 / Step 6] oauth_pending_logins + oauth_tokens schema (T3.7)', () => {
+  let db;
+  beforeAll(() => {
+    const database = require('../database');
+    database.initDatabase();
+    db = database.db;
+  });
+
+  function columnNames(table) {
+    const rows = db.prepare(`PRAGMA table_info('${table}')`).all();
+    return rows.map((r) => r.name);
+  }
+
+  test.each([
+    ['oauth_pending_logins', 'used_at'],
+    ['oauth_pending_logins', 'outcome'],
+    ['oauth_tokens', 'provider_subject'],
+    ['oauth_tokens', 'first_confirmed_at'],
+  ])('%s.%s column exists (Step 6 / T3.7)', (table, col) => {
+    expect(columnNames(table).includes(col)).toBe(true);
+  });
+});

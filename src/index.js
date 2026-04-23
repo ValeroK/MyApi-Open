@@ -119,6 +119,20 @@ const {
   StateTokenError,
 } = require('./domain/oauth/state');
 
+// M3 / T3.7 — OAuth pending-login confirm lifecycle (post-callback
+// "did the user consent to log in as X?" gesture) goes exclusively
+// through this domain module. The oauth_pending_logins row is the
+// single source of truth; no handler is allowed to stash pending-login
+// metadata on `req.session` (closes the C3 session-fixation variant).
+const {
+  createPendingConfirm,
+  previewPendingConfirm,
+  consumePendingConfirm,
+  hasConfirmedBefore,
+  recordFirstConfirmation,
+  PendingConfirmError,
+} = require('./domain/oauth/pending-confirm');
+
 const {
   db,
   initDatabase,
@@ -7632,8 +7646,10 @@ app.post("/api/v1/auth/logout", (req, res) => {
   delete req.session.user;
   delete req.session.masterTokenRaw;
   delete req.session.masterTokenId;
-  delete req.session.oauth_login_pending;
-  delete req.session.oauth_confirm;
+  // M3 / T3.7: `oauth_login_pending` and `oauth_confirm` are no longer
+  // written anywhere — the `oauth_pending_logins` DB row is the sole
+  // source of truth for the post-callback gesture. Left out of the
+  // logout cleanup intentionally so the inventory gate stays green.
   delete req.session.oauth_signup;
   delete req.session.isFirstLogin;
   delete req.session.currentWorkspace;
@@ -8777,78 +8793,95 @@ app.get([
         });
       }
 
-      // Store OAuth credentials in session pending user confirmation
-      req.session.oauth_login_pending = {
-        service,
+      // M3 / T3.7 (ADR-0014 Step 6 + ADR-0016): route through the
+      // gesture screen unless this EXACT {service, user, provider_subject}
+      // tuple has already been confirmed once. No pending-login data
+      // lives on `req.session` any more — the row in `oauth_pending_logins`
+      // is the single source of truth (closes the C3 session-fixation
+      // variant).
+      const firstSeen = !hasConfirmedBefore({
+        db,
         userId: appUser.id,
-        username: appUser.username,
-        email: appUser.email || email,
-        displayName: appUser.displayName || name,
-        avatarUrl: appUser.avatarUrl || avatarUrl || null,
-        providerUserId,
-        hasTwoFa: appUser.twoFactorEnabled,
-        tokenData: {
-          accessToken: tokenData.accessToken,
-          refreshToken: tokenData.refreshToken || null,
-          expiresAt,
-          scope: tokenData.scope || null,
-        },
-        confirmedAt: null, // Will be set when user confirms
-        createdAt: new Date().toISOString(),
-      };
+        serviceName: service,
+        providerSubject: providerUserId,
+      });
 
-      console.log(`[OAuth] Stored pending login credentials in session for user: ${appUser.id}`);
-
-      // Redirect to confirmation page instead of auto-logging in
-      const confirmToken = crypto.randomBytes(16).toString('hex');
-
-      // Store BOTH in session AND in database as backup
-      // Session: for normal case where cookies are sent
-      req.session.oauth_confirm = { token: confirmToken, createdAt: Date.now() };
-      // Note: req.session.oauth_login_pending is already set above with appUser data
-      // No need to redefine it here
-
-      // Database: backup in case session cookie is lost
-      const dbConfirmId = 'oauth_confirm_' + crypto.randomBytes(16).toString('hex');
-      const confirmExpiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 min expiry
-      try {
-        db.prepare(`
-          INSERT INTO oauth_pending_logins (id, service_name, user_id, token, user_data, created_at, expires_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          dbConfirmId,
-          service,
-          appUser.id,
-          confirmToken,
-          JSON.stringify({
-            userId: appUser.id,
-            email: appUser.email || email,
-            username: appUser.username,
-            displayName: appUser.displayName || name,
-            avatarUrl: appUser.avatarUrl || avatarUrl || null,
-            hasTwoFa: appUser.twoFactorEnabled,
-          }),
-          new Date().toISOString(),
-          confirmExpiresAt
-        );
-        console.log(`[OAuth Callback] ✅ Stored pending login in DB: ${dbConfirmId}`);
-      } catch (dbErr) {
-        console.error('[OAuth Callback] Warning: Failed to store pending login in DB:', dbErr.message);
-        // Continue anyway - session storage is the primary mechanism
-      }
-
-      // CRITICAL: Session must be persisted BEFORE redirect
-      // NOTE: `return` is required here to stop the outer function from continuing
-      // and sending a second response, which would crash the server.
-      return req.session.save((err) => {
-        if (err) {
-          console.error('[OAuth Callback] ❌ Session save failed before confirm_login redirect:', err);
+      if (!firstSeen) {
+        // Returning user who has already gestured this provider subject
+        // for this local account: silently complete the login with NO
+        // gesture screen. We still re-persist the token (refresh rotations,
+        // scope drift, etc.) and keep `provider_subject` in sync.
+        try {
+          storeOAuthToken(
+            service,
+            appUser.id,
+            tokenData.accessToken,
+            tokenData.refreshToken || null,
+            expiresAt,
+            tokenData.scope || null,
+            providerUserId
+          );
+        } catch (storeErr) {
+          console.error('[OAuth Callback] Failed to refresh OAuth token on returning login:', storeErr.message);
+          // Non-fatal: the access token the user just authenticated with
+          // should still work; the next call through getCachedOAuthToken
+          // will surface the real error if this matters.
         }
 
-        const nextUrl = encodeURIComponent(safeReturnTo);
-        const confirmUrl = `/dashboard/?oauth_service=${service}&oauth_status=confirm_login&next=${nextUrl}&token=${confirmToken}`;
-        res.redirect(confirmUrl);
+        req.session.user = {
+          id: appUser.id,
+          email: appUser.email || email,
+          username: appUser.username,
+          displayName: appUser.displayName || name,
+          avatarUrl: appUser.avatarUrl || avatarUrl || null,
+          twoFactorEnabled: appUser.twoFactorEnabled,
+        };
+        const returningWorkspaces = getWorkspaces(appUser.id);
+        if (returningWorkspaces?.length > 0) {
+          req.session.currentWorkspace = returningWorkspaces[0].id;
+        }
+        const returningMaster = getExistingMasterToken(appUser.id);
+        if (returningMaster) {
+          req.session.masterTokenRaw = returningMaster.rawToken;
+          req.session.masterTokenId = returningMaster.tokenId;
+        }
+
+        return req.session.save((err) => {
+          if (err) {
+            console.error('[OAuth Callback] Session save failed on returning-user fast-path:', err);
+          }
+          res.redirect(safeReturnTo);
+        });
+      }
+
+      // First-seen (or subject changed): mint a pending-confirm row and
+      // redirect to the gesture screen. The row carries the token bundle
+      // so the accept endpoint can call storeOAuthToken once the user
+      // clicks "Continue".
+      const { token: confirmToken } = createPendingConfirm({
+        db,
+        serviceName: service,
+        userId: appUser.id,
+        providerSubject: providerUserId,
+        userData: {
+          userId: appUser.id,
+          email: appUser.email || email,
+          username: appUser.username,
+          displayName: appUser.displayName || name,
+          avatarUrl: appUser.avatarUrl || avatarUrl || null,
+          hasTwoFa: appUser.twoFactorEnabled,
+          tokenData: {
+            accessToken: tokenData.accessToken,
+            refreshToken: tokenData.refreshToken || null,
+            expiresAt,
+            scope: tokenData.scope || null,
+          },
+        },
       });
+
+      const nextUrl = encodeURIComponent(safeReturnTo);
+      const confirmUrl = `/dashboard/?oauth_service=${service}&oauth_status=confirm_login&next=${nextUrl}&token=${confirmToken}`;
+      return res.redirect(confirmUrl);
     }
 
     // Store token for authenticated owner (connect flow and non-primary login flow)
@@ -9118,111 +9151,191 @@ app.get("/api/v1/oauth/status", async (req, res) => {
   res.json({ services });
 });
 
-// POST /api/v1/oauth/confirm - Confirm pending OAuth login
-app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
+// M3 / T3.7 — map a PendingConfirmError.code to its HTTP envelope. Kept
+// narrow to the codes the domain module actually emits; anything else
+// is a programming error and falls through to a 500 at the caller.
+function pendingConfirmErrorResponse(err) {
+  switch (err && err.code) {
+    case PendingConfirmError.CODES.NOT_FOUND:
+      return { status: 400, body: { error: 'pending_confirm_not_found' } };
+    case PendingConfirmError.CODES.EXPIRED:
+      return { status: 400, body: { error: 'pending_confirm_expired' } };
+    case PendingConfirmError.CODES.REUSED:
+      return { status: 400, body: { error: 'pending_confirm_reused' } };
+    case PendingConfirmError.CODES.INVALID_OUTCOME:
+      // Internal contract violation — server never passes user-supplied
+      // outcomes. If this ever fires we want a 500 in the logs.
+      return null;
+    default:
+      return null;
+  }
+}
+
+// GET /api/v1/oauth/confirm/preview - Read-only inspection of a pending-login
+// row so the confirm-gesture page can render "Continue as Alice <email>?"
+// without revealing the encrypted OAuth token bundle. Bearer-gated by the
+// token itself; no session touched.
+app.get("/api/v1/oauth/confirm/preview", (req, res) => {
+  const token = typeof req.query?.token === 'string' ? req.query.token : null;
+  if (!token) {
+    return res.status(400).json({ error: 'Missing token query parameter' });
+  }
   try {
-    const { token } = req.body || {};
-
-    logger.debug('[OAuth Confirm] Attempting confirmation', { sessionId: req.sessionID, hasToken: !!token });
-
-    if (!token || typeof token !== 'string') {
-      return res.status(400).json({ error: 'Invalid or missing confirmation token' });
-    }
-
-    // Check if token matches what's in the session
-    const oauthConfirm = req.session?.oauth_confirm;
-    if (!oauthConfirm || oauthConfirm.token !== token) {
-      console.log(`[OAuth Confirm] ❌ FAILED: Token mismatch or missing`);
-      console.log(`  - Expected: ${oauthConfirm ? 'exists' : 'MISSING'}`);
-      console.log(`  - Match: ${oauthConfirm?.token === token ? 'YES' : 'NO'}`);
-      return res.status(403).json({ error: 'Invalid confirmation token' });
-    }
-
-    // Check confirm token expiry (15 minutes)
-    if (Date.now() - oauthConfirm.createdAt > 15 * 60 * 1000) {
-      delete req.session.oauth_confirm;
-      return res.status(403).json({ error: 'Confirmation token expired. Please sign in again.' });
-    }
-
-    // Check if we have pending login credentials (try session first, then database as fallback)
-    let pending = req.session?.oauth_login_pending;
-    
-    if (!pending) {
-      console.log(`[OAuth Confirm] Session data missing, checking database for backup...`);
-      
-      // Fallback: Check if token exists in database as backup
-      // This handles the case where session cookie was lost (e.g., user cleared browser storage)
-      try {
-        const pendingLogin = db.prepare(`
-          SELECT user_data FROM oauth_pending_logins 
-          WHERE token = ? 
-          ORDER BY created_at DESC 
-          LIMIT 1
-        `).get(token);
-        
-        if (pendingLogin) {
-          pending = JSON.parse(pendingLogin.user_data);
-          console.log(`[OAuth Confirm] ✅ Found backup pending login in database`);
-        }
-      } catch (dbErr) {
-        console.error('[OAuth Confirm] Error querying database backup:', dbErr.message);
+    const preview = previewPendingConfirm({ db, token });
+    res.json(preview);
+  } catch (err) {
+    if (err instanceof PendingConfirmError) {
+      const mapped = pendingConfirmErrorResponse(err);
+      if (mapped) {
+        return res.status(mapped.status).json(mapped.body);
       }
     }
-    
-    if (!pending) {
-      console.log(`[OAuth Confirm] ❌ FAILED: No pending login found in session or database`);
-      return res.status(400).json({ error: 'No pending login found. Please try signing up again.' });
-    }
+    console.error('[OAuth Confirm Preview] Unexpected error:', err);
+    res.status(500).json({ error: 'Failed to preview pending login' });
+  }
+});
 
-    // Move pending login to actual session user
-    req.session.user = {
-      id: pending.userId,
-      email: pending.email,
-      username: pending.username,
-      displayName: pending.displayName,
-      avatarUrl: pending.avatarUrl,
-      twoFactorEnabled: pending.hasTwoFa,
-    };
+// POST /api/v1/oauth/confirm - User-gesture accept of a pending OAuth login.
+// Consumes the row (atomic outcome='accepted' write), calls storeOAuthToken
+// with the first-seen markers, stamps `first_confirmed_at` so subsequent
+// logins on the same {service, user, provider_subject} tuple can skip the
+// gesture, and establishes the session. DB row is the single source of
+// truth — NO reliance on `req.session.oauth_confirm` / `oauth_login_pending`
+// (those session keys are retired by T3.7).
+app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'Invalid or missing confirmation token' });
+  }
 
-    console.log(`[OAuth Confirm] Setting session.user to ${pending.userId}`);
-    
-    // Set default workspace for this user
-    const userWorkspaces = getWorkspaces(pending.userId);
-    if (userWorkspaces?.length > 0) {
-      req.session.currentWorkspace = userWorkspaces[0].id;
-    }
+  logger.debug('[OAuth Confirm] Attempting confirmation', {
+    sessionId: req.sessionID,
+    hasToken: true,
+  });
 
-    // Clear pending login and token
-    delete req.session.oauth_login_pending;
-    delete req.session.oauth_confirm;
-
-    // Proactively load the canonical master token into session so the frontend
-    // gets it immediately without a separate bootstrap round-trip
-    const existingMasterForConfirm = getExistingMasterToken(pending.userId);
-    if (existingMasterForConfirm) {
-      req.session.masterTokenRaw = existingMasterForConfirm.rawToken;
-      req.session.masterTokenId = existingMasterForConfirm.tokenId;
-    }
-
-    // Save session and respond
-    req.session.save((err) => {
-      if (err) {
-        logger.error('[OAuth Confirm] Session save failed', { error: err.message });
-        return res.status(200).json({ ok: true, user: req.session.user, warning: 'Session sync delayed' });
+  let row;
+  try {
+    row = consumePendingConfirm({ db, token, outcome: 'accepted' });
+  } catch (err) {
+    if (err instanceof PendingConfirmError) {
+      const mapped = pendingConfirmErrorResponse(err);
+      if (mapped) {
+        logger.info('[OAuth Confirm] domain rejected confirm', { code: err.code });
+        return res.status(mapped.status).json(mapped.body);
       }
+    }
+    console.error('[OAuth Confirm] Unexpected error consuming row:', err);
+    return res.status(500).json({ error: 'Failed to confirm login' });
+  }
 
-      logger.info('[OAuth Confirm] Login confirmed', { userId: pending.userId });
-      res.json({
+  let payload = {};
+  try {
+    payload = JSON.parse(row.user_data || '{}');
+  } catch (_e) {
+    payload = {};
+  }
+
+  const userId = row.user_id;
+  const serviceName = row.service_name;
+  const providerSubject = payload.providerSubject || null;
+  const tokenData = payload.tokenData || {};
+
+  // Persist the OAuth token bundle and stamp the first-seen marker. Both
+  // operations are idempotent — if the user somehow retries the accept
+  // (cookie fight, back button, etc.) the second call would have landed
+  // on a REUSED row above and never gotten here.
+  try {
+    storeOAuthToken(
+      serviceName,
+      userId,
+      tokenData.accessToken,
+      tokenData.refreshToken || null,
+      tokenData.expiresAt || null,
+      tokenData.scope || null,
+      providerSubject
+    );
+  } catch (storeErr) {
+    console.error('[OAuth Confirm] storeOAuthToken failed:', storeErr.message);
+    return res.status(500).json({ error: 'Failed to persist OAuth token' });
+  }
+
+  if (providerSubject) {
+    try {
+      recordFirstConfirmation({
+        db,
+        userId,
+        serviceName,
+        providerSubject,
+      });
+    } catch (markerErr) {
+      console.error('[OAuth Confirm] recordFirstConfirmation failed:', markerErr.message);
+      // Non-fatal: worst case the user sees the gesture screen one more
+      // time on the next login. Do not surface to the caller.
+    }
+  }
+
+  req.session.user = {
+    id: userId,
+    email: payload.email,
+    username: payload.username,
+    displayName: payload.displayName,
+    avatarUrl: payload.avatarUrl,
+    twoFactorEnabled: payload.hasTwoFa,
+  };
+
+  const userWorkspaces = getWorkspaces(userId);
+  if (userWorkspaces?.length > 0) {
+    req.session.currentWorkspace = userWorkspaces[0].id;
+  }
+
+  const existingMasterForConfirm = getExistingMasterToken(userId);
+  if (existingMasterForConfirm) {
+    req.session.masterTokenRaw = existingMasterForConfirm.rawToken;
+    req.session.masterTokenId = existingMasterForConfirm.tokenId;
+  }
+
+  req.session.save((err) => {
+    if (err) {
+      logger.error('[OAuth Confirm] Session save failed', { error: err.message });
+      return res.status(200).json({
         ok: true,
         user: req.session.user,
-        bootstrap: existingMasterForConfirm
-          ? { tokenId: existingMasterForConfirm.tokenId, hasToken: true }
-          : null,
+        warning: 'Session sync delayed',
       });
+    }
+    logger.info('[OAuth Confirm] Login confirmed', { userId });
+    res.json({
+      ok: true,
+      user: req.session.user,
+      bootstrap: existingMasterForConfirm
+        ? { tokenId: existingMasterForConfirm.tokenId, hasToken: true }
+        : null,
     });
+  });
+});
+
+// POST /api/v1/oauth/confirm/reject - User-gesture REJECT of a pending
+// OAuth login. Burns the row with outcome='rejected' so it can't be
+// replayed, and returns 200. Critically, does NOT set `req.session.user`
+// — rejecting must never accidentally log anyone in.
+app.post("/api/v1/oauth/confirm/reject", authRateLimit, (req, res) => {
+  const { token } = req.body || {};
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ error: 'Invalid or missing confirmation token' });
+  }
+  try {
+    consumePendingConfirm({ db, token, outcome: 'rejected' });
+    logger.info('[OAuth Confirm Reject] Login rejected by user gesture');
+    return res.json({ ok: true });
   } catch (err) {
-    console.error('[OAuth Confirm] Error:', err);
-    res.status(500).json({ error: 'Failed to confirm login' });
+    if (err instanceof PendingConfirmError) {
+      const mapped = pendingConfirmErrorResponse(err);
+      if (mapped) {
+        return res.status(mapped.status).json(mapped.body);
+      }
+    }
+    console.error('[OAuth Confirm Reject] Unexpected error:', err);
+    return res.status(500).json({ error: 'Failed to reject login' });
   }
 });
 
