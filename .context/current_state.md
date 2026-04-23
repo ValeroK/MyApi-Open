@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **27 / 27 suites, 363 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **28 / 28 suites, 371 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,50 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — **M3 Step 1 / T3.0: execution playbook +
+- **2026-04-21 (latest)** — **M3 Step 2 / T3.1: additive schema
+  migration on `oauth_state_tokens`.** The table gains five columns and
+  two indexes that collectively let the row carry everything a flow
+  needs (so the in-memory `oauthStateMeta` map can be deleted in Steps
+  4 + 5 and the deterministic `buildPkcePairFromState` can be replaced
+  by a real random verifier stored alongside the state). **Red-first
+  discipline honoured:** new `src/tests/oauth-state-schema.test.js`
+  (8 assertions) was filed and run to **6 failures / 2 passes** before
+  the migration landed; after the migration it runs green in the same
+  commit. New columns (rationale captured inline in `src/database.js`
+  and in the test header):
+  - `user_id TEXT NULL` — populated on `link` flows for already-
+    authenticated users; NULL on `login` flows. TEXT to match this
+    repo's `users.id` convention (ADR-0006 §Schema says INTEGER; this
+    deviation is documented in the test file header).
+  - `mode TEXT NOT NULL DEFAULT 'login'` — one of `login` / `link` /
+    `install`. `DEFAULT 'login'` lets the ALTER succeed on non-empty
+    tables without a backfill script; the domain module (Step 3)
+    enforces the enum at write time.
+  - `return_to TEXT NULL` — post-callback redirect target, validated
+    by `isSafeInternalRedirect` at the edge (M2 hardening).
+  - `code_verifier TEXT NOT NULL DEFAULT ''` — random base64url
+    PKCE verifier written at issue time. DEFAULT `''` exists only so
+    the ALTER succeeds on non-empty tables; the domain module never
+    writes the empty string and any row carrying one is inherently
+    invalid (`consumeStateToken` rejects + the prune job ages it out).
+  - `used_at TEXT NULL` — set inside the same transaction that
+    consumes the row; single-source-of-truth for replay detection.
+  New indexes: `idx_oauth_state_tokens_expires` (for the prune scan
+  in Step 8 / T3.9) and `idx_oauth_state_tokens_used` (for replay
+  checks + prune grace window). Migration is **additive and
+  idempotent**: fresh DBs get the full shape from the `CREATE TABLE`;
+  existing deployments pick up the columns via `safeMigration()`
+  ALTERs on next boot — no downtime, no backfill script, no data
+  loss (pre-migration state tokens are ephemeral 10-minute rows
+  anyway). The five schema-gap assertions in `oauth-state-inventory`
+  flipped from `toBe(false)` → `toBe(true)` in the same commit (same
+  snapshot-inversion pattern M2 Step 2 used on `legacy-vault-inventory`).
+  The C3 finding is still open at the handler level (Steps 4 + 5
+  finish the job); this commit makes the handlers *capable* of being
+  rewritten without extending an in-memory map. `npm test` →
+  **28 / 28 suites, 371 pass, 18 skip, exit 0** (+1 suite / +8
+  assertions vs Step 1).
+- **2026-04-21** — **M3 Step 1 / T3.0: execution playbook +
   inventory regression gate.** New `ADR-0014-m3-oauth-state-hardening-plan.md`
   ratifies the 8-commit execution path for M3 (target design is frozen
   at ADR-0006 — DB-backed single-use state rows, random 32-byte PKCE

@@ -271,12 +271,24 @@ function initDatabase() {
       updated_at TEXT NOT NULL
     );
 
+    -- M3 / T3.1 (ADR-0006 + ADR-0014 Step 2): OAuth state row is the
+    -- single source of truth for a flow. code_verifier is a random
+    -- 32-byte PKCE verifier stored at issue time; used_at is set inside
+    -- the transaction that consumes the row so replays are rejected.
+    -- Column names retain the pre-M3 convention (state_token /
+    -- service_name) for continuity; src/domain/oauth/state.js maps them
+    -- to the ADR-0006 field names at its API boundary.
     CREATE TABLE IF NOT EXISTS oauth_state_tokens (
       id TEXT PRIMARY KEY,
       state_token TEXT NOT NULL UNIQUE,
       service_name TEXT NOT NULL,
+      user_id TEXT,
+      mode TEXT NOT NULL DEFAULT 'login',
+      return_to TEXT,
+      code_verifier TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL
+      expires_at TEXT NOT NULL,
+      used_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS oauth_pending_logins (
@@ -364,6 +376,11 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_personas_active ON personas(active);
     CREATE INDEX IF NOT EXISTS idx_oauth_tokens_service ON oauth_tokens(service_name);
     CREATE INDEX IF NOT EXISTS idx_oauth_state_tokens_state ON oauth_state_tokens(state_token);
+    -- M3 / T3.1: expires_at drives the background prune scan (Step 8 /
+    -- T3.9); used_at keeps the replay check and prune grace window
+    -- cheap once the table has churned through many flows.
+    CREATE INDEX IF NOT EXISTS idx_oauth_state_tokens_expires ON oauth_state_tokens(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_oauth_state_tokens_used ON oauth_state_tokens(used_at);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
     CREATE INDEX IF NOT EXISTS idx_context_cache_key ON context_cache(key);
@@ -751,6 +768,50 @@ function initDatabase() {
   safeMigration("ALTER TABLE oauth_tokens ADD COLUMN encryption_version INTEGER DEFAULT 1");
   safeMigration("ALTER TABLE users ADD COLUMN pii_encrypted INTEGER DEFAULT 0");
   safeMigration("ALTER TABLE conversations ADD COLUMN encryption_version INTEGER DEFAULT 1");
+
+  // M3 / T3.1 (ADR-0006 + ADR-0014 §Step 2): expand oauth_state_tokens so
+  // the row carries everything a flow needs — replacing the in-memory
+  // `req.session.oauthStateMeta` map and the deterministic
+  // `buildPkcePairFromState` helper (both deleted in Steps 4 + 5).
+  //
+  // safeMigration is idempotent — re-running these ALTERs on a DB that
+  // already has the columns is a no-op. Deployments upgrading from a
+  // pre-M3 schema pick up the columns on their next boot.
+  //
+  // Column-by-column rationale:
+  //   user_id       TEXT NULL
+  //     - NULL on `login` flows; set on `link` flows for already-
+  //       authenticated users. users.id is TEXT in this repo
+  //       (see CREATE TABLE users), so we store it as TEXT here too.
+  //   mode          TEXT NOT NULL DEFAULT 'login'
+  //     - One of login / link / install (Discord bot-install).
+  //       DEFAULT 'login' lets the ALTER succeed on non-empty tables
+  //       without needing a backfill; domain module enforces the
+  //       enum at write time.
+  //   return_to     TEXT NULL
+  //     - Post-callback redirect target, validated at the edge by
+  //       `src/lib/redirect-safety.js` / `isSafeInternalRedirect`.
+  //   code_verifier TEXT NOT NULL DEFAULT ''
+  //     - Random 32-byte value base64url-encoded (length 43) issued by
+  //       createStateToken(). DEFAULT '' only exists to satisfy the
+  //       NOT NULL constraint during ALTER on a non-empty table;
+  //       any pre-migration row carrying the empty verifier is
+  //       uniquely invalid and will be rejected by consumeStateToken
+  //       (STATE_REUSED is the closest sentinel; the prune job then
+  //       ages it out). The domain module never writes the empty
+  //       string.
+  //   used_at       TEXT NULL
+  //     - Set inside the same transaction that consumes the row so
+  //       the next read-with-matching-state returns STATE_REUSED
+  //       deterministically (no race window).
+  safeMigration("ALTER TABLE oauth_state_tokens ADD COLUMN user_id TEXT");
+  safeMigration("ALTER TABLE oauth_state_tokens ADD COLUMN mode TEXT NOT NULL DEFAULT 'login'");
+  safeMigration("ALTER TABLE oauth_state_tokens ADD COLUMN return_to TEXT");
+  safeMigration("ALTER TABLE oauth_state_tokens ADD COLUMN code_verifier TEXT NOT NULL DEFAULT ''");
+  safeMigration("ALTER TABLE oauth_state_tokens ADD COLUMN used_at TEXT");
+  // The two new indexes live in the CREATE INDEX IF NOT EXISTS block
+  // above; SQLite is idempotent for CREATE INDEX IF NOT EXISTS so no
+  // extra safeMigration call is needed here.
 
   // Encryption key management table
   try {

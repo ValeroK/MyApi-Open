@@ -90,9 +90,11 @@ describe('[M3 / Step 2] oauth_state_tokens schema gap (T3.1)', () => {
     );
   });
 
-  // Each of the following assertions is written in the **today-form** (the
-  // column is missing). Step 2 adds the column and the assertion flips from
-  // `toBe(false)` to `toBe(true)`.
+  // Each of the following assertions was filed in its "today / missing"
+  // form in M3 Step 1 and FLIPPED in Step 2 / T3.1 once the additive
+  // migration landed. If any of these columns ever goes missing again
+  // (someone drops them via a bad migration), this test catches it at
+  // the next `npm test`.
   test.each([
     ['user_id', 'populated for logged-in link flows (ADR-0006 §Schema)'],
     ['mode', '"login" / "link" / "install" (ADR-0006 §Schema)'],
@@ -106,12 +108,10 @@ describe('[M3 / Step 2] oauth_state_tokens schema gap (T3.1)', () => {
       'set on first callback match; replay rejection (ADR-0006 §Schema)',
     ],
   ])(
-    'column %p is MISSING today (flips to present in Step 2 / T3.1)  —  %s',
+    'column %p is PRESENT (flipped from missing in Step 2 / T3.1)  —  %s',
     (colName /* , rationale */) => {
       const cols = columnNames();
-      // TODO(M3 Step 2 / T3.1): flip `toBe(false)` → `toBe(true)` once the
-      // migration runs.
-      expect(cols.includes(colName)).toBe(false);
+      expect(cols.includes(colName)).toBe(true);
     }
   );
 });
