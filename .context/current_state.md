@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-21**
+> - Last updated: **2026-04-23**
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **29 / 29 suites, 394 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **32 / 32 suites, 422 pass / 18 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,156 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — **Docker-first integration scaffolding
+- **2026-04-23 (latest)** — **M3 Steps 4 + 5 / T3.4 + T3.5 + T3.6
+  paired in one atomic commit.** Collapsed per explicit direction to
+  preserve `oauth-signup-flow.test.js`'s end-to-end coverage across
+  the refactor — splitting 4 and 5 would have left that suite
+  temporarily red on an intermediate SHA. This is the commit that
+  actually closes the C3 ("OAuth state not DB-validated") and C6
+  ("Discord state bypass") findings from `plan.md` §6.3 at the
+  handler level; Steps 1–3 had set up the machinery, this one
+  rewires the call-sites.
+    - **`src/index.js` — authorize handler
+      (`/api/v1/oauth/authorize/:service`).** Replaces the
+      session-backed `req.session.oauthStateMeta[state] = {...}`
+      write with a single `createOAuthStateRow({ db, serviceName,
+      mode, returnTo, userId })` call (domain `createStateToken`
+      aliased to `createOAuthStateRow` to avoid a name collision
+      with the retired legacy same-named export from
+      `./database`, which no route handler calls after this
+      commit and is scheduled for deletion in a follow-up
+      cleanup). `stateRow.codeChallenge` is what now goes into
+      the provider auth URL's `code_challenge` parameter —
+      **not** `buildPkcePairFromState(state).codeChallenge`. The
+      two "CRITICAL" comments reminding future maintainers to
+      keep the session write alive are gone.
+    - **`src/index.js` — callback handler
+      (`/api/v1/oauth/callback/:service`).** State parameter is
+      now **mandatory** for every provider (a missing `state`
+      returns 400 with `code: 'STATE_MISSING'`); the session
+      lookup is replaced by a single
+      `consumeStateToken({ db, state, serviceName: service })`
+      call whose error taxonomy surfaces as discriminated 400s
+      (`STATE_NOT_FOUND` / `STATE_EXPIRED` / `STATE_REUSED` /
+      `STATE_SERVICE_MISMATCH`); a `stateMeta` object is
+      reconstructed from the consumed row (`mode`, `ownerId`,
+      `returnTo`, `codeVerifier`) so all downstream code paths
+      in the handler keep working without further edits. The
+      PKCE verifier sent to the provider's token-exchange
+      endpoint is now `stateMeta.codeVerifier` — the
+      **persisted random 43-char base64url value** from T3.3,
+      not `buildPkcePairFromState(state).codeVerifier`.
+    - **`src/index.js` — Discord carve-out gone.** The
+      `isDiscordBotInstall` variable, its `!state && guild_id`
+      detection, and the 302-bypass branch it guarded are
+      deleted. Discord now follows the same mandatory-state
+      path as every other provider. Verified Discord's
+      authorize flow does persist `state` across the upstream
+      redirect, so no adapter change was required.
+    - **`src/index.js` — dead primitives deleted.** The
+      `base64UrlNoPad` and `buildPkcePairFromState` function
+      declarations are gone. These were the H1 finding from
+      `plan.md` §6.3 (deterministic HMAC PKCE verifier). H1
+      is now closed at the handler level — the primitive-level
+      closure landed in Step 3.
+    - **Inventory regression gates flipped.** Four assertions
+      in `src/tests/oauth-state-inventory.test.js` that were
+      `TODO(M3 Step 5)` / `(M3 Step 4+5)` now assert the
+      **absence** of: `buildPkcePairFromState(`, the
+      `` createHmac('sha256', secret).update(`pkce:${state}`) ``
+      literal, any `req.session.oauthStateMeta` reference,
+      and any `isDiscordBotInstall` token. Same snapshot-
+      inversion pattern used in M2 Step 2 on
+      `legacy-vault-inventory`.
+    - **New test files (both written red-first).**
+      `src/tests/oauth-authorize-handler.test.js` — supertest
+      integration suite locking the authorize refactor:
+      state-row persistence with correct `service_name` /
+      `mode` / `return_to` / `user_id` / `code_verifier`
+      shape, PKCE challenge passed to the provider URL as
+      base64url(sha256(verifier)), fresh-row uniqueness
+      across sequential authorize calls, absence of any
+      session-side state write (readback of the cookie jar
+      shows no `oauthStateMeta` key).
+      `src/tests/oauth-callback-handler.test.js` — 8-scenario
+      supertest suite mocking `src/services/google-adapter.js`
+      (no real OAuth provider contact): happy path 302 +
+      `used_at` populated, replay → `STATE_REUSED` (row stays
+      consumed), unknown → `STATE_NOT_FOUND`, service mismatch
+      (google-issued / twitter-called) → `STATE_SERVICE_MISMATCH`,
+      expired (`expires_at` forced into the past) →
+      `STATE_EXPIRED` with `used_at` kept NULL, Discord without
+      `state` + with `guild_id` → 400 (was 302 pre-Step-5),
+      cookies-dropped / fresh-agent round-trip → 302 proving
+      session independence, twitter row stores a 43-char random
+      base64url verifier used by the callback unchanged.
+    - **Test-first discipline observable.** The inventory gate
+      flip + both new supertest suites were filed before
+      `src/index.js` was touched. The interim RED state was
+      captured implicitly by the existing
+      `oauth-signup-flow.test.js` failing on a callback-only
+      refactor — which is precisely why the user elected to
+      pair Steps 4 + 5: running that implicit RED for the
+      duration of just this one commit is acceptable; running
+      it across two commits would have left an intermediate
+      SHA broken, violating ADR-0012's every-commit-exits-0
+      gate.
+    - **Fix applied during the refactor.** The callback
+      handler test initially failed to load because its
+      `beforeAll` set `GOOGLE_*` env vars before
+      `require('../index')` but forgot `TWITTER_*`, so the
+      `issue('twitter')` helper hit the 400 "service not
+      enabled" branch and `new URL(res.headers.location)`
+      threw on `undefined`. Fix was additive: set
+      `TWITTER_CLIENT_ID` / `TWITTER_CLIENT_SECRET` /
+      `TWITTER_REDIRECT_URI` in `beforeAll` before the
+      `require`, and switch the `issue()` helper to hit
+      `?json=1` so state is returned in the body — robust
+      against redirect-shape changes and surfaces real errors
+      instead of URL-constructor stack traces.
+    - **Full Docker regression GREEN.**
+      `docker-compose -f docker-compose.test.yml run --rm myapi-test
+      npx jest --forceExit` → **32 suites / 422 pass / 18
+      skipped / 0 fail** in **~7.3 s** (+2 suites / +20 tests
+      vs the ADR-0015 baseline of 30 / 402 / 18). The
+      `--forceExit` is required because `src/index.js`
+      schedules `setInterval` timers at module load (log
+      rotation + heartbeat); without it, Jest hangs waiting
+      for the event loop to drain. Documented as a
+      testing-infrastructure note in the suite headers.
+    - **Intentionally deferred to M3 wrap-up (`m3-wrap`):**
+      - *One live end-to-end Google OAuth smoke* through
+        `docker-compose -f docker-compose.smoke.yml`. The new
+        handler tests already drive the exact state-consumption
+        path against a real DB; batching a single real-provider
+        round-trip at M3 wrap-up (after Steps 6–8 land) is
+        cheaper than one per Step and exercises the
+        fully-integrated surface.
+      - *Retirement of the legacy `createStateToken` +
+        `validateStateToken` exports* from `src/database.js`
+        (now unreferenced). Not time-sensitive; the deprecated
+        exports don't affect correctness, and deleting them
+        touches the schema layer we just stabilised.
+  **What this unlocks for M3:**
+    - Step 6 / T3.7 (`LogIn.jsx` confirm-screen gesture +
+      `/api/v1/oauth/confirm/preview` endpoint) can now assume
+      the callback's `stateMeta.mode === 'confirm'` path is
+      backed by a DB row the confirm-preview endpoint can
+      re-read without session dependency — same row-as-SSOT
+      invariant already locked by the new callback tests.
+    - Step 7 / T3.8 (replay / missing / expired / valid
+      regression matrix) is now a "combine what we have" job:
+      the callback test suite already covers replay, missing,
+      expired, and valid individually; T3.8 just needs to
+      reshape the assertions into the §5.4 security-regression
+      framework.
+    - Step 8 / T3.9 (background prune job) becomes the only
+      remaining engineering work in M3 — the
+      `pruneExpiredStateTokens(...)` primitive already ships
+      from T3.2; all that's left is scheduling and an ops log
+      line.
+
+- **2026-04-21** — **Docker-first integration scaffolding
   (pre-Step 4).** Addresses the "I want to actually boot the app and
   run integration tests — and I want all of it in Docker, not on my
   PC" request surfaced during M3 review. Artefacts:
@@ -636,27 +785,28 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 in progress.** Execution playbook (ADR-0014) filed
-  and Step 1 / T3.0 (inventory regression gate) shipped green. The
-  12 inventory assertions lock today's broken behaviour so Steps 2–8
-  (T3.1–T3.9) each have to flip a labelled gate — no silent skipping.
-  Target design is ADR-0006 (unchanged): DB-backed single-use state
-  rows with a random 32-byte PKCE verifier stored in-row, no Discord
-  bypass. Next up: Step 2 / T3.1 (expand `oauth_state_tokens` schema
-  via an additive, backfill-safe migration).
+- **Now:** **M3 Steps 1–5 landed** (T3.0–T3.6 / 7 of 10). C3
+  ("OAuth state not DB-validated") and C6 ("Discord state bypass")
+  from `plan.md` §6.3 are **closed at the handler level** as of the
+  2026-04-23 paired commit. H1 (deterministic PKCE verifier) is now
+  closed at both the primitive level (Step 3) *and* the handler
+  level (Step 5) — `buildPkcePairFromState` is off disk entirely.
+- **Next:** **M3 Step 6 / T3.7** — `LogIn.jsx` confirm-screen gesture
+  + `/api/v1/oauth/confirm/preview` endpoint. The callback now
+  redirects to `?oauth_status=confirm_login` in every login-mode
+  flow; Step 6 closes the loop by refusing to complete the login
+  without a user-triggered button press showing the OAuth subject
+  email (mitigates the session-fixation variant of C3). Followed
+  by Step 7 / T3.8 (replay / missing / expired / valid regression
+  matrix — mostly a reshape of existing callback tests into the
+  §5.4 security-regression frame) and Step 8 / T3.9 (background
+  prune scheduler around the already-shipping
+  `pruneExpiredStateTokens`), then the M3 wrap-up commit +
+  one live smoke on real Google.
 - **Recently closed:** **M2 complete.** All eight in-scope tasks
   (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
-  per ADR-0013 (T2.2, T2.3, T2.6). Weak-crypto path and silent
-  default-key fallbacks removed, HKDF domain-separation primitive
-  live, boot-time secret gate fail-closed in every environment,
-  public-facing docs (CLAUDE / SECURITY / README) match the code.
-  Plus the M2 wrap-up commit folded in a frontend open-redirect
-  hardening for `LogIn.jsx` (`isSafeInternalRedirect` + 61
-  behavioural + 10 textual-gate assertions).
-- **Next:** M3 Steps 2–8 per ADR-0014 (schema migration → domain
-  module → authorize rewire → callback rewire + Discord bypass
-  deletion → user-gesture confirm screen → replay/expired/missing
-  regression matrix → background prune).
+  per ADR-0013 (T2.2, T2.3, T2.6). Plus the M2 wrap-up commit
+  folded in a frontend open-redirect hardening for `LogIn.jsx`.
 - **Blocked / waiting on a human:**
   - **Google OAuth credential rotation** at the provider — tracked for M3
     hardening. Not urgent since `REMOVED_…` fallbacks are gone and

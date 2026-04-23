@@ -130,37 +130,36 @@ describe('[M3 / Steps 4–5] legacy OAuth-state primitives still live in src/ind
     expect(source.length).toBeGreaterThan(10_000);
   });
 
-  // Step 4 / T3.4 removes the call-site of `buildPkcePairFromState`; Step 5
-  // / T3.5 deletes the function declaration itself. Both flip this
-  // assertion to "not present".
-  test('buildPkcePairFromState is defined today (flips to absent in Step 5 / T3.5)', () => {
-    expect(source).toMatch(/\bfunction\s+buildPkcePairFromState\s*\(/);
-    // TODO(M3 Step 5 / T3.5): flip to `expect(source).not.toMatch(...)` once
-    // the function is deleted.
+  // Flipped in Step 5 / T3.5: the deterministic PKCE verifier helper
+  // is deleted outright. Its only remaining call-site (the callback)
+  // is rewired to read `code_verifier` from the consumed state row,
+  // so neither the declaration nor any invocation may remain.
+  test('buildPkcePairFromState is NOT defined (flipped in Step 5 / T3.5)', () => {
+    expect(source).not.toMatch(/\bbuildPkcePairFromState\b/);
   });
 
-  test('deterministic HMAC verifier literal is present today (flips in Step 5 / T3.5)', () => {
-    // This is the line that makes the current PKCE non-compliant: the
-    // verifier is derived from `HMAC(SESSION_SECRET, "pkce:" + state)`
-    // rather than being a per-request random value. Closes H1 when removed.
-    expect(source).toMatch(/createHmac\s*\(\s*['"]sha256['"]\s*,\s*secret\s*\)\s*\.update\s*\(\s*`pkce:\$\{state\}`\s*\)/);
-    // TODO(M3 Step 5 / T3.5): flip to `.not.toMatch(...)`.
+  // Flipped in Step 5 / T3.5: removing the helper also removes its
+  // deterministic `HMAC(SESSION_SECRET, "pkce:" + state)` body — the
+  // exact line that made PKCE non-compliant (plan.md §6.3 H1).
+  test('deterministic HMAC verifier literal is NOT present (flipped in Step 5 / T3.5)', () => {
+    expect(source).not.toMatch(/createHmac\s*\(\s*['"]sha256['"]\s*,\s*secret\s*\)\s*\.update\s*\(\s*`pkce:\$\{state\}`\s*\)/);
   });
 
-  // Step 4 / T3.4 replaces the in-memory session map with the DB row.
-  // Every `req.session.oauthStateMeta` read and write is deleted.
-  test('req.session.oauthStateMeta is referenced today (flips to absent in Steps 4–5)', () => {
+  // Flipped in Step 5 / T3.5 (together with Step 4 / T3.4): every
+  // authorize-write, callback-read, callback-delete, and logout-wipe
+  // of `req.session.oauthStateMeta` is gone. The DB row in
+  // `oauth_state_tokens` is the sole source of truth.
+  test('req.session.oauthStateMeta is NO LONGER referenced anywhere (flipped in Step 5 / T3.5)', () => {
     const hits = source.match(/\boauthStateMeta\b/g) || [];
-    expect(hits.length).toBeGreaterThanOrEqual(4);
-    // TODO(M3 Step 5 / T3.5 — after authorize AND callback are rewritten):
-    // flip to `expect(hits.length).toBe(0)`.
+    expect(hits.length).toBe(0);
   });
 
-  // Step 5 / T3.6 removes the Discord bot-install carve-out entirely;
-  // Discord uses the same state-row path as every other provider.
-  test('Discord state bypass is present today (flips to absent in Step 5 / T3.6)', () => {
-    expect(source).toMatch(/\bisDiscordBotInstall\b/);
-    // TODO(M3 Step 5 / T3.6): flip to `.not.toMatch(...)`.
+  // Flipped in Step 5 / T3.6: the Discord bot-install carve-out
+  // (`service === 'discord' && !state && req.query.guild_id`) is
+  // deleted. Discord now goes through the same state-row path as
+  // every other provider. Closes C6.
+  test('Discord state bypass is NOT present (flipped in Step 5 / T3.6)', () => {
+    expect(source).not.toMatch(/\bisDiscordBotInstall\b/);
   });
 });
 

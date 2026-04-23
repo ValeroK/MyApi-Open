@@ -38,8 +38,18 @@ const crypto = require('crypto');
 // Constants + errors
 // ---------------------------------------------------------------------------
 
-/** Modes accepted by {@link createStateToken}. */
-const VALID_MODES = Object.freeze(['login', 'link', 'install']);
+/**
+ * Modes accepted by {@link createStateToken}.
+ *
+ * ADR-0006 §Schema canonicalises three values (`login`, `link`, `install`).
+ * This codebase exposes `connect` in the public `?mode=` query string for
+ * the "link an OAuth provider to an already-authenticated account" flow,
+ * which is the same concept ADR-0006 calls `link`. Rather than rewrite
+ * every caller, we accept the legacy label here and store it verbatim —
+ * the callback handler (M3 Step 5) treats `connect` and `link` as
+ * equivalent for its redirect-string decisions.
+ */
+const VALID_MODES = Object.freeze(['login', 'link', 'install', 'connect']);
 
 /** Symbolic error codes surfaced to HTTP handlers. */
 const CODES = Object.freeze({

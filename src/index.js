@@ -108,6 +108,17 @@ setInterval(() => {
 
 const { pendingRequests: afpPendingRequests, afpConnections } = require('./lib/afp-state');
 
+// M3 / T3.4 + T3.5 — OAuth state lifecycle goes exclusively through
+// the domain module. `createStateToken` is aliased to
+// `createOAuthStateRow` to avoid colliding with the legacy same-named
+// export from `./database` (which is no longer called from any route
+// after T3.5 landed and can be retired in a later cleanup).
+const {
+  createStateToken: createOAuthStateRow,
+  consumeStateToken,
+  StateTokenError,
+} = require('./domain/oauth/state');
+
 const {
   db,
   initDatabase,
@@ -167,8 +178,11 @@ const {
   revokeOAuthToken,
   updateOAuthStatus,
   getOAuthStatus,
-  createStateToken,
-  validateStateToken,
+  // `createStateToken` / `validateStateToken` exported by `./database`
+  // are the pre-M3 variants (random state, no PKCE verifier column).
+  // After M3 Step 5 they are not imported here — every caller in this
+  // file goes through `src/domain/oauth/state.js`. Left in `database.js`
+  // for now; a later cleanup milestone may retire them.
   cleanupExpiredStateTokens,
   cleanupOldRateLimits,
   createConversation,
@@ -7621,7 +7635,6 @@ app.post("/api/v1/auth/logout", (req, res) => {
   delete req.session.oauth_login_pending;
   delete req.session.oauth_confirm;
   delete req.session.oauth_signup;
-  delete req.session.oauthStateMeta;
   delete req.session.isFirstLogin;
   delete req.session.currentWorkspace;
 
@@ -8340,22 +8353,11 @@ app.delete('/api/v1/personas/:id/skills/:skillId', authenticate, (req, res) => {
 
 // --- OAuth Endpoints ---
 
-function base64UrlNoPad(buf) {
-  return Buffer.from(buf)
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/g, '');
-}
-
-function buildPkcePairFromState(state) {
-  const secret = String(process.env.SESSION_SECRET || 'myapi-session-secret-change-me');
-  // Deterministic per-state verifier (lets callback recompute without extra storage)
-  const verifierRaw = crypto.createHmac('sha256', secret).update(`pkce:${state}`).digest();
-  const codeVerifier = base64UrlNoPad(Buffer.concat([verifierRaw, verifierRaw])).slice(0, 64);
-  const codeChallenge = base64UrlNoPad(crypto.createHash('sha256').update(codeVerifier).digest());
-  return { codeVerifier, codeChallenge };
-}
+// M3 / T3.5 — The pre-M3 deterministic PKCE helper (and its private
+// base64url companion) were removed here. The PKCE verifier is now
+// persisted alongside each state row by the domain module
+// (`src/domain/oauth/state.js`) and read back via
+// `consumeStateToken(...)`. See ADR-0006, ADR-0014, plan.md §6.3 H1.
 
 // Compatibility alias: some clients use /oauth/authorize/twitter/x
 app.get('/api/v1/oauth/authorize/twitter/x', (req, res) => {
@@ -8403,33 +8405,18 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
     });
   }
 
-  // Create state token for CSRF protection
-  let state;
-  try {
-    state = createStateToken(service, 30);
-  } catch (stateError) {
-    console.error(`[OAuth] Failed to create state token for ${service}:`, stateError);
-    return res.status(500).json({
-      error: 'Failed to initialize OAuth flow',
-      message: 'Could not create secure state token'
-    });
-  }
-
-  // Store OAuth flow metadata in session
-  req.session.oauthStateMeta = req.session.oauthStateMeta || {};
-
-  // Try to authenticate the user to get ownerId
-  // This checks session, Bearer token, and masterToken cookie
+  // Resolve the caller identity BEFORE issuing the state row, so the
+  // row can persist `user_id` alongside `state_token`. This is the
+  // same priority order the callback uses; keeping them in lockstep
+  // guarantees "who started the flow" is decidable without a session.
   await tryAuthenticate(req);
 
-  // Get ownerId from multiple sources (SAME priority as callback will use)
   let ownerId = null;
   if (req.session?.user?.id) {
     ownerId = String(req.session.user.id);
   } else if (req.tokenMeta?.ownerId) {
     ownerId = String(req.tokenMeta.ownerId);
   } else if (req.cookies?.myapi_master_token) {
-    // FALLBACK: Extract ownerId from masterToken cookie
     try {
       const masterTokenRaw = req.cookies.myapi_master_token;
       const accessTokens = getAccessTokens() || [];
@@ -8444,14 +8431,39 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
     }
   }
 
+  // Issue the state row through the domain module. This writes one
+  // row to `oauth_state_tokens` carrying a random state_token, a
+  // freshly-generated PKCE verifier, the canonical mode, the intended
+  // post-callback redirect, and the resolved ownerId. The callback
+  // (M3 Step 5) will consume this same row via `consumeStateToken`.
+  //
+  // Historical note: prior to M3 Step 4, state was stashed on
+  // `req.session` under the authorize-side meta map, and the PKCE
+  // verifier was derived deterministically from the state via
+  // HMAC(SESSION_SECRET, ...). Both are gone here — the DB row is
+  // the sole source of truth and the verifier is 256 bits of fresh
+  // entropy per flow (plan.md §6.3 H1). See ADR-0014 §Step 4.
+  const returnTo = String(req.query.returnTo || '/dashboard/');
+  let stateRow;
+  try {
+    stateRow = createOAuthStateRow({
+      db,
+      serviceName: service,
+      mode,
+      returnTo,
+      userId: ownerId,
+      ttlSec: 600, // 10 minutes — ADR-0006 §Schema
+    });
+  } catch (stateError) {
+    console.error(`[OAuth] Failed to create state token for ${service}:`, stateError);
+    return res.status(500).json({
+      error: 'Failed to initialize OAuth flow',
+      message: 'Could not create secure state token'
+    });
+  }
+  const state = stateRow.state;
+
   logger.debug('[OAuth Authorize] flow initiated', { service, hasOwnerId: !!ownerId });
-  req.session.oauthStateMeta[state] = {
-    mode,
-    forcePrompt,
-    ownerId,
-    returnTo: String(req.query.returnTo || '/dashboard/'),
-    createdAt: Date.now(),
-  };
 
   // Get authorization URL from adapter
   let authUrl;
@@ -8481,8 +8493,7 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
     }
 
     if (['twitter', 'airtable', 'canva'].includes(service)) {
-      const { codeChallenge } = buildPkcePairFromState(state);
-      runtimeAuthParams.code_challenge = codeChallenge;
+      runtimeAuthParams.code_challenge = stateRow.codeChallenge;
       runtimeAuthParams.code_challenge_method = 'S256';
     }
     authUrl = adapter.getAuthorizationUrl(state, runtimeAuthParams);
@@ -8506,8 +8517,11 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
   // Determine response format (JSON or redirect)
   const wantsJson = String(req.query.json || '').toLowerCase() === '1';
 
+  // `req.session.save` is still invoked so that any anonymous→authenticated
+  // session upgrade performed by `tryAuthenticate(req)` above is flushed
+  // before the client is redirected — NOT because we rely on session
+  // state for OAuth flow bookkeeping any more.
   if (wantsJson) {
-    // CRITICAL: Save session before responding, otherwise oauthStateMeta won't persist
     return req.session.save((err) => {
       if (err) {
         console.error(`[OAuth Authorize] ❌ Session save failed for JSON response:`, err);
@@ -8522,8 +8536,6 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
     });
   }
 
-  // Default behavior: redirect to OAuth provider
-  // CRITICAL: Save session before redirect, otherwise oauthStateMeta won't persist
   return req.session.save((err) => {
     if (err) {
       console.error(`[OAuth Authorize] ❌ Session save failed:`, err);
@@ -8560,27 +8572,46 @@ app.get([
     console.error(`[OAuth] Service not in list: ${service}`);
     return res.status(400).json({ error: "Invalid OAuth service" });
   }
-  // Discord bot installation callbacks arrive without a state parameter because
-  // the user navigated to the Discord auth URL directly (not via /oauth/authorize/:service).
-  // In this case, fall back to the authenticated session user to identify the owner.
-  const isDiscordBotInstall = service === 'discord' && !state && req.query.guild_id;
 
-  if (!state && !isDiscordBotInstall) {
-    return res.status(400).json({ error: "Invalid or expired state token" });
+  // Every provider (Discord included) MUST supply a state parameter
+  // now — the pre-M3 bot-install carve-out is gone (closes C6).
+  if (!state) {
+    return res.status(400).json({
+      error: 'Missing state token',
+      code: 'STATE_MISSING',
+      service,
+    });
   }
 
-  // Check state in session (where it was stored during authorize step)
-  const stateMeta = isDiscordBotInstall
-    ? { mode: 'connect', ownerId: req.session?.user?.id || null, returnTo: '/dashboard/services' }
-    : req.session?.oauthStateMeta?.[state];
-
-  if (!stateMeta && !isDiscordBotInstall) {
-    return res.status(400).json({ error: "Invalid or expired state token - not found in session" });
+  // Atomically look up the state row, validate it, and mark it used
+  // in one go. Replay / expired / unknown / service-mismatch all
+  // throw a StateTokenError with a discriminated code (ADR-0006).
+  let stateRow;
+  try {
+    stateRow = consumeStateToken({ db, state, serviceName: service });
+  } catch (err) {
+    if (err instanceof StateTokenError) {
+      return res.status(400).json({
+        error: 'Invalid or expired state token',
+        code: err.code,
+        service,
+      });
+    }
+    console.error('[OAuth] Unexpected error consuming state token:', err);
+    return res.status(500).json({ error: 'Internal error validating state token' });
   }
 
-  if (!stateMeta) {
-    return res.status(400).json({ error: "Invalid or expired state token - not found in session" });
-  }
+  // Expose a shape compatible with the pre-M3 `stateMeta` object so
+  // downstream branches (which still read `stateMeta.mode`,
+  // `stateMeta.returnTo`, `stateMeta.ownerId`) keep working without
+  // a blanket rename. `codeVerifier` carries the PKCE verifier from
+  // the DB row for providers that need it in the token exchange.
+  const stateMeta = {
+    mode: stateRow.mode,
+    ownerId: stateRow.user_id || null,
+    returnTo: stateRow.return_to,
+    codeVerifier: stateRow.code_verifier,
+  };
 
   // Provider denied/failed before issuing a code (common for scope/config problems)
   if (providerError) {
@@ -8614,9 +8645,6 @@ app.get([
     });
   }
 
-  // Clean up state token from session after validation
-  if (req.session?.oauthStateMeta) delete req.session.oauthStateMeta[state];
-
   // Prevent open redirect — validate using URL parsing, not string prefix checks
   let safeReturnTo = '/dashboard/';
   if (stateMeta.returnTo) {
@@ -8634,8 +8662,7 @@ app.get([
     const adapter = oauthAdapters[service];
     const runtimeTokenParams = {};
     if (['twitter', 'airtable', 'canva'].includes(service)) {
-      const { codeVerifier } = buildPkcePairFromState(state);
-      runtimeTokenParams.code_verifier = codeVerifier;
+      runtimeTokenParams.code_verifier = stateMeta.codeVerifier;
     }
     console.log(`[OAuth] Exchanging code for token with ${service} adapter...`);
     const tokenData = await adapter.exchangeCodeForToken(code, runtimeTokenParams);
