@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **21 / 21 suites, 247 pass / 18 skip, exit 0** (~14 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **22 / 22 suites, 269 pass / 18 skip, exit 0** (~17 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,45 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — M2 Step 3 (T2.10): nested Docker manifest
+- **2026-04-21 (latest)** — M2 Step 4 (T2.1): `deriveSubkey(root, purpose)`
+  HKDF-SHA-256 primitive added to `src/lib/encryption.js`:
+  - **API shape.** `deriveSubkey(root, purpose, opts?)` → `Buffer`.
+    `root` is a Buffer or clean even-length hex string (≥ 32 bytes);
+    `purpose` is a whitelisted label from the frozen export
+    `SUBKEY_PURPOSES = ['oauth:v1', 'session:v1', 'audit:v1']`. Defaults
+    to a 32-byte output (drops into AES-256-GCM); accepts 16..64. Opt
+    `salt` is a third separation axis; RFC 5869 §2.2 default is a
+    `HashLen` zero buffer when salt is absent.
+  - **Implementation.** Node's native `crypto.hkdfSync('sha256', …)`.
+    The `info` parameter carries the purpose label, which is what
+    buys domain separation — two purposes produce statistically
+    independent outputs from the same root.
+  - **Fail-closed validation.** Unregistered purpose, empty purpose,
+    non-string purpose, short/non-Buffer-non-string/malformed-hex root,
+    length outside `[16, 64]` all throw the single generic message
+    `"Subkey derivation failed"`; root + purpose never appear in
+    errors. Test + KAT escape hatches (`allowUnregisteredPurpose`,
+    `allowShortRoot`) exist only so RFC 5869 vectors can run without
+    weakening the production contract.
+  - **Test.** New `src/tests/encryption-deriveSubkey.test.js`, 22
+    assertions across 5 describe blocks, written **red-first** (all
+    failing with `TypeError: deriveSubkey is not a function`) and
+    landed green in the same commit as the implementation. Covers:
+    module surface + frozen purpose list, RFC 5869 Test Case 1 KAT
+    (exact byte match on 42-byte OKM), determinism, three-way domain
+    separation (oauth/session/audit), root-hex ↔ root-Buffer
+    equivalence, obvious-distance sanity (output ≠ root[0..32],
+    output ≠ sha256(root)), full input-validation matrix, and an
+    end-to-end AES-256-GCM round-trip (oauth-encrypted ciphertext
+    fails to decrypt under the session subkey — the whole point).
+  - Full `npm test --silent` → **22 / 22 suites, 269 pass, 18 skip,
+    exit 0** (was 21/21/247 at end of Step 3; +1 suite and +22 tests).
+  - No behavior change for any existing `src/lib/encryption.js`
+    consumer; the new function + constant are purely additive. Wiring
+    consumers (OAuth token encryption, session cookie signing, audit
+    MAC) is M3+ scope per ADR-0013 §Follow-ups.
+  - Commit: `fce3074`.
+- **2026-04-21** — M2 Step 3 (T2.10): nested Docker manifest
   scrubbed of `crypto-js`:
   - **Constraint discovered:** the repo's `Dockerfile` does
     `COPY src/package*.json ./src/` + `cd src && npm ci --only=production`
@@ -220,11 +258,8 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 - **Now:** M2 — consolidate crypto, **re-scoped to pure deletion** per
   **ADR-0013**. Steps 1 (inventory + regression test), 2 (deletions +
-  `init-db` rewrite), and 3 (nested manifest scrub) are done. Remaining
-  M2 work:
-  - **T2.1** — add `deriveSubkey(root, purpose)` (HKDF-SHA-256) to
-    `src/lib/encryption.js`. Purposes: `oauth:v1`, `session:v1`, `audit:v1`
-    (vault purpose dropped — no vault class).
+  `init-db` rewrite), 3 (nested manifest scrub), and 4 (HKDF
+  `deriveSubkey` primitive) are done. Remaining M2 work:
   - **T2.4** — delete the `default-vault-key-change-me` fallback in
     `src/database.js`; add regression tests.
   - **T2.5** — run `validateRequiredSecrets()` in every `NODE_ENV` (not just
