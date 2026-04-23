@@ -135,31 +135,49 @@ refactor touches the code around them.
 
 ---
 
-## M2 — Consolidate crypto + one-shot vault migration
+## M2 — Consolidate crypto (re-scoped to deletion per ADR-0013)
 
-**Goal.** A single crypto module (AES-256-GCM + HKDF); legacy `crypto-js` path
-deleted; `identity_vault` + `connectors` rows re-encrypted under GCM in one shot.
+**Goal.** A single crypto module (AES-256-GCM + HKDF); weak `crypto-js` path
+and its orphan callers deleted; vault-key fallbacks and secret-validation
+gate hardened.
+
+**Re-scoping note (2026-04-21).** M2 was originally written assuming
+`src/vault/vault.js` was live and populated `identity_vault` / `connectors`
+rows would need a one-shot migration (ADR-0005, Option C). Inventory work
+in T2.0 proved the legacy path is orphan in the running server, so the
+migration + rewrite tasks (T2.2, T2.3, T2.6) are **cancelled** and replaced
+by a straight deletion (T2.9) and a nested-package cleanup (T2.10). See
+**ADR-0013**. The non-vault hygiene half of M2 (T2.4, T2.5) is unaffected.
 
 **Exit criteria.**
 - `src/utils/encryption.js` is deleted.
-- `src/vault/vault.js` is gone (its public surface moved into `src/domain/vault/`).
-- All sensitive columns in `identity_vault` and `connectors` decrypt via GCM.
+- `src/vault/vault.js` is deleted (not rewritten — it had no live callers).
+- The three orphan legacy modules (`src/routes/api.js`,
+  `src/routes/management.js`, `src/brain/brain.js`) and the manual
+  `src/scripts/init-db.js` seed script are deleted.
+- `crypto-js` does not appear in any `package.json` in the repo and is not
+  resolvable from the repo root.
 - `default-vault-key-change-me` fallback exists in zero places.
 - Secret validation runs regardless of `NODE_ENV`.
+- `src/tests/legacy-vault-inventory.test.js` stays green, with its snapshot
+  assertions flipped to "legacy files do not exist".
 
 **Depends on.** M0, M1.
-**Estimated duration.** ~2 days.
+**Estimated duration.** ~1 day (down from ~2 after re-scoping).
 
 | # | Task | Effort | Depends on | Notes |
 |---|------|--------|------------|-------|
-| T2.1 | `[ ]` Add `deriveSubkey(root, purpose)` using HKDF-SHA-256 to `src/lib/encryption.js` (or a new `src/infra/crypto/`) and write unit tests | S | T0.7 | Purposes: `oauth:v1`, `vault:v1`, `session:v1`, `audit:v1`. |
-| T2.2 | `[ ]` Write migration script `src/scripts/migrate-vault-to-gcm.js` that streams every `identity_vault` and `connectors` row, decrypts with legacy `crypto-js`, re-encrypts with GCM, writes back in a transaction, verifies row count + spot-check HMAC | M | T2.1 | One-shot; idempotent (detects already-migrated rows by version prefix). |
-| T2.3 | `[ ]` Add `npm run db:migrate:vault-to-gcm` and document in `docs/runbooks/key-rotation.md` (stub) | XS | T2.2 |  |
-| T2.4 | `[ ]` Remove `default-vault-key-change-me` fallbacks in `src/database.js` lines 1424, 2798, 2838 (and any siblings found by grep) | S | T2.2 | Fail fast if `VAULT_KEY` unset; don't paper over with legacy fallback. |
-| T2.5 | `[ ]` Move `validateRequiredSecrets()` to run on every `NODE_ENV`, not just production; expand banned-defaults list | S | T2.4 |  |
-| T2.6 | `[ ]` Rewrite `src/vault/vault.js` as `src/domain/vault/index.js` using the GCM module; keep the same public API so existing callers (e.g. `src/brain/brain.js`) keep working | M | T2.2 |  |
-| T2.7 | `[ ]` Delete `src/utils/encryption.js` and any remaining `require('crypto-js')` imports; remove `crypto-js` from `package.json` | S | T2.6 |  |
-| T2.8 | `[ ]` Update `CLAUDE.md`, `SECURITY.md`, and `README.md` to state "AES-256-GCM everywhere" truthfully | XS | T2.7 |  |
+| T2.0 | `[x]` Write inventory + weak-crypto regression test (`src/tests/legacy-vault-inventory.test.js`): BFS from `src/index.js` must not reach `crypto-js`, weak `Encryption`, or the `Vault` class; root `package.json` must not list `crypto-js`; `crypto-js` must not resolve from repo root; only sanctioned callers may import the legacy modules today. | S | T0.7 | **Done 2026-04-21.** 10 new assertions, all passing; full suite **20/20, 237/237 non-skipped, exit 0**. Locks today's orphan state and becomes the permanent regression gate after deletion. |
+| T2.1 | `[ ]` Add `deriveSubkey(root, purpose)` using HKDF-SHA-256 to `src/lib/encryption.js` (or a new `src/infra/crypto/`) and write unit tests | S | T0.7 | Purposes: `oauth:v1`, `session:v1`, `audit:v1` (vault purpose dropped — no vault class after M2). |
+| T2.2 | `[~]` ~~Write migration script `src/scripts/migrate-vault-to-gcm.js`~~ | — | — | **Cancelled per ADR-0013.** No live ciphertext exists in the legacy format in the running-server path. If a self-hoster reports populated legacy rows, reopen and resurrect the script from `git log`. |
+| T2.3 | `[~]` ~~Add `npm run db:migrate:vault-to-gcm` + runbook stub~~ | — | — | **Cancelled per ADR-0013.** |
+| T2.4 | `[ ]` Remove `default-vault-key-change-me` fallbacks in `src/database.js` lines 1424, 2798, 2838 (and any siblings found by grep) | S | — | Fail fast if `VAULT_KEY` unset; don't paper over with legacy fallback. Add a regression test in `security-regression.test.js`. |
+| T2.5 | `[ ]` Move `validateRequiredSecrets()` to run on every `NODE_ENV`, not just production; expand banned-defaults list | S | T2.4 | Add a regression test that asserts banned defaults fail the boot check in `NODE_ENV=test` + `development`. |
+| T2.6 | `[~]` ~~Rewrite `src/vault/vault.js` as `src/domain/vault/index.js`~~ | — | — | **Cancelled per ADR-0013.** The `Vault` class had no live callers; we delete it outright in T2.9 instead of rewriting it. |
+| T2.7 | `[ ]` Delete `src/utils/encryption.js`; flip the existence-snapshot assertion in `legacy-vault-inventory.test.js` from `toBe(true)` to `toBe(false)` | XS | T2.0 | Must still leave the full suite green. |
+| T2.8 | `[ ]` Update `CLAUDE.md`, `SECURITY.md`, and `README.md` to state "AES-256-GCM everywhere" truthfully, and call out that the legacy vault path was deleted in M2 | XS | T2.7, T2.9 |  |
+| T2.9 | `[ ]` Delete the orphan modules in one commit: `src/vault/vault.js`, `src/routes/api.js`, `src/routes/management.js`, `src/brain/brain.js`, `src/scripts/init-db.js`. Remove the stray `const createManagementRoutes = require('./routes/management');` line from `src/index.js` (line ~2562) and the `"db:init"` script from root `package.json`. Flip the matching existence-snapshot assertion in `legacy-vault-inventory.test.js`. | S | T2.0 | New task per ADR-0013. Whole graph already confirmed unreachable from `src/index.js`. |
+| T2.10 | `[ ]` Remove `crypto-js` from `src/package.json` `dependencies` (and drop `src/package-lock.json` if it exists) **or** delete the nested `src/package.json` + lockfile entirely if no other script references them. The inventory test's "resolvable" gate already enforces this from the root; this task closes the nested install surface. | S | T2.9 | Decide between trimming vs. deleting based on whether any remaining `src/` script (e.g. `qa`, `qa:security`) is still used in practice. |
 
 ---
 

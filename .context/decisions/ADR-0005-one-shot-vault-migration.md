@@ -1,11 +1,14 @@
 # ADR-0005 — One-shot offline vault migration to AES-256-GCM
 
-- **Status.** Accepted
+- **Status.** Accepted; migration workflow **superseded by ADR-0013**
+  (2026-04-21). The original context below is retained as history; the
+  migration script and dual-PR workflow are no longer required because the
+  legacy vault path is orphan in the running server.
 - **Date.** 2026-04-21
 - **Decision makers.** repo owner + AI pairing
 - **Related.** `plan.md` §0.1 (OQ-5, OQ-7), §6.3 (critical item "weak
-  `crypto-js` AES path"), `TASKS.md` M2
-- **Tags.** security, crypto, migration
+  `crypto-js` AES path"), `TASKS.md` M2, **ADR-0013** (supersedes workflow)
+- **Tags.** security, crypto, migration, historical
 
 ## Context
 

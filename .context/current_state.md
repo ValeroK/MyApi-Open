@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **19 / 19 suites, 227 pass / 18 skip, exit 0** (~13 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **20 / 20 suites, 237 pass / 18 skip, exit 0** (~13 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,20 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — Pre-M2 baseline lock:
+- **2026-04-21 (latest)** — M2 Step 1: legacy vault inventory + re-scoping:
+  - Added `src/tests/legacy-vault-inventory.test.js` (10 assertions): BFS
+    over static `require()` edges from `src/index.js`, asserts no reachable
+    module loads `crypto-js` / the weak `Encryption` module / the `Vault`
+    class, asserts root `package.json` has no `crypto-js`, and asserts
+    `crypto-js` is not resolvable from the repo root. Also confirms the
+    only callers of the legacy modules are the modules themselves and the
+    (unmounted) `src/scripts/init-db.js`.
+  - Full `npm test --silent` → **20 / 20 suites, 237 pass, 18 skip, exit 0**.
+  - New **ADR-0013** records the finding: the legacy vault path is orphan
+    and the planned one-shot migration (ADR-0005, Option C) is moot. M2
+    pivots to pure deletion. ADR-0005 status updated to
+    "Accepted; migration workflow superseded by ADR-0013".
+- **2026-04-21** — Pre-M2 baseline lock:
   - `npm install` run at the repo root (716 packages); `node_modules/`
     populated. Fixed Windows-only `EBUSY` teardown flake in
     `oauth-security-hardening.test.js` (new `safeUnlink` helper that retries
@@ -142,11 +155,23 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** M2 — consolidate crypto + one-shot vault migration. First task is
-  inspecting the actual state of `src/utils/encryption.js` and the nested
-  `src/package.json` / `src/package-lock.json` that still pull `crypto-js`
-  (root `package.json` does not). Finding: the vulnerable path lives in
-  a nested install, not the top-level dependency tree.
+- **Now:** M2 — consolidate crypto, **re-scoped to pure deletion** per
+  **ADR-0013**. Characterization work revealed the legacy vault subsystem
+  (`src/vault/vault.js`, `src/utils/encryption.js`, `src/routes/api.js`,
+  `src/routes/management.js`, `src/brain/brain.js`, `src/scripts/init-db.js`)
+  is **orphan in the running server**: `src/index.js` never requires any of
+  them and uses an in-memory stub `vault` object; sensitive crypto already
+  runs via `src/lib/encryption.js` (AES-256-GCM). The inventory test
+  `src/tests/legacy-vault-inventory.test.js` locks this finding (10 new
+  assertions; +10 tests). Next up: delete the orphan modules + remove
+  nested `crypto-js` dep in one commit, flip snapshot assertions to
+  "does-not-exist", and then close out the non-vault half of M2
+  (`default-vault-key-change-me` fallback + `NODE_ENV=production`-only
+  secret validation). T2.2/T2.3/T2.6 are **cancelled** (no population to
+  migrate). Risk acknowledged: any self-hoster who ever manually ran
+  `cd src && npm install && node scripts/init-db.js` and populated the
+  tables would need the deleted code recovered from `git log` — captured
+  in ADR-0013.
 - **Next:** M3 OAuth state + PKCE hardening (DB-backed `state_tokens`,
   random PKCE verifier, remove Discord bypass).
 - **Blocked / waiting on a human:**
