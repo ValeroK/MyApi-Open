@@ -69,12 +69,51 @@ You connect your services (Google, GitHub, Slack, and 30+ more) through MyApi on
   <img width="512" src="https://github.com/user-attachments/assets/5bf8bf21-dfca-4afe-b724-9cee6eab8470" alt="MyApi Stack">
 </p>
 
-**Request flow:**
+Three-tier: **React dashboard → Express API gateway → SQLite (or PostgreSQL)**. The gateway (`src/index.js`) is the single entry point for every agent request, every OAuth callback, and every dashboard action.
+
+### What MyApi stores
+
+| Table | Contents | Encryption |
+|---|---|---|
+| `oauth_tokens` | Access + refresh tokens from the 45+ OAuth providers you connect (Google, GitHub, Slack, …) | AES-256-GCM (`ENCRYPTION_KEY`) |
+| `vault_tokens` | Manually-added API keys (OpenAI, Stripe, AWS, any custom API) | AES-256-GCM (`VAULT_KEY`) |
+| `access_tokens` | Scoped Bearer tokens issued **to agents** (`myapi_…`) | bcrypt-hashed |
+| `audit_log` | Every API request — who, what, when, from-IP, user-agent | — |
+
+### How a request flows
 
 ```
 Request → auth middleware → scope validator → RBAC → device approval gate
         → route handler → brain/vault → database → response
 ```
+
+For an agent request to an external service (the hot path), this expands to:
+
+```
+ Agent (OpenClaw, ChatGPT, Claude Code, …)
+   │
+   │ POST /api/v1/services/github/proxy
+   │ Authorization: Bearer myapi_xxx...
+   │ Body: { path: "/user/repos", method: "GET" }
+   ▼
+ MyApi gateway
+   1. authenticate()              — bcrypt-compare against access_tokens
+   2. scope-validator              — require services:read / services:write
+   3. deviceApproval gate          — block until user approves in dashboard
+   4. rate-limit check             — per-user, per-service
+   5. getOAuthToken() + refresh    — decrypt, auto-refresh if expired
+   6. SSRF guard                   — reject private/internal targets
+   7. upstream HTTPS call          — attach real credential server-side
+   8. audit_log INSERT             — full trail with user-agent (e.g. "OpenClaw")
+   │
+   ▼
+ GitHub / Google / OpenAI / …     ← the real key only exists between step 5 and 7
+   │
+   ▼
+ Upstream JSON response → returned to the agent (key never revealed)
+```
+
+**The security property:** the agent only ever holds `myapi_…`. If it's compromised, you revoke one token in the dashboard — no upstream rotation needed.
 
 ---
 
@@ -236,6 +275,84 @@ openssl rand -hex 32
 ### OAuth Service Credentials
 
 OAuth providers follow the pattern `{SERVICE}_CLIENT_ID` / `{SERVICE}_CLIENT_SECRET` with a corresponding `ENABLE_OAUTH_{SERVICE}=true` feature flag. See [`docs/SERVICES_MANUAL.md`](docs/SERVICES_MANUAL.md) for the full configuration reference covering all 45+ supported services.
+
+---
+
+## Agent Integration
+
+MyApi is designed to be called by AI agents (OpenClaw, Hermes, Claude Code, ChatGPT GPTs, custom MCP clients, …). Agents never handle raw credentials — they hold a scoped `myapi_…` Bearer token and proxy everything through MyApi.
+
+### 1. Enroll the agent (RFC 8628 Device Flow)
+
+```bash
+# Agent requests a device code (needs a bootstrap token from the dashboard)
+curl -X POST https://your-myapi.com/api/v1/agentic/device/authorize \
+  -H "Authorization: Bearer <bootstrap-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"OpenClaw on laptop","scope":"services:read"}'
+
+# Returns: { user_code: "ABCD-EFGH", verification_uri_complete: "...", device_code: "..." }
+# User opens the verification_uri and approves in the dashboard.
+# Agent then polls /api/v1/agentic/device/token and receives its final myapi_... Bearer.
+```
+
+Optional hardening: the agent can register an **Ed25519 public key** (`POST /api/v1/agentic/asc/register`) and sign each request with `X-Agent-PublicKey` / `X-Agent-Signature` / `X-Agent-Timestamp` (±60 s replay window). This makes a stolen Bearer alone useless.
+
+### 2. Call any connected service through the proxy
+
+```bash
+curl -X POST https://your-myapi.com/api/v1/services/github/proxy \
+  -H "Authorization: Bearer myapi_xxx..." \
+  -H "X-Workspace-ID: <workspace-id>" \
+  -H "Content-Type: application/json" \
+  -d '{"path":"/user/repos","method":"GET"}'
+```
+
+MyApi decrypts your GitHub token, calls `https://api.github.com/user/repos` with it, logs the action, and returns GitHub's JSON. The agent never sees the token.
+
+The same pattern works for every OAuth service (`/services/google/proxy`, `/services/slack/proxy`, `/services/notion/proxy`, …) and for vault-token APIs registered with `auth_type='api_key'` (OpenAI, Stripe, custom APIs).
+
+### 3. Self-describing keys
+
+Each vault token can carry machine-readable usage instructions so agents can learn new APIs without human configuration:
+
+- `GET /api/v1/vault/tokens/:id/instructions` — fetch human/AI-authored usage notes + examples.
+- `POST /api/v1/vault/tokens/:id/learn-from-api` — agents can write back auto-discovered usage patterns after a successful call.
+
+### MCP (Model Context Protocol) on-ramp
+
+`src/mcp-server.js` exposes MyApi as an MCP server for Claude Desktop, Cursor, and other MCP clients:
+
+```json
+// claude_desktop_config.json
+{
+  "mcpServers": {
+    "myapi": {
+      "command": "node",
+      "args": ["/path/to/MyApi-Open/src/mcp-server.js"],
+      "env": { "MYAPI_USER_ID": "<your-user-id>" }
+    }
+  }
+}
+```
+
+> The MCP transport is functional; several per-service handlers currently return placeholder data and are being wired to the REST proxy — track progress in the roadmap.
+
+### Key API endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/services/:name/proxy` | Proxy any HTTP request to a connected OAuth or API-key service |
+| `POST /api/v1/ask` | Natural-language intent → service resolution → proxy execution |
+| `GET  /api/v1/services/:id/methods` | Discover callable methods for a connected service |
+| `POST /api/v1/vault/tokens` | Store a new encrypted API key (master only) |
+| `GET  /api/v1/vault/tokens` | List vault tokens (metadata only; secret never returned) |
+| `GET  /api/v1/vault/tokens/:id/reveal` | Decrypt a vault secret (master only — escape hatch) |
+| `POST /api/v1/agentic/device/authorize` | Begin RFC 8628 Device Flow for an agent |
+| `POST /api/v1/agentic/asc/register` | Register an Ed25519 public key for signed-request auth |
+| `GET  /api/v1/audit/log` | Immutable audit trail |
+
+The full OpenAPI surface is served at `/api/v1/openapi.json`.
 
 ---
 
