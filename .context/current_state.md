@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **21 / 21 suites, 245 pass / 18 skip, exit 0** (~14 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **21 / 21 suites, 247 pass / 18 skip, exit 0** (~14 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,37 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — M2 Step 2: orphan subsystem deleted, `init-db`
+- **2026-04-21 (latest)** — M2 Step 3 (T2.10): nested Docker manifest
+  scrubbed of `crypto-js`:
+  - **Constraint discovered:** the repo's `Dockerfile` does
+    `COPY src/package*.json ./src/` + `cd src && npm ci --only=production`
+    and then runs `node index.js` from `/app/src` — so
+    `src/package.json` is the production dep manifest for every
+    containerized deploy, not a dead relic. Deleting it outright would
+    break Docker. Kept in place; trimmed only.
+  - **`src/package.json`** — removed `crypto-js ^4.2.0` from
+    `dependencies`. Other declared deps kept as-is (version drift vs.
+    root is a separate cleanup, not M2 scope).
+  - **`src/package-lock.json`** — stripped the three `crypto-js`
+    entries by hand (`packages[''].dependencies['crypto-js']`,
+    `packages['node_modules/crypto-js']`, top-level
+    `dependencies['crypto-js']`). `crypto-js` has zero transitive deps
+    in this lockfile, so leaf-removal leaves every other package byte-
+    identical — avoids the unwanted churn an `npm install
+    --package-lock-only` would trigger.
+  - **`src/tests/legacy-vault-inventory.test.js`** — gained two new
+    dependency-gate assertions: nested `src/package.json` must not
+    declare `crypto-js`, and nested `src/package-lock.json` must have
+    zero `crypto-js` references across all three lockfile shapes
+    (v2 `packages[''].dependencies`, v2 `packages` tree, legacy v1
+    `dependencies`). Both assertions noop if the nested manifest is
+    later deleted, so a future "retire nested package.json entirely"
+    cleanup won't fail this gate.
+  - Full `npm test --silent` → **21 / 21 suites, 247 pass, 18 skip,
+    exit 0** (was 21/21/245/18 at end of Step 2; +2 from the new gate
+    assertions).
+  - Commit: `1025d81`.
+- **2026-04-21** — M2 Step 2: orphan subsystem deleted, `init-db`
   rewritten onto the live token API:
   - **Deleted** in one commit (ADR-0013 / T2.7 + T2.9): `src/utils/encryption.js`,
     `src/vault/vault.js`, `src/routes/api.js`, `src/routes/management.js`,
@@ -189,12 +219,9 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 ## 6. Active focus
 
 - **Now:** M2 — consolidate crypto, **re-scoped to pure deletion** per
-  **ADR-0013**. Step 1 (inventory + regression test) and Step 2 (deletions +
-  `init-db` rewrite) are done. Remaining M2 work:
-  - **T2.10** — remove `crypto-js` from the nested `src/package.json`
-    `dependencies` (or retire the nested manifest entirely if unused).
-    Already enforced from the root by the inventory test's "not resolvable
-    from repo root" gate, so this is pure cleanup.
+  **ADR-0013**. Steps 1 (inventory + regression test), 2 (deletions +
+  `init-db` rewrite), and 3 (nested manifest scrub) are done. Remaining
+  M2 work:
   - **T2.1** — add `deriveSubkey(root, purpose)` (HKDF-SHA-256) to
     `src/lib/encryption.js`. Purposes: `oauth:v1`, `session:v1`, `audit:v1`
     (vault purpose dropped — no vault class).
