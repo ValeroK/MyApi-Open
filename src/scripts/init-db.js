@@ -34,6 +34,7 @@ const {
   initDatabase,
   createAccessToken,
   getExistingMasterToken,
+  ensureOwnerUserRow,
 } = require('../database');
 
 const DEFAULT_LABEL = 'Initial Master Token (seed)';
@@ -50,6 +51,10 @@ function seedMasterToken({ force = false, label = DEFAULT_LABEL } = {}) {
   if (!force) {
     const existing = getExistingMasterToken(ownerId);
     if (existing && existing.tokenId) {
+      // Self-heal: even for the no-op path, make sure the users row
+      // exists. Pre-fix databases might have an access_tokens row from
+      // the old seed with NO matching users row.
+      ensureOwnerUserRow(ownerId);
       return {
         created: false,
         reason: 'existing_master_token',
@@ -57,6 +62,8 @@ function seedMasterToken({ force = false, label = DEFAULT_LABEL } = {}) {
       };
     }
   }
+
+  ensureOwnerUserRow(ownerId);
 
   const rawToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
   const hash = bcrypt.hashSync(rawToken, 10);

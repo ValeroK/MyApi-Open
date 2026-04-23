@@ -178,8 +178,32 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
   middleware tries to insert an approval row referencing a FK
   that doesn't exist. Reproduces on the host too. Documented in
   the runbook's "Known gotchas" table. Scheduled for a separate
-  fix once M3 is complete.
-  **Commit:** (see git log once pushed).
+  fix once M3 is complete. **→ FIXED 2026-04-23, see below.**
+  **Commit:** `8d9a7d4`.
+
+- **2026-04-23** — **Device-approval FK bug fixed (ADR-0015 Option A).**
+  Root cause: `bootstrap()` in `src/index.js` seeded `access_tokens`
+  with `owner_id = 'owner'` but never created a matching `users`
+  row; the first `/api/v1/me` request tripped
+  `device_approvals_pending.user_id -> users(id)` and the
+  fail-closed middleware returned `403 DEVICE_APPROVAL_FAILED`.
+  Fix: exported `ensureOwnerUserRow(ownerId)` from
+  `src/database.js` (idempotent `INSERT OR IGNORE`, non-bcrypt
+  sentinel password); called it from `bootstrap()`, from
+  `src/scripts/init-db.js` (both create + self-heal branches), and
+  from the master-regenerate handler. Added test-first coverage:
+  5 new FK-integrity assertions to `src/tests/init-db-seed.test.js`
+  and a new 3-assertion integration suite
+  `src/tests/device-approval-fk-integrity.test.js` that boots the
+  real app and asserts `/api/v1/me` no longer returns
+  `DEVICE_APPROVAL_FAILED`. **Live-smoke verified on a wiped
+  `./data/`: `/api/v1/me` now returns the intended
+  `403 DEVICE_APPROVAL_REQUIRED` with a persisted pending-approval
+  row.** Option B — elevating `access_tokens.owner_id` to a real
+  FK on `users(id)` — scheduled for M4 T4.9 so the inconsistency
+  becomes representationally impossible. Docker regression
+  **30 suites / 402 pass (+8 new) / 18 skipped / 0 fail**.
+  ADR: `.context/decisions/ADR-0015-master-token-user-fk.md`.
 
 - **2026-04-21** — **M3 Step 3 / T3.2 + T3.3: pure
   `src/domain/oauth/state.js` module.** The single entry point for

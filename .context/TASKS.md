@@ -65,7 +65,7 @@ See `.cursor/rules/test-first.mdc` for the full workflow.
 | M1 | Delete dangerous endpoints / hardcoded secrets | 7 | 7 | 🟢 Code landed — T1.6 closed (scan clean, findings were test tokens per owner); T1.7 ledger pending (rolled into M14) |
 | M2 | Consolidate crypto (re-scoped to deletion per ADR-0013) | 8 | 8 | ✅ Done 2026-04-21 — T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10; T2.2/T2.3/T2.6 cancelled per ADR-0013 |
 | M3 | OAuth state + PKCE + callback hardening | 10 | 4 | 🟡 In progress — Steps 1–3 / T3.0 + T3.1 + T3.2 + T3.3 done 2026-04-21; Steps 4–8 / T3.4–T3.9 pending |
-| M4 | Session + rate-limit dual-driver store | 8 | 0 | Not started |
+| M4 | Session + rate-limit dual-driver store | 9 | 0 | Not started (T4.9 data-integrity carry-over from ADR-0015) |
 | M5 | SSRF surface unification via SafeHTTPClient | 7 | 0 | Not started |
 | M6 | Monolith extraction (split `src/index.js`) | 10 | 0 | Not started |
 | M7 | TypeScript migration for domain + infra | 7 | 0 | Not started |
@@ -236,6 +236,7 @@ DB-backed state, random PKCE verifier stored server-side, no Discord carve-out.
 | T4.6 | `[ ]` Replace `express-rate-limit` configuration to use the new store; delete bespoke in-memory `Map`s + `rateLimitCleanupInterval` | M | T4.5 |  |
 | T4.7 | `[ ]` Add testcontainers-based integration test that runs a subset of auth + rate-limit tests against a real Redis | M | T4.3, T4.6 |  |
 | T4.8 | `[ ]` Tighten `app.set('trust proxy', ...)` to a CIDR list via env (`TRUSTED_PROXIES`); default to loopback only | S | T4.6 | Closes H5. |
+| T4.9 | `[ ]` **Option B from ADR-0015** — elevate `access_tokens.owner_id` to `FOREIGN KEY REFERENCES users(id) ON DELETE CASCADE` via an additive `access_tokens_v2` migration; back-populate missing `users` rows via `ensureOwnerUserRow` before the swap; audit every `createAccessToken` call site (~15) to confirm the `ownerId` is a real `users.id`; remove the now-redundant `ensureOwnerUserRow` call from `bootstrap()` + master-regen handler (keep the helper for the init-db CLI); add a migration test and a textual lint that forbids new `createAccessToken` callers that predate `ensureOwnerUserRow` / a users insert. | M | T0.7, ADR-0015 A | Closes the FK inconsistency representationally so the Option A guards become unnecessary. |
 
 ---
 

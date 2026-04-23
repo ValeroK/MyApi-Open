@@ -1599,6 +1599,65 @@ function decryptRawToken(encryptedJson) {
   return null;
 }
 
+/**
+ * Ensure a `users` row exists for `ownerId` so FK-dependent downstream
+ * tables (e.g. `device_approvals_pending.user_id -> users(id)`) don't trip
+ * when code creates a master access token for a synthetic owner string
+ * like "owner" (the default bootstrap owner_id).
+ *
+ * This is the Option A fix for the smoke-harness bug where a fresh server
+ * boot seeded an access_tokens row with `owner_id = 'owner'` but never a
+ * matching `users` row, so the first authenticated request crashed inside
+ * deviceApprovalMiddleware's createPendingApproval call with
+ * `SQLITE_CONSTRAINT_FOREIGNKEY: FOREIGN KEY constraint failed` and the
+ * fail-closed handler returned 403 DEVICE_APPROVAL_FAILED.
+ *
+ * Idempotent via INSERT OR IGNORE on both the PK and UNIQUE(username). The
+ * sentinel password_hash deliberately does not start with a `$2` bcrypt
+ * prefix, so no bcrypt.compare against it can ever return true -- this
+ * seed row is a DB-only identity, not a login account.
+ *
+ * Option B -- elevating `access_tokens.owner_id` to a real FK on
+ * `users(id)` so this inconsistency cannot arise at any call site -- is
+ * tracked as task T4.9 under M4. See ADR-0015.
+ */
+const NOLOGIN_PASSWORD_HASH = '!seed-owner-nologin!';
+function ensureOwnerUserRow(ownerId, options = {}) {
+  if (!ownerId || typeof ownerId !== 'string') return false;
+  const now = new Date().toISOString();
+  const displayName = options.displayName || 'Master Token Owner';
+  try {
+    const info = db.prepare(`
+      INSERT OR IGNORE INTO users
+        (id, username, display_name, email, avatar_url, timezone, password_hash, created_at, status, plan)
+      VALUES
+        (?,  ?,        ?,            ?,     ?,          ?,        ?,             ?,          ?,      ?)
+    `).run(
+      ownerId,
+      ownerId,
+      displayName,
+      null,
+      null,
+      null,
+      NOLOGIN_PASSWORD_HASH,
+      now,
+      'active',
+      'free',
+    );
+    return info && info.changes > 0;
+  } catch (err) {
+    // Swallow: if the INSERT can't run (schema mismatch, DB closed, etc.)
+    // we'd rather degrade gracefully than take down the server boot. The
+    // FK will still fire at createPendingApproval time with the original
+    // symptom if this helper ever silently fails, which is visible.
+    console.error('[ensureOwnerUserRow] failed to upsert users row', {
+      ownerId,
+      err: err && err.message,
+    });
+    return false;
+  }
+}
+
 function createAccessToken(hash, ownerId, scope, label, expiresAt = null, allowedPersonas = null, workspaceId = null, rawToken = null, tokenType = 'guest') {
   const id = 'tok_' + crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
@@ -6935,6 +6994,7 @@ module.exports = {
   createAuditLog,
   getAuditLogs,
   createUser,
+  ensureOwnerUserRow,
   getUsers,
   countTotalUsers,
   addToWaitlist,

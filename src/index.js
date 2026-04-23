@@ -278,6 +278,7 @@ const {
   executeRetentionCleanup,
   upsertOAuthServerClient,
   createApprovedDevice,
+  ensureOwnerUserRow,
 } = require("./database");
 const DeviceFingerprint = require('./utils/deviceFingerprint');
 
@@ -3220,6 +3221,13 @@ function bootstrap() {
   const masterExists = existingTokens.some(t => t.scope === 'full' && !t.revokedAt);
   let rawMaster;
   if (!masterExists) {
+    // ADR-0015 Option A: ensure the users row exists BEFORE we create
+    // the access_tokens row, so the downstream
+    // `device_approvals_pending.user_id -> users(id)` FK chain is
+    // satisfiable. Without this, /api/v1/me's first call on a fresh DB
+    // returned 403 DEVICE_APPROVAL_FAILED with
+    // `FOREIGN KEY constraint failed` -- see the smoke-harness runbook.
+    ensureOwnerUserRow('owner');
     rawMaster = 'myapi_' + crypto.randomBytes(32).toString("hex");
     const hash = bcrypt.hashSync(rawMaster, 10);
     createAccessToken(hash, "owner", "full", "Master Token", null, null, null, rawMaster, 'master');
@@ -5351,6 +5359,11 @@ app.post('/api/v1/tokens/master/regenerate', authRateLimit, authenticate, (req, 
 
   try {
     const ownerId = req.tokenMeta.ownerId || 'admin';
+    // ADR-0015 Option A: belt-and-braces -- the default-fallback `admin`
+    // owner might not have a users row yet, and any future caller who
+    // hits this handler with a fresh ownerId shouldn't trip the downstream
+    // device-approval FK the first time they exercise /api/v1/me.
+    ensureOwnerUserRow(ownerId);
     revokeExistingMasterTokens(ownerId);
     const rawToken = 'myapi_' + crypto.randomBytes(32).toString("hex");
     const hash = bcrypt.hashSync(rawToken, 10);

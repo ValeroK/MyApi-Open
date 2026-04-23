@@ -276,7 +276,7 @@ are visible inside the container.
 | `SECRET VALIDATION FAILED` on boot | `.env.smoke` is missing or was edited to a banned default | `cp .env.smoke.example .env.smoke` again, or pick new non-banned values |
 | DB file survives `docker:smoke:down` and breaks after a schema change | SQLite file in `./data/` is from a prior commit | `rm -rf data/ && npm run docker:smoke:init` to re-seed |
 | Tests pass on host but fail in Docker (or vice versa) | Different `better-sqlite3` native build | `docker:test` rebuilds the native binding inside the image — trust the Docker result |
-| `GET /api/v1/me` returns 403 `DEVICE_APPROVAL_FAILED` with `FOREIGN KEY constraint failed` | Pre-existing bug in device-approval middleware (issue not in scope of M3) | Not a scaffolding issue — it reproduces on the host too. Use endpoints that skip device approval (e.g. `/api/v1/services`) to validate auth works. Tracked for a separate fix. |
+| ~~`GET /api/v1/me` returns 403 `DEVICE_APPROVAL_FAILED`~~ | **Fixed 2026-04-23 — ADR-0015 Option A.** | Now returns the intended `403 DEVICE_APPROVAL_REQUIRED` (or `200` if the device is pre-approved) with a persisted `device_approvals_pending` row. Option B (FK elevation) is M4 T4.9. |
 
 ---
 

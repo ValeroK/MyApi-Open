@@ -178,4 +178,119 @@ describe('init-db seed script', () => {
       }
     });
   });
+
+  // ─── FK integrity regression (Option A fix for the smoke-harness bug) ────
+  //
+  // Root cause: `access_tokens.owner_id` is a free-form TEXT column (no FK),
+  // but `device_approvals_pending.user_id` is FK'd to `users(id)`. Before the
+  // Option A fix, init-db.js created the access_tokens row without ever
+  // inserting a matching users row, so the first request with the seeded
+  // master token exploded inside deviceApprovalMiddleware with
+  // `SQLITE_CONSTRAINT_FOREIGNKEY: FOREIGN KEY constraint failed`, caught by
+  // the fail-closed handler and returned as 403 DEVICE_APPROVAL_FAILED.
+  //
+  // These assertions lock the invariant: after seedMasterToken(), the owner
+  // row exists AND the downstream createPendingApproval call succeeds with
+  // SQLite's FK enforcement turned ON (the server enables it on several
+  // paths; these tests enable it explicitly so the invariant is enforced
+  // regardless of global pragma state).
+  describe('FK integrity for device_approvals_pending (ADR-0015 Option A)', () => {
+    const runWithForeignKeysOn = (fn) => {
+      const raw = dbModule.getRawDB ? dbModule.getRawDB() : dbModule.db;
+      const wasOn = raw.pragma('foreign_keys', { simple: true }) === 1;
+      raw.pragma('foreign_keys = ON');
+      try {
+        return fn();
+      } finally {
+        if (!wasOn) raw.pragma('foreign_keys = OFF');
+      }
+    };
+
+    it('creates a matching users row for the default owner on first seed', () => {
+      runWithForeignKeysOn(() => {
+        const ownerRow = dbModule.db
+          .prepare('SELECT id, username, status FROM users WHERE id = ?')
+          .get('owner');
+        expect(ownerRow).toBeDefined();
+        expect(ownerRow.id).toBe('owner');
+        expect(ownerRow.status).toBe('active');
+      });
+    });
+
+    it('uses an unloginable password_hash sentinel (no bcrypt match is ever possible)', async () => {
+      const row = dbModule.db
+        .prepare('SELECT password_hash FROM users WHERE id = ?')
+        .get('owner');
+      expect(row).toBeDefined();
+      expect(typeof row.password_hash).toBe('string');
+      // bcrypt hashes start with $2; the seed MUST NOT write a real bcrypt
+      // hash here -- the master-token owner is a DB-only identity, not a
+      // login account. Any bcrypt.compare against a non-bcrypt sentinel
+      // returns false, which is exactly what we want.
+      expect(row.password_hash.startsWith('$2')).toBe(false);
+      const matchesCommonPassword = await bcrypt.compare('', row.password_hash).catch(() => false);
+      expect(matchesCommonPassword).toBe(false);
+    });
+
+    it('createPendingApproval(tokenId, ownerId, ...) succeeds with FKs enforced', () => {
+      runWithForeignKeysOn(() => {
+        const token = dbModule.db
+          .prepare("SELECT id FROM access_tokens WHERE owner_id = 'owner' AND revoked_at IS NULL LIMIT 1")
+          .get();
+        expect(token).toBeDefined();
+        const approvalId = dbModule.createPendingApproval(
+          token.id,
+          'owner',
+          'deadbeef'.repeat(8), // 64-char fingerprint hash
+          { os: 'test', browser: 'jest', ipAddress: '127.0.0.1' },
+          '127.0.0.1',
+        );
+        expect(approvalId).toMatch(/^approval_[0-9a-f]{32}$/);
+
+        // Confirm the row is readable via the normal API and the FK chain
+        // is satisfied end-to-end.
+        const pending = dbModule.getPendingApprovals('owner', token.id);
+        expect(pending.some((p) => p.id === approvalId)).toBe(true);
+      });
+    });
+
+    it('re-seeding is idempotent on the users table (no UNIQUE(username) clash)', () => {
+      // The seed should use INSERT OR IGNORE so re-running does not throw
+      // on the UNIQUE(username) constraint.
+      expect(() => seedMasterToken()).not.toThrow();
+      const count = dbModule.db
+        .prepare('SELECT COUNT(*) AS n FROM users WHERE id = ?')
+        .get('owner').n;
+      expect(count).toBe(1);
+    });
+
+    it('custom INIT_DB_OWNER_ID provisions its own users row', () => {
+      const prev = process.env.INIT_DB_OWNER_ID;
+      process.env.INIT_DB_OWNER_ID = 'smoke-custom-owner';
+      try {
+        const result = seedMasterToken({ force: true });
+        expect(result.created).toBe(true);
+        runWithForeignKeysOn(() => {
+          const row = dbModule.db
+            .prepare('SELECT id, username FROM users WHERE id = ?')
+            .get('smoke-custom-owner');
+          expect(row).toBeDefined();
+          expect(row.id).toBe('smoke-custom-owner');
+
+          // FK chain smoke: device approval for this custom owner works too.
+          const approvalId = dbModule.createPendingApproval(
+            result.tokenId,
+            'smoke-custom-owner',
+            'cafed00d'.repeat(8),
+            { os: 'test', browser: 'jest', ipAddress: '127.0.0.1' },
+            '127.0.0.1',
+          );
+          expect(approvalId).toMatch(/^approval_[0-9a-f]{32}$/);
+        });
+      } finally {
+        if (prev === undefined) delete process.env.INIT_DB_OWNER_ID;
+        else process.env.INIT_DB_OWNER_ID = prev;
+      }
+    });
+  });
 });
