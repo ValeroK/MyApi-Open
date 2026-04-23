@@ -1418,10 +1418,13 @@ function decryptVaultToken(id, ownerId = 'owner', workspaceId = null) {
 
     // Legacy format fallback (AES-256-CBC, iv:ciphertext)
     if (decrypted == null) {
-      // ALLOW_LEGACY_DEFAULT_VAULT_KEY is restricted to test environments only (SOC2 Phase 1)
-      const allowLegacyDefault = process.env.NODE_ENV !== 'production' &&
-        String(process.env.ALLOW_LEGACY_DEFAULT_VAULT_KEY || '').toLowerCase() === 'true';
-      const encryptionKey = vaultKey || (allowLegacyDefault ? 'default-vault-key-change-me' : null);
+      // T2.4: legacy default-vault-key fallback removed. `vaultKey`
+      // is already guaranteed non-empty by the early-return above, so
+      // legacy-format decryption uses the real operator-supplied key.
+      // If that key can't decrypt the row, the row stays undecryptable
+      // and we return null (fail-closed), same as before, without ever
+      // exposing a publicly known fallback key to the caller.
+      const encryptionKey = vaultKey;
       if (!encryptionKey) return null;
       const algorithm = 'aes-256-cbc';
       const key = crypto.scryptSync(encryptionKey, 'salt', 32);
@@ -2365,7 +2368,9 @@ function deletePersona(id, ownerId = 'owner') {
 
 // OAuth Tokens
 const OAUTH_TOKEN_ALGO = 'aes-256-gcm';
-const LEGACY_DEFAULT_VAULT_KEY = 'default-vault-key-change-me';
+// T2.4: the former `LEGACY_DEFAULT_VAULT_KEY` constant has been removed.
+// Rows encrypted with the legacy default are no longer decryptable via
+// this path — callers must supply a real VAULT_KEY. See ADR-0013.
 
 function deriveOAuthKey(rawKey) {
   return crypto.scryptSync(String(rawKey || ''), 'salt', 32);
@@ -2409,8 +2414,10 @@ function getOAuthKeyCandidates() {
     // best-effort only
   }
 
-  // Backward compatibility: old tokens may have been encrypted with fallback key
-  add('legacy-default', LEGACY_DEFAULT_VAULT_KEY);
+  // T2.4: the legacy-default candidate has been removed. Any row still
+  // encrypted under the public default must be rotated via the key-
+  // rotation endpoint or treated as unrecoverable; we will not offer a
+  // publicly known key as a silent recovery candidate.
 
   return candidates;
 }
@@ -2795,7 +2802,14 @@ function cleanupExpiredStateTokens() {
 // Phase 5.1: Token Encryption Key Rotation
 function createKeyVersion(version, algorithm = 'aes-256-gcm') {
   const id = 'key_v' + crypto.randomBytes(8).toString('hex');
-  const vaultKey = process.env.VAULT_KEY || 'default-vault-key-change-me';
+  // T2.4: fail closed if VAULT_KEY is unset. The previous silent
+  // fallback to a legacy default constant (see ADR-0013 / T2.4) meant a
+  // key-version row could record a key hash derived from a publicly
+  // known value, defeating the whole point of versioning.
+  const vaultKey = String(process.env.VAULT_KEY || '').trim();
+  if (!vaultKey) {
+    throw new Error('VAULT_KEY is required to create a key version');
+  }
   const key = crypto.scryptSync(vaultKey, 'salt', 32);
   const keyHash = crypto.createHash('sha256').update(key).digest('hex');
   const now = new Date().toISOString();
@@ -2822,20 +2836,35 @@ function getCurrentKeyVersion() {
 }
 
 function rotateEncryptionKey(newVaultKey) {
+  // T2.4: rotation requires (a) a non-empty new key supplied by the
+  // caller and (b) a non-empty current VAULT_KEY so the old-key half
+  // of the rotation uses a real secret, not a publicly known default.
+  // Both used to silently fall back to the legacy default literal (see
+  // ADR-0013 / T2.4), which would have re-encrypted every OAuth token
+  // under a publicly known key — catastrophic.
+  const newKey = String(newVaultKey || '').trim();
+  if (!newKey) {
+    throw new Error('rotateEncryptionKey: newVaultKey is required (VAULT_KEY not provided in request)');
+  }
+  const currentKey = String(process.env.VAULT_KEY || '').trim();
+  if (!currentKey) {
+    throw new Error('rotateEncryptionKey: current VAULT_KEY must be set in the environment to rotate');
+  }
+
   // 1. Create new key version
   const currentVersions = db.prepare('SELECT MAX(version) as maxVersion FROM key_versions').get();
   const newVersion = (currentVersions.maxVersion || 0) + 1;
-  
+
   const newKeyId = createKeyVersion(newVersion);
-  
+
   // 2. Re-encrypt all OAuth tokens with new key
   const tokens = db.prepare('SELECT * FROM oauth_tokens').all();
   const now = new Date().toISOString();
-  
+
   for (const token of tokens) {
     try {
       // Decrypt with old key
-      const oldKey = process.env.VAULT_KEY || 'default-vault-key-change-me';
+      const oldKey = currentKey;
       const oldKeyHash = crypto.scryptSync(oldKey, 'salt', 32);
       
       let decryptedAccess = null;
@@ -2855,8 +2884,8 @@ function rotateEncryptionKey(newVaultKey) {
         decryptedRefresh = decipher.update(parsed.encrypted, 'hex', 'utf8') + decipher.final('utf8');
       }
       
-      // Re-encrypt with new key
-      const newKeyHash = crypto.scryptSync(newVaultKey, 'salt', 32);
+      // Re-encrypt with new key (T2.4: use the validated, trimmed copy)
+      const newKeyHash = crypto.scryptSync(newKey, 'salt', 32);
       
       let newAccessTokenEncrypted = null;
       if (decryptedAccess) {
