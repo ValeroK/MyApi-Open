@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **20 / 20 suites, 237 pass / 18 skip, exit 0** (~13 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **21 / 21 suites, 245 pass / 18 skip, exit 0** (~14 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,40 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — M2 Step 1: legacy vault inventory + re-scoping:
+- **2026-04-21 (latest)** — M2 Step 2: orphan subsystem deleted, `init-db`
+  rewritten onto the live token API:
+  - **Deleted** in one commit (ADR-0013 / T2.7 + T2.9): `src/utils/encryption.js`,
+    `src/vault/vault.js`, `src/routes/api.js`, `src/routes/management.js`,
+    `src/brain/brain.js`, `src/gateway/tokens.js`. All were unreachable from
+    `src/index.js`. Also removed the stray dangling
+    `const createManagementRoutes = require('./routes/management');` at
+    `src/index.js:2562` (no mount point).
+  - **Rewrote `src/scripts/init-db.js`** to provision a real master access
+    token via `createAccessToken(...)` against the live `access_tokens`
+    table in `src/database.js`. Idempotent by default
+    (`getExistingMasterToken(ownerId)` short-circuits), `--force` creates an
+    additional master for rotation, `INIT_DB_OWNER_ID` overrides the default
+    `"owner"` ownerId. Programmatic API: `seedMasterToken({ force, label })`.
+  - **New test `src/tests/init-db-seed.test.js`** (8 tests): fresh-DB happy
+    path, schema shape assertions (`scope='full'`, `token_type='master'`,
+    `revoked_at IS NULL`), idempotency / no-op path, `--force` path,
+    bcrypt round-trip of the raw token against the stored hash, custom
+    `INIT_DB_OWNER_ID`. Ran **red** first against the broken script
+    (`MODULE_NOT_FOUND: crypto-js`), green after the rewrite.
+  - **Tightened `src/tests/legacy-vault-inventory.test.js`**: flipped the
+    two existence-snapshot assertions from `toBe(true)` to `toBe(false)`;
+    `SANCTIONED_LEGACY_CALLERS` is gone; added a textual gate that scans
+    every `src/**/*.{js,cjs,mjs}` file (excluding `public/` + `node_modules/`)
+    for literal `require('crypto-js')` / `require('…/utils/encryption')` /
+    `require('…/vault/vault')` and asserts zero hits. This gate works
+    even against specifiers whose target no longer exists on disk.
+  - Full `npm test --silent` → **21 / 21 suites, 245 pass, 18 skip, exit 0**
+    (was 20 / 20 / 237). New gate is +1 suite, +8 tests.
+  - Remaining follow-ups still in M2: T2.10 (remove nested `crypto-js`
+    dep in `src/package.json`), T2.1 (HKDF `deriveSubkey`), T2.4
+    (`default-vault-key-change-me` fallback), T2.5 (secret validation in
+    every `NODE_ENV`), T2.8 (docs pass).
+- **2026-04-21** — M2 Step 1: legacy vault inventory + re-scoping:
   - Added `src/tests/legacy-vault-inventory.test.js` (10 assertions): BFS
     over static `require()` edges from `src/index.js`, asserts no reachable
     module loads `crypto-js` / the weak `Encryption` module / the `Vault`
@@ -156,22 +189,21 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 ## 6. Active focus
 
 - **Now:** M2 — consolidate crypto, **re-scoped to pure deletion** per
-  **ADR-0013**. Characterization work revealed the legacy vault subsystem
-  (`src/vault/vault.js`, `src/utils/encryption.js`, `src/routes/api.js`,
-  `src/routes/management.js`, `src/brain/brain.js`, `src/scripts/init-db.js`)
-  is **orphan in the running server**: `src/index.js` never requires any of
-  them and uses an in-memory stub `vault` object; sensitive crypto already
-  runs via `src/lib/encryption.js` (AES-256-GCM). The inventory test
-  `src/tests/legacy-vault-inventory.test.js` locks this finding (10 new
-  assertions; +10 tests). Next up: delete the orphan modules + remove
-  nested `crypto-js` dep in one commit, flip snapshot assertions to
-  "does-not-exist", and then close out the non-vault half of M2
-  (`default-vault-key-change-me` fallback + `NODE_ENV=production`-only
-  secret validation). T2.2/T2.3/T2.6 are **cancelled** (no population to
-  migrate). Risk acknowledged: any self-hoster who ever manually ran
-  `cd src && npm install && node scripts/init-db.js` and populated the
-  tables would need the deleted code recovered from `git log` — captured
-  in ADR-0013.
+  **ADR-0013**. Step 1 (inventory + regression test) and Step 2 (deletions +
+  `init-db` rewrite) are done. Remaining M2 work:
+  - **T2.10** — remove `crypto-js` from the nested `src/package.json`
+    `dependencies` (or retire the nested manifest entirely if unused).
+    Already enforced from the root by the inventory test's "not resolvable
+    from repo root" gate, so this is pure cleanup.
+  - **T2.1** — add `deriveSubkey(root, purpose)` (HKDF-SHA-256) to
+    `src/lib/encryption.js`. Purposes: `oauth:v1`, `session:v1`, `audit:v1`
+    (vault purpose dropped — no vault class).
+  - **T2.4** — delete the `default-vault-key-change-me` fallback in
+    `src/database.js`; add regression tests.
+  - **T2.5** — run `validateRequiredSecrets()` in every `NODE_ENV` (not just
+    production) with an expanded banned-defaults list; add regression tests.
+  - **T2.8** — update `CLAUDE.md`, `SECURITY.md`, `README.md` to state
+    "AES-256-GCM everywhere" truthfully and note the legacy deletion.
 - **Next:** M3 OAuth state + PKCE hardening (DB-backed `state_tokens`,
   random PKCE verifier, remove Discord bypass).
 - **Blocked / waiting on a human:**

@@ -2559,7 +2559,8 @@ const activityRoutes = require('./routes/activity');
 const emailRoutes = require('./routes/email');
 const workspacesRoutes = require('./routes/workspaces');
 const invitationsRoutes = require('./routes/invitations');
-const createManagementRoutes = require('./routes/management');
+// NOTE: `createManagementRoutes` used to be required here but was never mounted.
+// The legacy Vault-based management router was deleted in M2 (ADR-0013).
 
 app.use('/api/v1/notifications', authenticate, notificationsRouter);
 app.use('/api/v1/activity', authenticate, activityRoutes);

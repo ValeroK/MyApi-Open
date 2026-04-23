@@ -1,74 +1,119 @@
+#!/usr/bin/env node
+/**
+ * init-db — seed an initial master access token for a fresh MyApi install.
+ *
+ * Rewritten in M2 (see ADR-0013) to target the live `access_tokens` table in
+ * `src/database.js`. The previous version of this script used the orphan
+ * `TokenManager` / `Vault` / `src/utils/encryption.js` pair, which wrote to
+ * a separate `tokens` table the running server never reads.
+ *
+ * CLI:
+ *   node src/scripts/init-db.js           # seed if no master token exists
+ *   node src/scripts/init-db.js --force   # always create a new master token
+ *
+ * Env:
+ *   DB_PATH               (inherited by src/database.js)
+ *   DATABASE_TYPE         (inherited by src/database.js; sqlite | postgres)
+ *   VAULT_KEY             required in non-test envs for encrypted_token
+ *   ENCRYPTION_KEY        fallback for VAULT_KEY; required in tests
+ *   INIT_DB_OWNER_ID      owner_id for the seeded token (default: "owner")
+ *
+ * Programmatic:
+ *   const { seedMasterToken } = require('./src/scripts/init-db');
+ *   seedMasterToken({ force: false }) => { created, reason, tokenId, rawToken? }
+ */
+
+'use strict';
+
 require('dotenv').config();
-const { initDatabase } = require('../config/database');
-const TokenManager = require('../gateway/tokens');
-const Vault = require('../vault/vault');
 
-async function initialize() {
-  console.log('🔧 Initializing MyApi Platform...\n');
+const crypto = require('crypto');
+const bcrypt = require('bcrypt');
 
-  // Initialize database
-  const dbPath = process.env.DB_PATH || './data/myapi.db';
-  console.log(`📁 Database: ${dbPath}`);
-  initDatabase(dbPath);
-  console.log('✓ Database initialized\n');
+const {
+  initDatabase,
+  createAccessToken,
+  getExistingMasterToken,
+} = require('../database');
 
-  // Initialize components
-  const tokenManager = new TokenManager();
-  const vault = new Vault(process.env.ENCRYPTION_KEY);
+const DEFAULT_LABEL = 'Initial Master Token (seed)';
 
-  // Create initial personal token
-  console.log('🔑 Creating initial personal token...');
-  const personalToken = await tokenManager.createToken(
-    'Initial Personal Token',
-    'personal',
-    { identity: '*', preferences: '*', connectors: '*' },
-    null, // No expiration
-    { created_by: 'init-script' }
-  );
-
-  console.log('✓ Personal token created!\n');
-  console.log('╔═══════════════════════════════════════════════════════════════╗');
-  console.log('║                                                               ║');
-  console.log('║   🔐 SAVE THIS TOKEN - IT WILL ONLY BE SHOWN ONCE!           ║');
-  console.log('║                                                               ║');
-  console.log('╚═══════════════════════════════════════════════════════════════╝\n');
-  console.log(`Token: ${personalToken.token}\n`);
-  console.log('Copy this token and use it to access the dashboard and API.\n');
-
-  // Try to ingest USER.md if it exists
-  const userMdPath = process.env.USER_MD_PATH || './USER.md';
-  console.log(`📄 Attempting to ingest USER.md from: ${userMdPath}`);
-  
-  const ingestResult = vault.ingestUserMd(userMdPath);
-  
-  if (ingestResult.success) {
-    console.log(`✓ USER.md ingested successfully!`);
-    console.log(`  Sections parsed: ${ingestResult.sections.join(', ')}\n`);
-  } else {
-    console.log(`⚠ Could not ingest USER.md: ${ingestResult.error}`);
-    console.log('  You can ingest it later from the dashboard.\n');
-  }
-
-  // Store some example preferences
-  console.log('📋 Creating example preferences...');
-  vault.storePreference('theme', 'dark', 'ui');
-  vault.storePreference('language', 'en', 'general');
-  vault.storePreference('timezone', 'America/Chicago', 'general');
-  console.log('✓ Example preferences created\n');
-
-  console.log('╔═══════════════════════════════════════════════════════════════╗');
-  console.log('║                                                               ║');
-  console.log('║   ✅ MyApi Platform Initialized Successfully!                ║');
-  console.log('║                                                               ║');
-  console.log('║   Next steps:                                                 ║');
-  console.log('║   1. npm start                                                ║');
-  console.log('║   2. Open http://localhost:3001                               ║');
-  console.log('║   3. Login with your personal token                           ║');
-  console.log('║                                                               ║');
-  console.log('╚═══════════════════════════════════════════════════════════════╝\n');
+function resolveOwnerId() {
+  const raw = String(process.env.INIT_DB_OWNER_ID || '').trim();
+  return raw || 'owner';
 }
 
-initialize().catch(error => {
-  console.error('❌ Initialization failed:', error);
-  process.exit(1);
-});
+function seedMasterToken({ force = false, label = DEFAULT_LABEL } = {}) {
+  initDatabase();
+  const ownerId = resolveOwnerId();
+
+  if (!force) {
+    const existing = getExistingMasterToken(ownerId);
+    if (existing && existing.tokenId) {
+      return {
+        created: false,
+        reason: 'existing_master_token',
+        tokenId: existing.tokenId,
+      };
+    }
+  }
+
+  const rawToken = 'myapi_' + crypto.randomBytes(32).toString('hex');
+  const hash = bcrypt.hashSync(rawToken, 10);
+  const tokenId = createAccessToken(
+    hash,
+    ownerId,
+    'full',
+    label,
+    null, // expiresAt
+    null, // allowedPersonas
+    null, // workspaceId
+    rawToken, // enables encrypted_token so the master is retrievable
+    'master',
+  );
+
+  return { created: true, reason: 'created', tokenId, rawToken };
+}
+
+module.exports = { seedMasterToken };
+
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
+
+if (require.main === module) {
+  const force = process.argv.includes('--force');
+  try {
+    const result = seedMasterToken({ force });
+    if (!result.created) {
+      console.log(
+        '[init-db] Master token already exists for owner_id="%s" (tokenId=%s).',
+        resolveOwnerId(),
+        result.tokenId,
+      );
+      console.log(
+        '[init-db] Use --force to create an additional master token, or the',
+      );
+      console.log(
+        '           dashboard "Bootstrap master token" flow to rotate.',
+      );
+      process.exit(0);
+    }
+
+    console.log('');
+    console.log('╔══════════════════════════════════════════════════════════════╗');
+    console.log('║  Initial master token created — SAVE IT NOW.                 ║');
+    console.log('║  The server cannot recover this value for you later.         ║');
+    console.log('╚══════════════════════════════════════════════════════════════╝');
+    console.log('');
+    console.log('  tokenId : %s', result.tokenId);
+    console.log('  ownerId : %s', resolveOwnerId());
+    console.log('  token   : %s', result.rawToken);
+    console.log('');
+    process.exit(0);
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error('[init-db] Failed to seed master token:', msg);
+    process.exit(1);
+  }
+}
