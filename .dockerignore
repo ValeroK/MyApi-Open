@@ -1,13 +1,70 @@
+# ============================================================================
+# .dockerignore — trim build context for faster COPY + layer cache stability
+# ============================================================================
+# Why this matters for layer caching:
+#   - Docker ships the entire build context to the daemon on every build. A
+#     10 MB context is ~1 s transfer; a 500 MB context (with node_modules
+#     or .git) is tens of seconds.
+#   - Changes to files in the context invalidate the earliest COPY layer
+#     that references them. Pruning noise here keeps the `npm ci` cache
+#     warm across rebuilds.
+# ============================================================================
+
+# --- Never ship these into any image ---------------------------------------
 node_modules
+**/node_modules
 .git
+.gitleaksignore
+gitleaks-*.json
+
+# --- Local secrets (.env.* is only safe for the committed *.example files) -
 .env
 .env.*
 !.env.example
 !.env.docker
 !.env.dev.example
 !.env.prod.example
-*.log
-.DS_Store
+!.env.smoke.example
+
+# --- Build artefacts that the image rebuilds itself, never inherit from host
+dist
+**/dist
+build
+**/build
 coverage
+.tsbuildinfo
+**/*.tsbuildinfo
+
+# --- Host-side SQLite persistence (smoke harness bind-mount target) --------
+/data
+src/data
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# --- Log output (never part of the image) ---------------------------------
+*.log
+logs
+
+# --- Docs / ADR / tracking files (not loaded at runtime) -------------------
+.context
+docs
+
+# --- IDE / local tooling / OS noise ----------------------------------------
 .vscode
 .idea
+.cursor
+.claude
+.DS_Store
+Thumbs.db
+
+# --- Ephemeral helpers -----------------------------------------------------
+.git-commit-msg.tmp
+*.tmp
+
+# --- Docker assets themselves shouldn't ship into images -------------------
+Dockerfile*
+docker-compose*.yml

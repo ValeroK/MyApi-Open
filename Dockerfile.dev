@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # =============================================================================
 # Dockerfile.dev — Development + test image for MyApi
 # =============================================================================
@@ -5,59 +6,90 @@
 # Purpose
 # -------
 # Small image that runs the backend Node API for tests and manual smoke
-# testing. Used by:
-#   - docker-compose.test.yml  (npm test)
-#   - docker-compose.smoke.yml (node --watch)
+# testing. Consumed by:
+#   - docker-compose.test.yml   (npm test)
+#   - docker-compose.smoke.yml  (node --watch)
 #
-# Intentionally does NOT build the React/Vite dashboard. If you need to
-# exercise the dashboard UI, run its Vite dev server on the host:
+# Layer caching strategy
+# ----------------------
+# Every layer here is ordered so that the MOST stable inputs come first
+# and the MOST volatile inputs come last. In practice that means:
 #
-#     cd src/public/dashboard-app && npm install && npm run dev
+#   1. Base image                         (invalidated only on FROM bump)
+#   2. WORKDIR                            (effectively free)
+#   3. package.json + package-lock.json   (invalidated when deps change)
+#   4. npm ci                             (reuses BuildKit cache mount)
+#   5. mkdir data / logs                  (effectively free)
 #
-# Vite listens on :5173 by default and proxies API calls at `/api/*` to the
-# containerised backend on :4500 (the proxy is already configured in
-# src/public/dashboard-app/vite.config.ts — or add one if missing).
+# Source code is NOT baked into the image — both compose files bind-mount
+# `./src/` (and `./connectors/`) at runtime, so editing a handler or a
+# test never invalidates any layer here. A typical incremental rebuild
+# takes ~1 s (context transfer only).
+#
+# BuildKit cache mount on /root/.npm
+# ----------------------------------
+# `--mount=type=cache,target=/root/.npm` persists npm's on-disk tarball
+# cache across builds. Even when package.json/package-lock.json change
+# and layer (4) is invalidated, `npm ci` re-uses already-downloaded
+# tarballs from /root/.npm, typically cutting the install from 7 s →
+# 2-3 s. Requires BuildKit (`DOCKER_BUILDKIT=1` or Docker 23+, which
+# is default now).
+#
+# `npm ci` vs `npm install`
+# --------------------------
+# `npm ci` is strictly lockfile-driven: no lockfile resolution, no
+# install-time mutation of package-lock.json, and guaranteed identical
+# node_modules across builds. It's faster AND more reproducible. Use
+# `npm install` only when you want to update the lockfile, which is
+# never what a Docker build should do.
 #
 # Why not reuse `src/Dockerfile` or the root `Dockerfile`?
 # --------------------------------------------------------
-# Both of the existing production Dockerfiles are optimised for shipping a
-# single container with the built dashboard baked in, and both have
-# side-effects that hurt dev iteration:
-#   - root `Dockerfile` uses `npm ci --only=production`, so jest / supertest /
+# Both production Dockerfiles are optimised for shipping one container
+# with the built dashboard baked in, and each has dev-hostile side
+# effects:
+#   - root `Dockerfile` uses `npm ci --omit=dev`, so jest/supertest/
 #     every devDep is absent — tests can't run.
-#   - `src/Dockerfile` does `npm install` at /app (root package.json) and
-#     then `cd src/public/dashboard-app && npm run build`, but that second
-#     step requires vite from the *nested* package.json which was never
-#     installed. From-scratch builds of `src/Dockerfile` fail with
-#     `sh: 1: vite: not found` (observed 2026-04-21).
+#   - `src/Dockerfile` does `npm install` at /app (root package.json)
+#     and then `cd src/public/dashboard-app && npm run build`, but that
+#     requires vite from the *nested* package.json which was never
+#     installed. From-scratch builds fail with `sh: 1: vite: not found`
+#     (observed 2026-04-21).
 #
-# This file sidesteps both problems: install root package.json (incl.
-# devDeps), no frontend build, no production-only pruning. The smoke and
-# test compose files bind-mount `./src/` at runtime so image size stays
+# This file sidesteps both: install root package.json (incl. devDeps),
+# no frontend build, no production-only pruning. The smoke and test
+# compose files bind-mount `./src/` at runtime so image size stays
 # small and source edits are instantly visible.
 #
-# When the `src/Dockerfile` production-build bug is fixed in a future
-# cleanup commit, this file stays — it serves a different purpose (dev
-# speed vs. production shipping).
+# For dashboard UI testing, run Vite on the host instead:
+#     cd src/public/dashboard-app && npm install && npm run dev
+# and point it at :4500 via its vite.config.ts proxy.
 # =============================================================================
 
 FROM node:22
 
 WORKDIR /app
 
-# Install root package dependencies (dependencies + devDependencies). We
-# install ALL deps because the test container needs jest, supertest, etc.,
-# and the smoke container benefits from the same environment as tests for
-# parity.
-COPY package*.json ./
-RUN npm install --no-audit --no-fund
+# Copy ONLY manifest files first — this layer is invalidated strictly when
+# package.json or package-lock.json changes on disk. Copying a small file
+# here (rather than the whole tree) is the single most important layering
+# decision for rebuild speed.
+COPY package.json package-lock.json ./
 
-# Ensure runtime directories exist. `data` will be overridden by a bind
-# mount in the smoke compose; `logs` is used by the winston-style logger.
+# `npm ci` is lockfile-driven and deterministic. BuildKit cache mount on
+# /root/.npm keeps the on-disk tarball cache warm across builds, so even
+# when this layer IS invalidated, re-resolving deps is fast.
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --no-audit --no-fund
+
+# Ensure runtime directories exist. Both get overridden by bind mounts at
+# runtime (smoke compose), but the mkdir guarantees the paths are present
+# for cases without a mount (e.g. `docker run myapi:test` directly).
 RUN mkdir -p data logs
 
 EXPOSE 4500
 
-# Default command: boot the API in watch mode. The smoke compose overrides
-# this; the test compose overrides this with `npm test`.
+# Default command: boot the API. The smoke compose overrides this with
+# `node --watch --watch-path=/app/src src/index.js`; the test compose
+# overrides with `npm test`.
 CMD ["node", "src/index.js"]
