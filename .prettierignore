@@ -1,0 +1,16 @@
+node_modules
+coverage
+dist
+build
+data
+.tsbuildinfo
+src/public/dashboard-app/dist
+src/public/dashboard-app/node_modules
+src/public/dashboard-app/public
+src/migrations/**/*.sql
+src/node_modules
+connectors/**/dist
+connectors/**/node_modules
+package-lock.json
+*.db
+*.sqlite

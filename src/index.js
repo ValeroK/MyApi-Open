@@ -409,12 +409,14 @@ if (!startupHealth.healthy) {
 
 // --- OAuth Configuration ---
 // Load OAuth config with environment variable support
-// OAuth configuration - hardcoded with fallback to oauth.json
+// OAuth configuration. Enabled providers are those whose client id + secret
+// are both present in the environment. Hardcoded fallback strings were removed
+// on 2026-04-21 (see .context/TASKS.md T1.4/T1.5, plan.md §6.3).
 let oauthConfig = {
   google: {
-    enabled: true,
-    clientId: process.env.GOOGLE_CLIENT_ID || 'REMOVED_CLIENT_ID',
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET || 'REMOVED_SECRET',
+    enabled: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+    clientId: process.env.GOOGLE_CLIENT_ID || '',
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
     redirectUri: process.env.GOOGLE_REDIRECT_URI || 'https://www.myapiai.com/api/v1/oauth/callback/google'
   }
 };
@@ -3954,92 +3956,10 @@ app.get('/api/v1/health', (req, res) => {
   res.status(health.statusCode).json({ status: health.status, api: '/api/v1/', docs: '/openapi.json', database: health.database });
 });
 
-// Turso data import endpoints
-app.get('/turso-import', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public/turso-import.html'));
-});
-
-app.get('/api/v1/turso/export-sql', (req, res) => {
-  try {
-    const Database = require('better-sqlite3');
-    const dbPath = process.env.DB_PATH || path.join(__dirname, 'data/myapi.db');
-    const db = new Database(dbPath);
-
-    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all();
-
-    let sql = '-- MyApi Database Export\n-- Generated: ' + new Date().toISOString() + '\n\n';
-
-    for (const table of tables) {
-      const tableName = table.name;
-      const createStmt = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(tableName);
-      if (createStmt && createStmt.sql) {
-        sql += createStmt.sql + ';\n';
-      }
-
-      const rows = db.prepare(`SELECT * FROM ${tableName}`).all();
-      for (const row of rows) {
-        const columns = Object.keys(row).join(', ');
-        const values = Object.values(row).map(v => {
-          if (v === null) return 'NULL';
-          if (typeof v === 'string') return "'" + v.replace(/'/g, "''") + "'";
-          return v;
-        }).join(', ');
-        sql += `INSERT INTO ${tableName} (${columns}) VALUES (${values});\n`;
-      }
-    }
-
-    res.set('Content-Type', 'text/plain');
-    res.send(sql);
-  } catch (err) {
-    console.error('[Turso] Export error:', err);
-    res.status(500).json({ error: 'Failed to export SQL', details: err.message });
-  }
-});
-
-app.post('/api/v1/turso/execute', express.json(), (req, res) => {
-  const { sql, tursoUrl } = req.body;
-  const authHeader = req.headers.authorization;
-
-  if (!sql || !tursoUrl || !authHeader) {
-    return res.status(400).json({ error: 'Missing required fields: sql, tursoUrl, Authorization header' });
-  }
-
-  const token = authHeader.replace('Bearer ', '');
-
-  // Execute via HTTP to Turso
-  const https = require('https');
-  const options = {
-    hostname: tursoUrl.split('://')[1].split('/')[0],
-    port: 443,
-    path: '/',
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(sql)
-    }
-  };
-
-  const httpReq = https.request(options, (httpRes) => {
-    let data = '';
-    httpRes.on('data', chunk => data += chunk);
-    httpRes.on('end', () => {
-      if (httpRes.statusCode === 200 || httpRes.statusCode === 201) {
-        res.json({ success: true });
-      } else {
-        res.status(httpRes.statusCode).json({ error: `Turso returned ${httpRes.statusCode}` });
-      }
-    });
-  });
-
-  httpReq.on('error', (err) => {
-    console.error('[Turso] Request error:', err);
-    res.status(500).json({ error: 'Failed to execute on Turso', details: err.message });
-  });
-
-  httpReq.write(sql);
-  httpReq.end();
-});
+// Turso import/export/execute endpoints removed 2026-04-21 (ADR-0006 + M1).
+// Rationale: unauthenticated full-DB SQL export and an open SQL relay
+// were shipping at /turso-import, /api/v1/turso/export-sql, and
+// /api/v1/turso/execute. See .context/current_state.md §4 and .context/TASKS.md T1.1.
 
 app.get('/openapi.json', (req, res) => {
   const host = req.get('host');

@@ -25,6 +25,11 @@ src/.db_integrity
 
 # Build/cache
 .cache/
+.tsbuildinfo
+
+# Gitleaks scan artifacts — may contain raw secrets when not run with --redact.
+# Safe to generate locally; never commit.
+gitleaks-*.json
 
 # Local virtual environment
 backend/venv/

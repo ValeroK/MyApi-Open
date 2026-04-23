@@ -1,0 +1,105 @@
+---
+description: Keep the test suite green on every step and add tests with every change
+alwaysApply: true
+---
+
+# Test-first discipline
+
+The owner of this repo has asked that **every** incremental step be gated on
+the test suite and that new behaviour always lands with new tests. When you
+are working on this repo, do the following — in this order, every time — for
+every non-trivial change:
+
+## 1. Before you touch code, lock the baseline
+
+```powershell
+npm test --silent
+```
+
+The expected baseline today is **19 / 19 test suites passing, 227 passing
+tests, 18 skipped, exit 0**. If you see anything different on a clean HEAD,
+stop and investigate before making new changes — you've either pulled in a
+regression or your environment drifted.
+
+If you're about to work on a module, also skim the matching test file(s):
+
+- `src/tests/*.test.js`
+- `src/__tests__/*.test.js`
+- `src/public/dashboard-app/**/__tests__/*`
+
+## 2. Write or update the test *first*
+
+- For **new behaviour**: add a failing test that encodes the behaviour you're
+  about to implement (RED). Only then write the implementation (GREEN).
+- For **bug fixes**: write a regression test that fails against the buggy
+  code (RED), then fix, then confirm green.
+- For **refactors**: if there is no covering test yet, write a characterization
+  test that locks current behaviour *before* you refactor, so the refactor
+  has something to keep green.
+- For **security fixes**: add an assertion under
+  `src/tests/security-regression.test.js` so we can never regress. This is
+  non-negotiable for anything in `.context/plan.md` §6.3 ("Known critical
+  risks").
+
+Prefer black-box tests via `supertest` against the mounted app over
+white-box unit tests of internal helpers — it's where our bugs actually live.
+
+## 3. After each step, re-run the gate
+
+```powershell
+npm test --silent
+```
+
+- `Test Suites: 19 passed, 19 total` or better (with any new suites you
+  added). **Never merge a change that leaves a suite failing or reduces
+  passing count.**
+- The suite should run in under ~20 seconds on a dev laptop; if your change
+  blows that out, the test is doing too much and probably wants to move to
+  a slower integration bucket.
+
+If you need to iterate on a single file:
+
+```powershell
+npx jest <path/to/test> --runInBand --forceExit
+```
+
+## 4. Lint and typecheck are a ratchet, not a gate (yet)
+
+```powershell
+npm run lint:backend
+npm run typecheck
+```
+
+- Baseline 2026-04-21: **243 lint problems** (112 errors, 131 warnings) and
+  **739 `tsc` errors** under strict `checkJs`. CI reports these but doesn't
+  block on them.
+- Rule: **never increase** the count on files you touched in the same PR.
+  Prefer to leave the file cleaner than you found it.
+- When you convert a module to `.ts` or when you rewrite a legacy file, the
+  typecheck count drops — that's the intended M7 trajectory.
+
+## 5. If a test is flaky
+
+- **Do not** add a blanket `retry` or `--passWithNoTests`. Find the race.
+- Windows-specific `EBUSY` on `better-sqlite3` unlink in `afterAll` is a
+  known pattern; use the `safeUnlink` shape in
+  `src/tests/oauth-security-hardening.test.js` as the reference fix.
+- Document any flake you hit under `.context/sessions/` with a short note.
+
+## 6. Record what you did
+
+- Update `TASKS.md` to flip the task from `[ ]` / `[~]` to `[x]` with a
+  one-line note including the final `Test Suites:` line from `npm test`.
+- Mention new tests in the commit message (e.g. "covered by
+  `src/tests/crypto-envelope.test.js`").
+- Do not mark a task complete if the suite is red.
+
+## Anti-patterns to avoid
+
+- Marking work done "pending tests" — tests land with the code.
+- Disabling a test to "unblock CI". Fix it or quarantine it with an explicit
+  `test.skip('blocked on T…', …)` + a linked task id.
+- Writing tests that only check mock interactions — test observable behaviour
+  of the gateway as a user would.
+- Introducing `process.exit` / `setInterval` / unclosed handles inside test
+  code — it breaks Jest teardown and hides real failures.

@@ -13,6 +13,13 @@
     "dev": "cd src && npx nodemon index.js",
     "start": "node src/index.js",
     "start:prod": "NODE_ENV=production node src/index.js",
+    "lint": "npm run lint:backend && npm run lint:frontend",
+    "lint:backend": "eslint \"src/**/*.{js,ts}\" \"scripts/**/*.js\"",
+    "lint:backend:fix": "eslint \"src/**/*.{js,ts}\" \"scripts/**/*.js\" --fix",
+    "lint:frontend": "npm run lint --prefix src/public/dashboard-app",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write \"**/*.{js,ts,jsx,tsx,json,md,yml,yaml}\"",
+    "format:check": "prettier --check \"**/*.{js,ts,jsx,tsx,json,md,yml,yaml}\"",
     "build:frontend": "cd src/public/dashboard-app && npm run build",
     "build:docker": "docker-compose build",
     "docker:up": "docker-compose up -d",
@@ -65,8 +72,15 @@
   "devDependencies": {
     "@babel/preset-env": "^7.29.2",
     "@babel/preset-react": "^7.28.5",
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-n": "^17.15.1",
+    "eslint-plugin-security": "^3.0.1",
     "jest": "^30.3.0",
-    "supertest": "^7.2.2"
+    "prettier": "^3.4.2",
+    "supertest": "^7.2.2",
+    "typescript": "^5.7.2"
   },
   "engines": {
     "node": ">=20.0.0"

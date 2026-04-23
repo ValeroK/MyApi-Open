@@ -1,0 +1,72 @@
+---
+description: Keep `.context/` in sync when working in this repo
+alwaysApply: true
+---
+
+# `.context/` upkeep
+
+This repository uses `.context/` as its source of truth for project memory.
+Every agent session MUST load context from and write context to this folder.
+
+## On session start
+
+1. Read `.context/current_state.md` first. It tells you what's in-flight and
+   what's blocked.
+2. Read `.context/TASKS.md` and scan the milestone table at the top.
+3. Skim recent files in `.context/sessions/` for hand-off notes.
+4. If you are about to make any architectural decision, search
+   `.context/decisions/` for a relevant ADR first.
+
+## While working
+
+- When you **start** a task listed in `.context/TASKS.md`, flip its
+  checkbox `[ ]` → `[~]` and add your handle + date in the Notes column.
+- When you **finish** a task, flip `[~]` → `[x]` and update the Done column
+  in the milestone's progress table **and** the "Global progress" table at
+  the top of `.context/TASKS.md`.
+- If a task becomes blocked, flip to `[!]` and note the reason directly under
+  the task.
+- If a task is cancelled, flip to `[cancelled]` — never delete it.
+- If you discover work that isn't captured in `TASKS.md`, append a new task
+  row under the right milestone **and** bump the milestone's total count +
+  the global total.
+
+## When making a non-trivial design decision
+
+1. Copy `.context/decisions/TEMPLATE.md` to
+   `.context/decisions/ADR-NNNN-<short-slug>.md` (next unused `NNNN`).
+2. Fill in Context, Options considered, Decision, Consequences.
+3. Link the ADR from the relevant `TASKS.md` row and from `plan.md` if the
+   decision changes the target architecture.
+4. Never edit an accepted ADR in place — supersede it with a new ADR.
+
+## When finishing a working session
+
+1. Update `.context/current_state.md` §5 ("What changed recently") with a
+   one-line date-stamped entry and §6 ("Active focus") to reflect the new
+   state.
+2. If the session produced notable outcomes, copy
+   `.context/sessions/TEMPLATE.md` to
+   `.context/sessions/YYYY-MM-DD-<slug>.md` and fill it in.
+3. If a milestone flipped to complete, mark its header with
+   `✅ Complete (YYYY-MM-DD)` in `TASKS.md` and update the status column in
+   the Global progress table.
+
+## What NOT to do
+
+- Do not move `.context/plan.md` or `.context/TASKS.md` out of `.context/`.
+- Do not create new top-level tracker files that duplicate these.
+- Do not commit secrets, API keys, or production URLs into `.context/`.
+- Do not edit the ADR `TEMPLATE.md`, `tasks/TEMPLATE.md`, or
+  `sessions/TEMPLATE.md` in place — copy them first.
+- Do not silently drop a task. If something shouldn't ship, mark it
+  `[cancelled]` with a one-line reason.
+
+## Pointers
+
+- `.context/README.md` — folder layout and discipline.
+- `.context/plan.md` — architecture, design, testing, security plan.
+- `.context/TASKS.md` — active milestone + task tracker.
+- `.context/current_state.md` — 5-minute snapshot.
+- `.context/roadmap.md` — milestone sequence.
+- `.context/decisions/` — ADRs (ADR-0001+).

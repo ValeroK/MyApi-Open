@@ -1,6 +1,7 @@
 # =============================================================================
 # MyApi CI Pipeline
-# Runs tests, linting, and security checks on every push and pull request
+# Runs lint, type-check, tests, security checks on every push and pull request.
+# Hardening owners: .context/decisions/ADR-0008-npm-audit-blocks-high.md
 # =============================================================================
 
 name: CI
@@ -21,10 +22,10 @@ concurrency:
 
 jobs:
   # ===========================================================================
-  # Lint & Type Check
+  # Lint (backend + frontend)
   # ===========================================================================
-  lint:
-    name: Lint
+  lint-backend:
+    name: Lint backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,11 +38,64 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # NOTE: non-blocking until the legacy-monolith lint backlog is paid down.
+      # Baseline 2026-04-21: 243 problems (112 errors / 131 warnings).
+      # Policy: every PR must leave the number lower than the previous run;
+      # a ratchet script + blocking gate will land under M14 / CI hardening.
+      - name: ESLint (backend) — report-only
+        run: npm run lint:backend
+        continue-on-error: true
+
+      - name: Prettier check — report-only
+        run: npm run format:check
+        continue-on-error: true
+
+  lint-frontend:
+    name: Lint frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: src/public/dashboard-app
+        run: npm ci
+
       - name: Lint frontend
         working-directory: src/public/dashboard-app
-        run: |
-          npm ci
-          npm run lint
+        run: npm run lint
+
+  # ===========================================================================
+  # TypeScript type-check (runs against checkJs config)
+  # ===========================================================================
+  typecheck:
+    name: Type-check (tsc --noEmit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # NOTE: non-blocking until the legacy-JS typecheck backlog is paid down.
+      # Baseline 2026-04-21: 739 `error TS*` diagnostics under strict `checkJs`.
+      # The number drops as modules in `src/domain/` and `src/infra/*` convert
+      # to native .ts under M7. A ratchet script + blocking gate lands in M14.
+      - name: tsc --noEmit — report-only
+        run: npm run typecheck
+        continue-on-error: true
 
   # ===========================================================================
   # Backend Tests
@@ -84,9 +138,13 @@ jobs:
 
   # ===========================================================================
   # Security Audit
+  # Policy: block on HIGH+ advisories (.context/decisions/ADR-0008-...).
+  # If a HIGH lands on a transitive dep with no exploitable path, suppress via
+  # `package.json` `overrides` or file a dated note under .context/decisions/
+  # — never re-introduce `|| true` here.
   # ===========================================================================
   security:
-    name: Security Audit
+    name: Security audit (blocks on HIGH+)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,16 +157,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: npm audit
-        run: npm audit --audit-level=high || true
+      - name: npm audit (blocks at HIGH+)
+        run: npm audit --audit-level=high
 
   # ===========================================================================
   # Docker Build Validation
   # ===========================================================================
   docker:
     name: Docker Build
+    # `lint-backend` and `typecheck` are report-only today (see job comments);
+    # the hard gates that must pass before a Docker build are tests + security.
+    needs: [test, security]
     runs-on: ubuntu-latest
-    needs: [test]
     if: github.event_name == 'push'
 
     steps:
@@ -129,4 +189,3 @@ jobs:
           tags: myapi-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

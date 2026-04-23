@@ -1,0 +1,85 @@
+# .gitleaksignore — fingerprints gitleaks should skip on future scans.
+#
+# Rules:
+#   1. Only add a fingerprint here after a human has confirmed the match is
+#      either a placeholder / test value (Bucket A) or a credential that has
+#      been revoked at the provider (Bucket C in .context/decisions/ADR-0011).
+#   2. Never add a fingerprint for a real, still-live secret — rotate instead.
+#   3. When adding, paste the `Fingerprint` value exactly as gitleaks printed
+#      it. No surrounding quotes.
+#
+# Scope key:
+#   BUCKET A — placeholder in docs / tests / env-template. Safe.
+#   BUCKET C — real token shape that sat in git history; token revoked at
+#              provider; now replaced with a placeholder in HEAD. See
+#              .context/decisions/ADR-0011-gitleaks-scan-2026-04-21.md.
+
+# ============================================================================
+# BUCKET A — placeholders in HEAD (no-git / worktree scan fingerprints).
+# These lines deliberately contain `Bearer YOUR_TOKEN`, `sk_live_abc123`,
+# empty `*_CLIENT_SECRET=` in .env-style templates, or example curl snippets.
+# ============================================================================
+
+# README quickstart curl example: `Authorization: Bearer myapi_xxx...`
+README.md:curl-auth-header:304
+
+# Agent-docs curl example: `Authorization: Bearer YOUR_TOKEN`
+docs/AGENT_README.md:curl-auth-header:16
+
+# Services manual .env template with empty `TWITCH_CLIENT_SECRET=`
+docs/SERVICES_MANUAL.md:generic-api-key:568
+
+# Redactor comment explaining `sk_live_abc123...` → `sk_live_***`
+src/lib/data-exposure-prevention.js:generic-api-key:32
+
+# Skipped test fixture using `tok_regular_1234567890` as a mock id
+src/__tests__/export-routes.test.js.skip:generic-api-key:48
+
+# Marketplace listing form <select> with `'bearer'` as an auth_type option
+src/public/dashboard-app/src/pages/MyListings.jsx:curl-auth-header:231
+
+# Connectors docs comment: `tokenId looks like: tok_a44fbb...` (tokenId is
+# not a secret; the docs themselves call that out).
+src/public/dashboard-app/src/pages/Connectors.jsx:generic-api-key:614
+
+# PlatformDocs onboarding curl: `Authorization: Bearer YOUR_GUEST_TOKEN`
+src/public/dashboard-app/src/pages/PlatformDocs.jsx:curl-auth-header:322
+
+# Import-docs curl examples: `Authorization: Bearer YOUR_TOKEN`
+src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:172
+src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:422
+src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:434
+
+# ============================================================================
+# BUCKET A — same placeholders, historical commits (history scan fingerprints).
+# Keeping them ignored prevents re-alerting on the identical content in old
+# commits after HEAD has been sanitized.
+# ============================================================================
+
+e5ed067b0e2e257d8595e0255ccf8455fd727205:src/public/dashboard-app/src/pages/PlatformDocs.jsx:curl-auth-header:322
+e5ed067b0e2e257d8595e0255ccf8455fd727205:src/public/dashboard-app/src/pages/Connectors.jsx:generic-api-key:614
+00121e23c49e9281542134ffab6e9ea7cf5e8c07:src/lib/data-exposure-prevention.js:generic-api-key:32
+94a85d948294f05a0b384ec7cecd205520d93768:docs/AGENT_README.md:curl-auth-header:14
+94a85d948294f05a0b384ec7cecd205520d93768:src/__tests__/export-routes.test.js.skip:generic-api-key:48
+94a85d948294f05a0b384ec7cecd205520d93768:src/public/dashboard-app/src/pages/MyListings.jsx:curl-auth-header:221
+94a85d948294f05a0b384ec7cecd205520d93768:src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:172
+94a85d948294f05a0b384ec7cecd205520d93768:src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:422
+94a85d948294f05a0b384ec7cecd205520d93768:src/routes/IMPORT_DOCUMENTATION.md:curl-auth-header:434
+
+# ============================================================================
+# BUCKET C — real-looking `myapi_…` tokens committed to git history.
+# These tokens have been removed from HEAD on 2026-04-21 and must be revoked
+# in the MyApi DB. Tracking: .context/decisions/ADR-0011-gitleaks-scan-2026-04-21.md.
+# The history commits below will retain the raw tokens forever unless the repo
+# does a history rewrite; ignoring them here prevents alert fatigue while the
+# ADR and rotation row in that file remain the source of truth.
+# ============================================================================
+
+# docs/AGENT_README.md: `myapi_8e04fdb6…` example agent token (64-hex)
+94a85d948294f05a0b384ec7cecd205520d93768:docs/AGENT_README.md:generic-api-key:10
+
+# qa-tests/phase1-security.js: `MASTER_TOKEN = 'myapi_9a81e1bc…'`
+94a85d948294f05a0b384ec7cecd205520d93768:qa-tests/phase1-security.js:generic-api-key:10
+
+# qa-tests/phase1-security.js: `GUEST_TOKEN = 'myapi_guest_04634b05…'`
+94a85d948294f05a0b384ec7cecd205520d93768:qa-tests/phase1-security.js:generic-api-key:11

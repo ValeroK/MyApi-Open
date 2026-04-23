@@ -6,12 +6,25 @@
 
 const http = require('http');
 
-const BASE = 'http://localhost:4500';
-const MASTER_TOKEN = 'myapi_9a81e1bcd62f870db8d27c9565fc47cc7408800edc7fb7f0a3d08cb727f51fae';
-const GUEST_TOKEN = 'myapi_guest_04634b051025369134ed74c1ac66308382abcd2f344f542ece9c6621463cb2ad';
+// Tokens are now read from the environment so nothing live ends up in git.
+// Run this QA script like so:
+//   QA_MASTER_TOKEN=myapi_... QA_GUEST_TOKEN=myapi_guest_... node qa-tests/phase1-security.js
+// The previous hardcoded tokens (committed on 2026-04-21 and earlier) must be
+// treated as compromised and revoked in the MyApi DB. See
+// .context/decisions/ADR-0011-gitleaks-scan-2026-04-21.md.
+const BASE = process.env.QA_BASE || 'http://localhost:4500';
+const MASTER_TOKEN = process.env.QA_MASTER_TOKEN || '';
+const GUEST_TOKEN = process.env.QA_GUEST_TOKEN || '';
 const INVALID_TOKEN = 'myapi_0000000000000000000000000000000000000000000000000000000000000000';
 const EXPIRED_TOKEN = 'myapi_expired_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const EMPTY_TOKEN = '';
+
+if (!MASTER_TOKEN || !GUEST_TOKEN) {
+  console.error(
+    '[qa] QA_MASTER_TOKEN and QA_GUEST_TOKEN must be set. See the header of this file.'
+  );
+  process.exit(2);
+}
 
 const results = [];
 let passed = 0;

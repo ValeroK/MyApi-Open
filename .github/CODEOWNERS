@@ -1,0 +1,31 @@
+# CODEOWNERS — who must review each change.
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: everything needs repo owner review.
+*                                       @omribenami
+
+# Security-critical code: extra eyes when this exists.
+/src/lib/encryption.js                  @omribenami
+/src/lib/ssrf-prevention.js             @omribenami
+/src/lib/csrf-protection.js             @omribenami
+/src/lib/crypto-security.js             @omribenami
+/src/lib/oauth-security.js              @omribenami
+/src/domain/                            @omribenami
+/src/infra/crypto/                      @omribenami
+/src/infra/http/                        @omribenami
+/src/infra/session/                     @omribenami
+/src/middleware/                        @omribenami
+/src/services/*-adapter.js              @omribenami
+
+# Infrastructure + CI.
+/.github/                               @omribenami
+/docker-compose*.yml                    @omribenami
+/src/Dockerfile                         @omribenami
+/config/nginx/                          @omribenami
+/scripts/                               @omribenami
+
+# Project memory — must not silently drift.
+/.context/                              @omribenami
+/CLAUDE.md                              @omribenami
+/SECURITY.md                            @omribenami
+/README.md                              @omribenami

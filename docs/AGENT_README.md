@@ -7,7 +7,9 @@ You are an AI agent with access to a user's unified OAuth data through MyApi.
 ## ⚡ Quick Start (30 seconds)
 
 ### 1. Get your token
-The user will give you a token like: `myapi_8e04fdb632ee790fe5e95263bf4049a1c0865af06da94f576a646a94f028d2f5`
+The user will give you a token shaped like: `myapi_<64-char-hex-string>`
+(for example, `myapi_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`).
+Never commit a real token — they're treated as secret and every commit is scanned by gitleaks.
 
 ### 2. Make your first request
 ```bash
