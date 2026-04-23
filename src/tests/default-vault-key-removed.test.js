@@ -73,12 +73,17 @@ function listSrcJsFiles(root) {
   return out;
 }
 
-// Files allowed to mention the literal string — one for the banned-defaults
-// blocklist (it has to contain the literal so it can reject it), tests are
+// Files allowed to mention the literal string — the banned-defaults
+// blocklist has to contain the literal so it can reject it. Tests are
 // always allowed since they assert the gate.
+//
+// Post-T2.5 the blocklist lives in src/lib/validate-secrets.js; before
+// T2.5 it lived inline in src/index.js. We tolerate either location so
+// the gate does not break spuriously during the M2 refactor window.
 function isAllowedToMentionLegacyDefault(absPath) {
   const rel = path.relative(srcDir, absPath).replace(/\\/g, '/');
-  if (rel === 'index.js') return true; // banned-defaults list
+  if (rel === 'lib/validate-secrets.js') return true;
+  if (rel === 'index.js') return true; // legacy location pre-T2.5
   if (rel.startsWith('tests/')) return true;
   return false;
 }
@@ -123,11 +128,20 @@ describe('T2.4 — default-vault-key-change-me literal is gated', () => {
     expect(offenders).toEqual([]);
   });
 
-  it('the sanctioned site (src/index.js) still contains the literal inside the banned-defaults list', () => {
+  it('the sanctioned site (src/lib/validate-secrets.js) still contains the literal inside its banned-defaults list', () => {
     // This is the opposite direction: make sure the gatekeeper itself
     // doesn't accidentally lose its ability to reject the legacy value.
-    const indexText = fs.readFileSync(path.join(srcDir, 'index.js'), 'utf8');
-    expect(indexText).toMatch(/BANNED_DEFAULT_KEYS[\s\S]{0,200}default-vault-key-change-me/);
+    // After T2.5 the blocklist lives in src/lib/validate-secrets.js
+    // under the exported constant BANNED_DEFAULTS (a frozen Set).
+    const vsPath = path.join(srcDir, 'lib', 'validate-secrets.js');
+    expect(fs.existsSync(vsPath)).toBe(true);
+    const vsText = fs.readFileSync(vsPath, 'utf8');
+    // Loosely require the literal to appear after some marker that
+    // names the blocklist, so a stray unrelated occurrence somewhere
+    // doesn't satisfy the assertion.
+    expect(vsText).toMatch(
+      /(BANNED_DEFAULTS|_bannedDefaultsArr|banned[Dd]efaults?)[\s\S]{0,500}default-vault-key-change-me/,
+    );
   });
 });
 

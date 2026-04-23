@@ -12302,48 +12302,48 @@ app.use((err, req, res, next) => {
   });
 });
 
-// --- Validate Required Secrets (P0 Security Fix) ---
+// --- Validate Required Secrets (T2.5 — runs on every NODE_ENV, ADR-0013) ---
+// The blocklist + pure check live in src/lib/validate-secrets.js so they
+// can be unit-tested without booting an Express server. This wrapper
+// keeps the console-logging + fatal-exit behaviour that src/index.js
+// relies on at startup. The banned-defaults list (default-vault-key-
+// change-me, change-me, changeme, secret, password, *your-*-here
+// placeholders from src/.env.example) is enforced uniformly now — no
+// more NODE_ENV !== 'production' carve-out. See ADR-0013 and T2.5.
+const { validateRequiredSecrets: _validateRequiredSecretsPure } =
+  require('./lib/validate-secrets');
+
 function validateRequiredSecrets() {
-  const isProd = process.env.NODE_ENV === 'production';
-  const requiredSecrets = ['SESSION_SECRET', 'JWT_SECRET', 'ENCRYPTION_KEY', 'VAULT_KEY'];
+  const result = _validateRequiredSecretsPure();
 
-  const missing = [];
-  for (const secret of requiredSecrets) {
-    const value = process.env[secret];
-    if (!value || String(value).trim().length === 0) {
-      missing.push(secret);
-    }
-  }
-
-  if (missing.length > 0) {
-    console.error('❌ FATAL ERROR: Missing required secrets in production:');
-    missing.forEach(secret => {
+  if (result.missing.length > 0) {
+    console.error('❌ FATAL ERROR: Missing required secrets:');
+    for (const secret of result.missing) {
       console.error(`   - ${secret}`);
-    });
-    console.error('\nSet these environment variables before starting production server.');
+    }
+    console.error('\nSet these environment variables before starting the server.');
     console.error('Example: export SESSION_SECRET="your-secret-here"');
-
-    if (isProd) {
-      process.exit(1);
-    } else {
-      console.warn('⚠️  Running in development mode with missing secrets. This is insecure!');
-    }
   }
 
-  // SOC2 Phase 1: Reject known insecure default key values in production
-  if (isProd) {
-    const BANNED_DEFAULT_KEYS = ['default-vault-key-change-me', 'change-me', 'changeme', 'secret', 'password'];
-    for (const envVar of ['VAULT_KEY', 'ENCRYPTION_KEY', 'JWT_SECRET', 'SESSION_SECRET']) {
-      const val = String(process.env[envVar] || '').trim().toLowerCase();
-      if (val && BANNED_DEFAULT_KEYS.includes(val)) {
-        console.error(`❌ FATAL: ${envVar} is set to a known insecure default value. Change it before starting in production.`);
-        process.exit(1);
-      }
+  if (result.banned.length > 0) {
+    console.error('❌ FATAL: Required secrets are set to known-insecure default / placeholder values:');
+    for (const { name } of result.banned) {
+      // Name is logged, value is not — value may be a .env.example
+      // placeholder like "your-vault-key-here-change-in-production"
+      // which is safe-ish to echo, but we still treat it as a secret.
+      console.error(`   - ${name}`);
     }
-    if (missing.length === 0) {
-      console.log('✅ All required secrets validated');
-    }
+    console.error('\nRegenerate these values before starting the server (any environment).');
   }
+
+  if (!result.ok) {
+    // T2.5: fail closed in every NODE_ENV. Previous behaviour was to
+    // warn-and-continue in dev/test; that reliably let operators ship
+    // to staging with the .env.example placeholders in place.
+    process.exit(1);
+  }
+
+  console.log('✅ All required secrets validated');
 }
 
 // Cleanup function for global.sessions (P0 Security Fix: Session Memory Leak)
