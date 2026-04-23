@@ -217,6 +217,32 @@ describe('Legacy vault / weak-crypto regression gate (post-deletion, ADR-0013)',
       expect(devDeps).not.toContain('crypto-js');
     });
 
+    it('nested src/package.json does not declare crypto-js', () => {
+      // The Dockerfile does `cd src && npm ci --only=production`, so the
+      // nested manifest is production-critical. This gate prevents the
+      // weak module from being reinstated by the Docker build.
+      const nested = path.join(srcDir, 'package.json');
+      if (!fs.existsSync(nested)) return; // no nested manifest -> nothing to gate
+      const pkg = JSON.parse(fs.readFileSync(nested, 'utf8'));
+      const deps = Object.keys(pkg.dependencies || {});
+      const devDeps = Object.keys(pkg.devDependencies || {});
+      expect(deps).not.toContain('crypto-js');
+      expect(devDeps).not.toContain('crypto-js');
+    });
+
+    it('nested src/package-lock.json does not reference crypto-js', () => {
+      const lockPath = path.join(srcDir, 'package-lock.json');
+      if (!fs.existsSync(lockPath)) return;
+      const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      const pkgs = lock.packages || {};
+      const legacyDeps = lock.dependencies || {};
+      const rootEntry = pkgs[''] || {};
+      const rootDeps = rootEntry.dependencies || {};
+      expect(Object.keys(rootDeps)).not.toContain('crypto-js');
+      expect(Object.keys(pkgs)).not.toContain('node_modules/crypto-js');
+      expect(Object.keys(legacyDeps)).not.toContain('crypto-js');
+    });
+
     it('crypto-js is not resolvable from the repo root', () => {
       expect(() => {
         require.resolve('crypto-js', { paths: [repoRoot] });
