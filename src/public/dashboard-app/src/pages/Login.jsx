@@ -4,6 +4,7 @@ import { handleOAuthCallback } from '../utils/oauth';
 import { AVAILABLE_SERVICES } from '../utils/oauth';
 import BrandLogo from '../components/BrandLogo';
 import { clearAuthArtifacts } from '../utils/authRuntime';
+import { isSafeInternalRedirect } from '../utils/redirectSafety';
 
 const OAuthIcons = {
   google: (
@@ -88,9 +89,7 @@ function Login() {
                 setMasterToken(sessionUser.bootstrap.masterToken);
               }
               setUser(sessionUser.user || sessionUser);
-              const pending = sessionStorage.getItem('pendingOAuthReturn');
-              if (pending) { sessionStorage.removeItem('pendingOAuthReturn'); window.location.href = pending; }
-              else { window.history.replaceState({}, document.title, '/dashboard/'); window.location.href = '/dashboard/'; }
+              redirectAfterLogin();
             }
           })
           .catch(() => {
@@ -109,9 +108,7 @@ function Login() {
                 setMasterToken(sessionUser.bootstrap.masterToken);
               }
               setUser(sessionUser.user || sessionUser);
-              const pending = sessionStorage.getItem('pendingOAuthReturn');
-              if (pending) { sessionStorage.removeItem('pendingOAuthReturn'); window.location.href = pending; }
-              else { window.history.replaceState({}, document.title, '/dashboard/'); window.location.href = '/dashboard/'; }
+              redirectAfterLogin();
             }
           });
       } else if (callback.status === 'signup_required') {
@@ -149,16 +146,18 @@ function Login() {
     }
   }, []);
 
-  function redirectAfterLogin() {
+  // Central post-authentication redirect sink. Every caller funnels through
+  // here so the same-origin guard (isSafeInternalRedirect) is impossible to
+  // bypass. `serverPreferredTarget` allows the 2FA / signup-complete
+  // endpoints to hint a preferred next URL; it still has to pass the guard.
+  function redirectAfterLogin(serverPreferredTarget = null) {
     const fromStorage = sessionStorage.getItem('pendingOAuthReturn');
     const fromUrl = new URLSearchParams(window.location.search).get('returnTo');
-    const pending = fromStorage || fromUrl;
-    if (pending) {
-      sessionStorage.removeItem('pendingOAuthReturn');
-      window.location.href = pending;
-    } else {
-      window.location.href = '/dashboard/';
-    }
+    const candidate = serverPreferredTarget || fromStorage || fromUrl;
+    try { sessionStorage.removeItem('pendingOAuthReturn'); } catch (_) { /* storage unavailable */ }
+    try { window.history.replaceState({}, document.title, '/dashboard/'); } catch (_) { /* best-effort */ }
+    const target = isSafeInternalRedirect(candidate) ? candidate : '/dashboard/';
+    window.location.href = target;
   }
 
   if (isAuthenticated) {
@@ -196,11 +195,7 @@ function Login() {
       const masterToken = result?.data?.bootstrap?.masterToken || null;
       if (masterToken) setMasterToken(masterToken);
       if (sessionUser) setUser(sessionUser);
-      const serverReturnTo = result?.data?.pendingReturnTo || null;
-      const clientReturnTo = sessionStorage.getItem('pendingOAuthReturn') || new URLSearchParams(window.location.search).get('returnTo');
-      const pending = serverReturnTo || clientReturnTo;
-      if (pending) { sessionStorage.removeItem('pendingOAuthReturn'); window.location.href = pending; }
-      else { window.location.href = '/dashboard/'; }
+      redirectAfterLogin(result?.data?.pendingReturnTo || null);
     } catch {
       setError('Failed to verify 2FA code. Please try again.');
     } finally {

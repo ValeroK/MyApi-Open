@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **22 / 22 suites, 269 pass / 18 skip, exit 0** (~17 s) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **26 / 26 suites, 351 pass / 18 skip, exit 0** (~15 s) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,116 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-21 (latest)** — M2 Step 4 (T2.1): `deriveSubkey(root, purpose)`
+- **2026-04-21 (latest)** — Frontend open-redirect hardening in
+  `src/public/dashboard-app/src/pages/LogIn.jsx` (folded into the M2
+  wrap-up commit). The mid-session merge from the upstream dashboard
+  rewrite had introduced a same-origin guard regression: four
+  post-authentication sites (`confirm_login` branch, `connected`
+  branch, 2FA challenge handler, and the authenticated-redirect fast
+  path) were assigning `window.location.href = pending` without
+  validating that `pending` was an absolute same-origin path.
+  `pending` was read from `?returnTo=` (attacker-controllable) and
+  re-hydrated from `sessionStorage`, so a phishing link like
+  `/dashboard/login?returnTo=https://evil.example/harvest` could
+  hijack the user after a successful OAuth round-trip.
+  - **Fix.** A new pure helper `isSafeInternalRedirect(target)` accepts
+    only strings that (a) start with a single `/`, (b) are not
+    protocol-relative (`//…` or `/\…`), and (c) contain no control
+    characters. Authoritative copy lives at
+    `src/lib/redirect-safety.js` (CJS, testable by the backend Jest
+    config); a byte-parity ESM mirror at
+    `src/public/dashboard-app/src/utils/redirectSafety.js` is consumed
+    by `LogIn.jsx`.
+  - **Wiring.** All four vulnerable sites now funnel through a single
+    hardened sink — `redirectAfterLogin(serverPreferredTarget?)` —
+    which consults `serverPreferredTarget || sessionStorage ||
+    ?returnTo=` in order and falls back to `/dashboard/` whenever the
+    candidate fails the guard. The three inline `if (pending) { … }
+    else { … }` blocks in the OAuth callback branches and the 2FA
+    handler were deleted and replaced with a single call to this sink,
+    so future edits can't re-introduce the bare-assignment pattern.
+  - **Tests.** 51-assertion behavioural suite
+    `src/tests/redirect-safety.test.js` exercises the algorithm
+    (accept table, non-strings, every common URL scheme,
+    protocol-relative / backslash-smuggled paths, scheme-like strings
+    without a leading slash, and control-character vectors). 10-assertion
+    textual gate `src/tests/login-jsx-redirect-safety.test.js` scans
+    `LogIn.jsx` to assert (a) the import is present, (b) a
+    `redirectAfterLogin` sink exists, (c) no banned symbol-name
+    (`pending`, `pendingReturnTo`, `serverReturnTo`, `clientReturnTo`)
+    is assigned directly to `window.location.href`, and (d) every
+    remaining `window.location.href = …` RHS is either the guarded
+    `target` local or a hardcoded same-origin literal. A second
+    describe block enforces source parity between the CJS
+    authoritative copy and the ESM frontend mirror (four defensive
+    checks must appear in the same order in both files).
+  - Full `npm test --silent` → **26 / 26 suites, 351 pass, 18 skip,
+    exit 0** (was 24 / 290 at end of T2.8; +2 suites, +61 assertions).
+    Lint + typecheck report zero new findings in any changed file.
+- **2026-04-21** — M2 wrap-up (T2.8): docs aligned to
+  "AES-256-GCM everywhere" and to the M2 deletions / gates.
+  - `CLAUDE.md` — the Request-Flow diagram no longer references the
+    deleted `src/brain/brain.js` + `src/vault/vault.js`; the "Key
+    Source Files" table now lists `src/database.js` (not the
+    long-gone `src/config/database.js`), `src/lib/encryption.js`
+    with HKDF `deriveSubkey` called out, and
+    `src/lib/validate-secrets.js`. Added an explicit "Removed in M2
+    (ADR-0013)" paragraph enumerating the six deleted modules and the
+    `crypto-js` drop. The Environment section now documents the
+    boot-time secret gate and lists `SESSION_SECRET` alongside the
+    other three required secrets.
+  - `SECURITY.md` — §"Security Practices" reorganised into
+    Cryptography / Boot-time secret validation / Operational. The
+    cryptography sub-section makes the four M2 guarantees explicit:
+    AES-256-GCM everywhere, HKDF-SHA-256 domain separation (with the
+    frozen purpose whitelist and the RFC 5869 regression test named),
+    no legacy weak-crypto path (with the six deleted modules named
+    and the inventory test named), no default-key fallback (with the
+    T2.4 regression test named). The secrets gate is documented as
+    "runs on every NODE_ENV, fail-closed".
+  - `README.md` — the §"What MyApi stores" table already claimed
+    AES-256-GCM for both `oauth_tokens` and `vault_tokens`; the
+    request-flow diagram now says "database layer
+    (src/database.js)" instead of the deleted "brain/vault"
+    waypoint. A bordered "Boot-time validation" admonition was added
+    below the required-secrets table pointing operators at the gate
+    and explaining why they get a hard exit if any placeholder from
+    `src/.env.example` is left in place. `ENCRYPTION_KEY` /
+    `VAULT_KEY` descriptions bumped from "AES-256" to "AES-256-GCM"
+    for accuracy.
+  - Full `npm test --silent` → **24 / 24 suites, 290 pass, 18 skip,
+    exit 0** (unchanged from end of Step 6; docs-only commit plus
+    the M2 wrap-up log entry below).
+- **2026-04-21** — M2 Step 6 (T2.5): `validateRequiredSecrets()`
+  extracted into the pure helper `src/lib/validate-secrets.js` and
+  now runs fail-closed in every `NODE_ENV`. Blocklist widened to
+  cover every verbatim `src/.env.example` placeholder for the four
+  required secrets in addition to the historical weak literals
+  (`change-me`, `changeme`, `secret`, `password`,
+  `default-vault-key-change-me`). Exports are test-pinned:
+  `REQUIRED_SECRETS` is a frozen array of the four names,
+  `BANNED_DEFAULTS` is a behaviourally-immutable Set (`.add` /
+  `.delete` / `.clear` throw). 14-test suite
+  `src/tests/validate-required-secrets.test.js` locks surface,
+  blocklist contents, every-NODE_ENV behaviour, whitespace handling,
+  multi-violation reporting, and `process.env` plumbing. The T2.4
+  regression gate was updated to track the blocklist's move from
+  inline `src/index.js` into the new helper. Commit `380b9af`.
+- **2026-04-21** — M2 Step 5 (T2.4): four `default-vault-key-change-me`
+  fallback sites in `src/database.js` removed:
+  - `decryptVaultToken` legacy AES-256-CBC path no longer honours
+    `ALLOW_LEGACY_DEFAULT_VAULT_KEY`.
+  - The `LEGACY_DEFAULT_VAULT_KEY` constant is gone.
+  - `getOAuthKeyCandidates()` no longer offers the legacy default as
+    a recovery candidate.
+  - `createKeyVersion()` and `rotateEncryptionKey()` both throw a
+    clear error when the current `VAULT_KEY` is unset; `rotate` also
+    validates its `newVaultKey` argument.
+  New test `src/tests/default-vault-key-removed.test.js` (7 tests,
+  test-first red-first / green-after) provides a textual gate across
+  `src/**/*.js` and behavioural gates against the rewritten
+  functions. Commit `fda13b8`.
+- **2026-04-21** — M2 Step 4 (T2.1): `deriveSubkey(root, purpose)`
   HKDF-SHA-256 primitive added to `src/lib/encryption.js`:
   - **API shape.** `deriveSubkey(root, purpose, opts?)` → `Buffer`.
     `root` is a Buffer or clean even-length hex string (≥ 32 bytes);
@@ -256,16 +365,14 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** M2 — consolidate crypto, **re-scoped to pure deletion** per
-  **ADR-0013**. Steps 1 (inventory + regression test), 2 (deletions +
-  `init-db` rewrite), 3 (nested manifest scrub), and 4 (HKDF
-  `deriveSubkey` primitive) are done. Remaining M2 work:
-  - **T2.4** — delete the `default-vault-key-change-me` fallback in
-    `src/database.js`; add regression tests.
-  - **T2.5** — run `validateRequiredSecrets()` in every `NODE_ENV` (not just
-    production) with an expanded banned-defaults list; add regression tests.
-  - **T2.8** — update `CLAUDE.md`, `SECURITY.md`, `README.md` to state
-    "AES-256-GCM everywhere" truthfully and note the legacy deletion.
+- **Now:** **M2 complete.** All eight in-scope tasks closed (T2.0, T2.1,
+  T2.4, T2.5, T2.7, T2.8, T2.9, T2.10). Three tasks cancelled per
+  ADR-0013 (T2.2, T2.3, T2.6 — the "vault migration" half became
+  dead-code deletion once the subsystem was proven orphan). Net
+  outcome: the weak-crypto path and every silent default-key fallback
+  are gone, the HKDF domain-separation primitive is in place, the
+  boot-time secret gate runs fail-closed in every environment, and
+  the public-facing docs (CLAUDE / SECURITY / README) match the code.
 - **Next:** M3 OAuth state + PKCE hardening (DB-backed `state_tokens`,
   random PKCE verifier, remove Discord bypass).
 - **Blocked / waiting on a human:**

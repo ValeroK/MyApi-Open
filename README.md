@@ -84,7 +84,7 @@ Three-tier: **React dashboard → Express API gateway → SQLite (or PostgreSQL)
 
 ```
 Request → auth middleware → scope validator → RBAC → device approval gate
-        → route handler → brain/vault → database → response
+        → route handler → database layer (src/database.js) → response
 ```
 
 For an agent request to an external service (the hot path), this expands to:
@@ -248,10 +248,21 @@ openssl rand -hex 32
 |---|---|
 | `PORT` | Server port (default: `4500`) |
 | `NODE_ENV` | `development` or `production` |
-| `ENCRYPTION_KEY` | 32-byte hex key — AES-256 encryption for OAuth tokens |
-| `VAULT_KEY` | 32-byte hex key — Token Vault encryption |
+| `ENCRYPTION_KEY` | 32-byte hex key — AES-256-GCM encryption for OAuth tokens |
+| `VAULT_KEY` | 32-byte hex key — AES-256-GCM vault token encryption |
 | `JWT_SECRET` | JWT signing secret |
 | `SESSION_SECRET` | Express session secret |
+
+> **Boot-time validation (every `NODE_ENV`).** MyApi calls
+> `validateRequiredSecrets()` from `src/lib/validate-secrets.js` at
+> startup and **exits with code 1** if any of the four required secrets
+> is missing, whitespace-only, or set to a known-insecure value
+> (`change-me`, `changeme`, `secret`, `password`,
+> `default-vault-key-change-me`, or one of the verbatim placeholders
+> shipped in `src/.env.example` such as
+> `your-vault-key-here-change-in-production`). Regenerate all four with
+> `openssl rand -hex 32` before booting — the gate runs in dev, test,
+> staging, and production identically (see ADR-0013 / T2.5).
 
 ### Functionally Required
 

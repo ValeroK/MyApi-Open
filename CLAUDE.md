@@ -36,7 +36,7 @@ Three-tier: React dashboard → Express API gateway → SQLite database
 
 ### Backend Entry Point: `src/index.js`
 
-Monolithic server file (~2400 lines) that:
+Monolithic server file (~11.4k lines) that:
 - Starts Express on port 4500 with Helmet, CORS, rate limiting
 - Configures OAuth for 45+ services from `config/oauth.json` or env vars (pattern: `${VAR_NAME}` substitution, feature flags `ENABLE_OAUTH_{SERVICE}`)
 - Initializes the DB and runs migrations on startup
@@ -50,32 +50,51 @@ Request → auth middleware (src/middleware/auth.js)
         → scope-validator (src/middleware/scope-validator.js)
         → RBAC (src/middleware/rbac.js)
         → device approval gate (src/middleware/deviceApproval.js)
-        → route handler (src/routes/*.js)
-        → brain/vault for data (src/brain/brain.js, src/vault/vault.js)
-        → database (src/config/database.js)
+        → route handler (inlined in src/index.js, plus files under src/routes/)
+        → database layer (src/database.js)
 ```
 
 **Auth headers**: `Authorization: Bearer {token}` + `X-Workspace-ID: {id}` for multi-tenancy.
 
 ### Token Types
 
-- **Personal tokens**: Full data access, generated on first run (printed to logs)
-- **Guest/scoped tokens**: Read-only, filtered by scope hierarchy (`admin:*` > `services:*` > `services:{name}:read`)
-- Vault tokens are bcrypt-hashed; OAuth tokens are AES-256-GCM encrypted before DB storage
+- **Access tokens** (`access_tokens` table): Master tokens for the owner
+  (`token_type = 'master'`, full scope) and scoped tokens for agents.
+  Stored as `bcrypt` hashes with AES-256-GCM-encrypted raw copies for
+  dashboard display. Created via `createAccessToken()` in
+  `src/database.js`; the CLI seed path is `npm run db:init` → 
+  `src/scripts/init-db.js`, which calls the same function so headless
+  installs produce usable master tokens.
+- **Vault tokens** (`vault_tokens` table): Operator-added third-party API
+  keys (OpenAI, Stripe, …). Stored encrypted with `VAULT_KEY`-derived
+  AES-256-GCM (legacy AES-256-CBC decryption path is retained for
+  backward compatibility and requires the real `VAULT_KEY` — no
+  publicly-known default fallback).
+- **OAuth tokens** (`oauth_tokens` table): Access + refresh tokens from
+  the 45+ providers, AES-256-GCM with scoped `ENCRYPTION_KEY`.
+- Scope hierarchy for access tokens: `admin:*` > `services:*` >
+  `services:{name}:read`.
 
 ### Key Source Files
 
 | File | Purpose |
 |------|---------|
-| `src/config/database.js` | SQLite (better-sqlite3), WAL mode, 50+ tables, all CRUD operations and schema migrations |
-| `src/routes/api.js` | Core identity/preference/connector endpoints; factory pattern: `createApiRoutes(brain, vault, tokenManager, auditLog)` |
-| `src/routes/` | Additional routes: `admin`, `auth`, `services`, `skills`, `vault-instructions`, `workspaces`, `notifications`, `devices`, `email`, `invitations`, `import`, `export` |
-| `src/brain/brain.js` | `PersonalBrain` class — enforces token scope and applies privacy filters on all data responses |
-| `src/gateway/tokens.js` | `TokenManager` — creates, validates, revokes API tokens |
-| `src/gateway/audit.js` | `AuditLog` — writes every API action with IP, scope, and metadata |
-| `src/lib/encryption.js` | AES-256-GCM with PBKDF2 (600k iterations), authenticated encryption, key rotation |
-| `src/lib/context-engine.js` | Context caching and retrieval for AI interactions |
-| `src/lib/knowledge-base.js` | Knowledge base document operations |
+| `src/database.js` | SQLite (better-sqlite3), WAL mode, 50+ tables, all CRUD operations, schema migrations, token creation / OAuth token store / vault token store, key versioning and rotation. |
+| `src/routes/` | Focused route modules: `admin`, `auth`, `services`, `skills`, `vault-instructions`, `workspaces`, `notifications`, `devices`, `email`, `invitations`, `import`, `export`. Most identity / preference / connector endpoints remain inlined in `src/index.js` pending the M6 monolith extraction. |
+| `src/lib/encryption.js` | AES-256-GCM with PBKDF2 (600k iterations), authenticated encryption, key rotation, and (M2 / T2.1) `deriveSubkey(root, purpose)` HKDF-SHA-256 for domain-separated subkeys (`oauth:v1`, `session:v1`, `audit:v1`). |
+| `src/lib/validate-secrets.js` | Boot-time gate for `SESSION_SECRET`, `JWT_SECRET`, `ENCRYPTION_KEY`, `VAULT_KEY`. Pure function; rejects empty / banned defaults (e.g. `change-me`, `default-vault-key-change-me`, and the verbatim `src/.env.example` placeholders) under every `NODE_ENV`. See ADR-0013 / T2.5. |
+| `src/lib/context-engine.js` | Context caching and retrieval for AI interactions. |
+| `src/lib/knowledge-base.js` | Knowledge base document operations. |
+
+**Removed in M2 (ADR-0013)**: `src/utils/encryption.js` (weak `crypto-js`
+module), `src/vault/vault.js`, `src/routes/api.js`,
+`src/routes/management.js`, `src/brain/brain.js`, and
+`src/gateway/tokens.js`. These were unreachable from `src/index.js` and
+have been deleted. `crypto-js` itself is removed from `package.json` and
+the nested `src/package.json`, and is enforced non-resolvable by
+`src/tests/legacy-vault-inventory.test.js`. `src/gateway/audit.js` is
+the lone survivor under `src/gateway/` — still orphaned today, tracked
+for removal outside M2.
 
 ### Database
 
@@ -113,8 +132,20 @@ Test files follow phase-based naming: `integration.test.js`, `phase1-workspaces.
 Copy `src/.env.example` to `src/.env`. Critical variables:
 ```
 PORT=4500
-ENCRYPTION_KEY=<32-char>     # AES-256 OAuth token encryption
-VAULT_KEY=<32-char>          # Vault token encryption
+ENCRYPTION_KEY=<32-char>     # AES-256-GCM OAuth token encryption
+VAULT_KEY=<32-char>          # AES-256-GCM vault token encryption
 JWT_SECRET=<secret>
+SESSION_SECRET=<secret>
 DB_PATH=./data/myapi.db
 ```
+
+`src/index.js` calls `validateRequiredSecrets()` from
+`src/lib/validate-secrets.js` during bootstrap, **in every NODE_ENV**.
+The process exits with code 1 if any of `SESSION_SECRET`,
+`JWT_SECRET`, `ENCRYPTION_KEY`, or `VAULT_KEY` is missing, whitespace,
+or set to a known-insecure value — `change-me`, `changeme`, `secret`,
+`password`, `default-vault-key-change-me`, or one of the verbatim
+placeholders shipped in `src/.env.example` (e.g.
+`your-vault-key-here-change-in-production`). Regenerate all four
+secrets with `openssl rand -hex 32` (or equivalent) before booting, in
+any environment.

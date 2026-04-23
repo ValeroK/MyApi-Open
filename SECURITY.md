@@ -60,7 +60,51 @@ MyApi follows a coordinated vulnerability disclosure model:
 
 ## Security Practices
 
-- AES-256-GCM encryption for all OAuth tokens and sensitive vault data
+### Cryptography
+
+- **AES-256-GCM everywhere.** OAuth tokens, vault tokens, and master
+  access tokens are encrypted with AES-256-GCM (authenticated
+  encryption, random 96-bit nonce per operation, 128-bit auth tag) via
+  `src/lib/encryption.js`. PBKDF2-SHA-256 at 600k iterations is used
+  for password-based key derivation (NIST SP 800-132 compliant).
+- **HKDF-SHA-256 for domain separation** (`src/lib/encryption.js`
+  `deriveSubkey(root, purpose)`, M2 / T2.1). Purposes are a frozen
+  whitelist: `oauth:v1`, `session:v1`, `audit:v1`. Two purposes
+  produce statistically independent subkeys from the same root, so an
+  OAuth-purpose ciphertext cannot be decrypted under the session or
+  audit subkey. Correctness is locked to RFC 5869 Test Case 1 via
+  `src/tests/encryption-deriveSubkey.test.js`.
+- **No legacy weak-crypto path in the codebase.** The previous
+  `crypto-js` AES-without-IV module (`src/utils/encryption.js`) and
+  every module that referenced it (`src/vault/vault.js`,
+  `src/routes/api.js`, `src/routes/management.js`, `src/brain/brain.js`,
+  `src/gateway/tokens.js`) have been deleted (M2 / ADR-0013).
+  `crypto-js` itself is removed from both the root and nested
+  `package.json` files and is enforced non-resolvable by
+  `src/tests/legacy-vault-inventory.test.js`. The regression gate fails
+  the build on any new `require('crypto-js')`.
+- **No default-key fallback.** The legacy
+  `default-vault-key-change-me` fallback that used to appear in four
+  places in `src/database.js` has been removed (M2 / T2.4). Key
+  versioning, OAuth rotation, and vault decryption all fail closed
+  when `VAULT_KEY` is unset rather than silently using a publicly
+  known literal. Enforced by
+  `src/tests/default-vault-key-removed.test.js`.
+
+### Boot-time secret validation
+
+- **Runs on every NODE_ENV.** `src/lib/validate-secrets.js` checks
+  `SESSION_SECRET`, `JWT_SECRET`, `ENCRYPTION_KEY`, and `VAULT_KEY`
+  during bootstrap. The process exits with code 1 if any secret is
+  missing, whitespace-only, or set to a banned default (`change-me`,
+  `changeme`, `secret`, `password`, `default-vault-key-change-me`,
+  and every verbatim placeholder shipped in `src/.env.example`).
+  Previously this gate was production-only and warn-and-continue in
+  other environments; since M2 / T2.5 it is uniformly fatal.
+  Enforced by `src/tests/validate-required-secrets.test.js`.
+
+### Operational
+
 - Bcrypt-hashed passwords (cost factor 10)
 - Immutable append-only audit logs (SOC2 CC7)
 - Idle session timeout (20 min) + absolute session cap (8 h)
