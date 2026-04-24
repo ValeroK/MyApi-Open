@@ -64,6 +64,19 @@ const NotificationService = require('./services/notificationService');
 const NotificationDispatcher = require('./lib/notificationDispatcher');
 const emailService = require('./services/emailService');
 const alerting = require('./lib/alerting');
+// Single source of truth for auth-sensitive rate limit, SOC2 session
+// registry, and TOTP replay protection.  Both this file and
+// `src/routes/auth.js` import from the same module so there is exactly
+// ONE map backing each control (see src/lib/authHardening.js header).
+const {
+  authRateLimit: authRateLimitShared,
+  setSessionStore: setAuthHardeningSessionStore,
+  registerUserSession,
+  unregisterUserSession,
+  revokeAllUserSessions,
+  isTotpCodeUsed,
+  markTotpCodeUsed,
+} = require('./lib/authHardening');
 
 // PERFORMANCE FIX: Token cache to prevent repeated decryption
 // Each decryption is CPU-intensive. Cache for 5 minutes to prevent 502 errors.
@@ -1163,42 +1176,11 @@ if (process.env.NODE_ENV !== 'test' && !process.env.DATABASE_URL) {
   });
 }
 
-// SOC2 CC6 — Concurrent session limits (max 3 per user, oldest invalidated on new login)
-const MAX_SESSIONS_PER_USER = 3;
-// userId -> [{ sessionId, createdAt }]
-const userSessionRegistry = new Map();
-
-function registerUserSession(userId, sessionId) {
-  if (!userSessionRegistry.has(userId)) userSessionRegistry.set(userId, []);
-  const sessions = userSessionRegistry.get(userId);
-  sessions.push({ sessionId, createdAt: Date.now() });
-
-  // Evict oldest sessions that exceed the limit
-  while (sessions.length > MAX_SESSIONS_PER_USER) {
-    const { sessionId: oldSid } = sessions.shift(); // oldest first
-    if (sessionStore && typeof sessionStore.destroy === 'function') {
-      try { sessionStore.destroy(oldSid, () => {}); } catch (_) {}
-    }
-    logger.warn('Session evicted due to concurrent session limit', { userId, evictedSessionId: oldSid });
-  }
-}
-
-function unregisterUserSession(userId, sessionId) {
-  const sessions = userSessionRegistry.get(userId);
-  if (!sessions) return;
-  const idx = sessions.findIndex(s => s.sessionId === sessionId);
-  if (idx !== -1) sessions.splice(idx, 1);
-}
-
-function revokeAllUserSessions(userId) {
-  const sessions = userSessionRegistry.get(userId) || [];
-  for (const { sessionId } of sessions) {
-    if (sessionStore && typeof sessionStore.destroy === 'function') {
-      try { sessionStore.destroy(sessionId, () => {}); } catch (_) {}
-    }
-  }
-  userSessionRegistry.delete(userId);
-}
+// SOC2 CC6 — concurrent session cap, TOTP replay protection, and the
+// shared auth rate-limit live in `src/lib/authHardening.js`.  Wire this
+// module's sessionStore into that shared state so `registerUserSession`
+// can evict the oldest session when the per-user cap is exceeded.
+setAuthHardeningSessionStore(sessionStore);
 
 app.use(session({
   ...(sessionStore ? { store: sessionStore } : {}),
@@ -2170,8 +2152,11 @@ function rateLimit(windowMs = 60000, maxRequests = (process.env.NODE_ENV === 'te
 // IMPORTANT: As requested, rate limiting is scoped ONLY to plan-management features.
 const planFeatureRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 1000 : 30, 'plan-features');
 
-// Security: strict rate limit for auth-sensitive endpoints (5 attempts per minute)
-const authRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 1000 : 5, 'auth-sensitive');
+// Security: strict rate limit for auth-sensitive endpoints (5 attempts per minute).
+// The single source of truth lives in `src/lib/authHardening.js` and is
+// shared with `src/routes/auth.js` — keeping the exported name here so
+// the many inline route handlers below keep referencing `authRateLimit`.
+const authRateLimit = authRateLimitShared;
 
 // BUG-15: Stricter rate limit for 2FA/TOTP attempts (3 attempts per minute to prevent brute force)
 const twoFactorRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 1000 : 3, '2fa-attempts');
@@ -2396,26 +2381,10 @@ function _invalidateCachedToken(rawToken) {
   if (rawToken) _tokenCache.delete(rawToken);
 }
 
-// ── TOTP replay protection (Issue #17) ──────────────────────────────────────
-// Tracks recently used TOTP codes per user to prevent same-code replay attacks.
-// TTL of 90s covers window:2 (±60s) with buffer.
-const usedTotpCodes = new Map(); // key: `${userId}:${code}` → expiresAt
-const TOTP_CODE_TTL_MS = 90_000;
-
-function isTotpCodeUsed(userId, code) {
-  const key = `${userId}:${code}`;
-  const exp = usedTotpCodes.get(key);
-  if (!exp) return false;
-  if (Date.now() > exp) { usedTotpCodes.delete(key); return false; }
-  return true;
-}
-
-function markTotpCodeUsed(userId, code) {
-  const now = Date.now();
-  // Evict expired entries before adding a new one
-  for (const [k, exp] of usedTotpCodes) { if (now > exp) usedTotpCodes.delete(k); }
-  usedTotpCodes.set(`${userId}:${code}`, now + TOTP_CODE_TTL_MS);
-}
+// ── TOTP replay protection (Issue #17) ─────────────────────────────────────
+// `isTotpCodeUsed` / `markTotpCodeUsed` now live in
+// `src/lib/authHardening.js` so password-login, OAuth 2FA-challenge,
+// step-up-auth and every other TOTP gate share ONE replay window.
 
 async function authenticate(req, res, next) {
   // SKIP authentication for public endpoints (OAuth authorize/callback, login signup)

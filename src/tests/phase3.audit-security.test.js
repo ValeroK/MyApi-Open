@@ -21,9 +21,16 @@ describe('Phase 3 Audit/Security', () => {
     const login = await agent.post('/api/v1/auth/login').send({ email, password });
     expect(login.status).toBe(200);
 
+    // NOTE: we intentionally do NOT set workspaceId here.  After F5.1 P1a
+    // the password-login handler populates `req.session.currentWorkspace`
+    // (via `getOrEnsureUserWorkspace`) and the audit-log endpoint scopes
+    // its query to `workspace_id = currentWorkspace OR workspace_id IS NULL`.
+    // A seed row with a hard-coded unrelated workspace (`ws_test`) used to
+    // be visible because the scoping was effectively disabled; now it
+    // would be filtered out.  Leaving `workspaceId` unset keeps this test
+    // focused on session-auth'd audit visibility, not workspace routing.
     createAuditLog({
       requesterId: `sess_${user}`,
-      workspaceId: 'ws_test',
       actorId: user,
       actorType: 'user',
       action: 'phase3_test_action',

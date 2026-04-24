@@ -7,12 +7,32 @@ const logger = require('../utils/logger');
 const express = require('express');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
-const { getAccessTokens, getExistingMasterToken, createAccessToken, db } = require('../database');
+const speakeasy = require('speakeasy');
+const {
+  getAccessTokens,
+  getExistingMasterToken,
+  createAccessToken,
+  db,
+  getUserByEmail,
+  getUserByUsername,
+  getOrEnsureUserWorkspace,
+  createAuditLog,
+} = require('../database');
 const emailService = require('../services/emailService');
+const alerting = require('../lib/alerting');
 
 const { generateCSRFToken, validateCSRFToken } = require('../lib/csrf-protection');
 const { requireBetaSlot } = require('../middleware/betaCap');
 const { invalidateBetaFullCache } = require('../lib/betaMode');
+// F5.1 Phase 1a — single source of truth for SOC2 session registry,
+// TOTP replay protection, and the per-IP auth rate limit.  See
+// `src/lib/authHardening.js` for ownership + lifecycle rationale.
+const {
+  authRateLimit,
+  registerUserSession,
+  isTotpCodeUsed,
+  markTotpCodeUsed,
+} = require('../lib/authHardening');
 
 const router = express.Router();
 
@@ -109,7 +129,7 @@ function regenerateSession(req) {
  * POST /api/v1/auth/token-login
  * Login with master token (for cross-device access)
  */
-router.post('/token-login', requireCsrfForSession, async (req, res) => {
+router.post('/token-login', authRateLimit, requireCsrfForSession, async (req, res) => {
   try {
     const token = req.body?.token;
     if (!token || typeof token !== 'string' || token.length < 16) {
@@ -149,31 +169,102 @@ router.post('/token-login', requireCsrfForSession, async (req, res) => {
 
 /**
  * POST /api/v1/auth/login
- * Login with email and password, returns master token
+ *
+ * Password login with optional TOTP second factor.  Accepts EITHER
+ * `username` OR `email` in the request body — historically the inline
+ * shadow route in `src/index.js:6887` supported both and the dashboard
+ * (plus CLI tools) relied on either form.  If `user.twoFactorEnabled`
+ * is set, a valid `totpCode` is required and the code is marked as
+ * used to close the replay window.  Emits `user_login` on success,
+ * `failed_login` on bad password, `2fa_failed_attempt` on bad TOTP,
+ * and registers the new session with the SOC2 concurrent-session cap.
  */
-router.post('/login', requireCsrfForSession, async (req, res) => {
+router.post('/login', authRateLimit, requireCsrfForSession, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
+    const { email, username, password, totpCode } = req.body || {};
+    if ((!email && !username) || !password) {
+      return res.status(400).json({ error: 'Email (or username) and password required' });
     }
-    
-    const { getUserByEmail } = require('../database');
+
     let user = null;
     try {
-      user = getUserByEmail(email);
+      if (email) {
+        user = getUserByEmail(email);
+      } else if (username) {
+        user = getUserByUsername(username);
+      }
     } catch (e) {
       logger.error('Error fetching user:', e);
-      return res.status(500).json({ error: 'Internal server error', message: 'Service temporarily unavailable' });
+      return res
+        .status(500)
+        .json({ error: 'Internal server error', message: 'Service temporarily unavailable' });
     }
-    
+
+    // Use a generic error string so we do not leak whether the account exists.
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const passwordMatch = await bcrypt.compare(password, user.password_hash || '').catch(() => false);
+    const passwordMatch = await bcrypt
+      .compare(password, user.password_hash || '')
+      .catch(() => false);
     if (!passwordMatch) {
+      try {
+        createAuditLog({
+          requesterId: 'unknown',
+          action: 'failed_login',
+          resource: '/auth/login',
+          scope: 'session',
+          ip: req.ip,
+          details: { username: user.username, reason: 'invalid_credentials' },
+        });
+      } catch (auditErr) {
+        logger.warn('[Auth/Login] failed_login audit emit error', { err: auditErr?.message });
+      }
+      alerting.trackFailedLogin(req.ip);
       return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // 2FA gate — the shadow route in `src/index.js:6915` used to own this
+    // contract but was unreachable once `newAuthRoutes` shadowed the
+    // inline mount.  Restoring it here closes a latent auth-bypass where
+    // a 2FA-enabled account could be signed into with only a password.
+    if (user.twoFactorEnabled) {
+      if (!totpCode) {
+        return res.status(401).json({ error: '2FA code required', requires2FA: true });
+      }
+      const totpKey = String(totpCode).replace(/\s+/g, '');
+      const verified = speakeasy.totp.verify({
+        secret: user.totpSecret,
+        encoding: 'base32',
+        token: totpKey,
+        window: 2,
+      });
+      if (!verified) {
+        try {
+          createAuditLog({
+            requesterId: user.id,
+            action: '2fa_failed_attempt',
+            resource: '/auth/login',
+            scope: 'session',
+            ip: req.ip,
+            details: { reason: 'invalid_code' },
+          });
+        } catch (auditErr) {
+          logger.warn('[Auth/Login] 2fa_failed_attempt audit emit error', {
+            err: auditErr?.message,
+          });
+        }
+        alerting.trackFailedLogin(req.ip);
+        return res.status(401).json({ error: 'Invalid 2FA code', requires2FA: true });
+      }
+      // Replay protection: reject same code twice within its validity window.
+      if (isTotpCodeUsed(user.id, totpKey)) {
+        return res
+          .status(401)
+          .json({ error: '2FA code already used. Wait for the next code.', requires2FA: true });
+      }
+      markTotpCodeUsed(user.id, totpKey);
     }
 
     // Retrieve existing master token — login must NEVER create or revoke master tokens.
@@ -190,17 +281,57 @@ router.post('/login', requireCsrfForSession, async (req, res) => {
     }
 
     await regenerateSession(req);
+
+    let workspaceId = null;
+    try {
+      const workspace = getOrEnsureUserWorkspace(user.id);
+      workspaceId = workspace?.id || null;
+    } catch (wsErr) {
+      // Non-fatal — the dashboard will re-ensure on first write.  Log so
+      // we notice if this starts regressing.
+      logger.warn('[Auth/Login] getOrEnsureUserWorkspace failed', {
+        userId: user.id,
+        err: wsErr?.message,
+      });
+    }
+
     req.session.user = {
       id: user.id,
       email: user.email,
       username: user.username,
       displayName: user.displayName,
+      twoFactorEnabled: Boolean(user.twoFactorEnabled),
     };
     req.session.masterTokenRaw = masterTokenRaw;
     req.session.masterTokenId = masterTokenId;
-    
+    if (workspaceId) req.session.currentWorkspace = workspaceId;
+
     req.session.save((err) => {
       if (err) return res.status(500).json({ error: 'Session error' });
+
+      // SOC2 CC6 — track the new session and evict the oldest if the
+      // per-user concurrent-session cap (3) is exceeded.
+      try {
+        registerUserSession(user.id, req.sessionID);
+      } catch (regErr) {
+        logger.warn('[Auth/Login] registerUserSession failed', {
+          userId: user.id,
+          err: regErr?.message,
+        });
+      }
+
+      try {
+        createAuditLog({
+          requesterId: user.id,
+          action: 'user_login',
+          resource: `/users/${user.id}`,
+          scope: 'session',
+          ip: req.ip,
+        });
+      } catch (auditErr) {
+        logger.warn('[Auth/Login] user_login audit emit error', { err: auditErr?.message });
+      }
+
       res.json({
         success: true,
         userId: user.id,
@@ -210,7 +341,8 @@ router.post('/login', requireCsrfForSession, async (req, res) => {
           email: user.email,
           username: user.username,
           displayName: user.displayName,
-        }
+          twoFactorEnabled: Boolean(user.twoFactorEnabled),
+        },
       });
     });
   } catch (error) {
@@ -226,8 +358,21 @@ router.post('/login', requireCsrfForSession, async (req, res) => {
  * Body: { username, password, email, timezone, display_name }
  * Response: { success: true, data: { token, user: {...}, needsOnboarding: true } }
  */
-router.post('/register', requireCsrfForSession, requireBetaSlot, async (req, res) => {
-  const { username, password, display_name, email, timezone } = req.body || {};
+router.post(
+  '/register',
+  authRateLimit,
+  requireCsrfForSession,
+  requireBetaSlot,
+  async (req, res) => {
+  const {
+    username,
+    password,
+    display_name,
+    email,
+    timezone,
+    accepted_terms_at,
+    accepted_privacy_policy_at,
+  } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   const { isStrongPassword } = require('../utils/passwordUtils');
   if (!isStrongPassword(password)) return res.status(400).json({ error: 'Password must be at least 8 characters and contain 3 of: uppercase, lowercase, number, symbol' });
@@ -240,7 +385,7 @@ router.post('/register', requireCsrfForSession, requireBetaSlot, async (req, res
 
   try {
     const { db } = require('../database');
-    
+
     const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
     if (existing) return res.status(409).json({ error: 'Username already exists' });
 
@@ -248,11 +393,61 @@ router.post('/register', requireCsrfForSession, requireBetaSlot, async (req, res
     const hash = await bcrypt.hash(password, 12);
     const now = new Date().toISOString();
 
-    db.prepare(`INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user')`).run(
-      id, username, hash, display_name || username, email || '', timezone || 'UTC', now
-    );
+    // Detect whether the users table has the GDPR consent columns so we
+    // insert with the richer shape when available and quietly degrade on
+    // pre-migration deployments.  This mirrors `createUser()` in
+    // `src/database.js` so operators on either migration state land in a
+    // consistent audit posture.
+    let hasConsentCols = false;
+    try {
+      const cols = db.prepare('PRAGMA table_info(users)').all();
+      hasConsentCols =
+        cols.some((c) => c.name === 'accepted_terms_at') &&
+        cols.some((c) => c.name === 'accepted_privacy_policy_at');
+    } catch (_) {
+      hasConsentCols = false;
+    }
+
+    const termsAt = accepted_terms_at || now;
+    const privacyAt = accepted_privacy_policy_at || now;
+
+    if (hasConsentCols) {
+      db.prepare(
+        `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles, accepted_terms_at, accepted_privacy_policy_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user', ?, ?)`,
+      ).run(
+        id,
+        username,
+        hash,
+        display_name || username,
+        email || '',
+        timezone || 'UTC',
+        now,
+        termsAt,
+        privacyAt,
+      );
+    } else {
+      db.prepare(
+        `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user')`,
+      ).run(id, username, hash, display_name || username, email || '', timezone || 'UTC', now);
+    }
     invalidateBetaFullCache();
+
+    // Compliance audit — the shadow route in `src/index.js:6876` used to
+    // emit this.  Restoring it here keeps SOC2/GDPR register-event
+    // logging intact after P1b deletes the shadow.
+    try {
+      createAuditLog({
+        requesterId: id,
+        action: 'user_register',
+        resource: `/users/${id}`,
+        scope: 'public',
+        ip: req.ip,
+      });
+    } catch (auditErr) {
+      logger.warn('[Auth/Register] user_register audit emit error', { err: auditErr?.message });
+    }
 
     // Fire-and-forget welcome email (does not block the 201 response)
     if (email) {
