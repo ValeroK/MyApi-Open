@@ -2834,7 +2834,45 @@ async function refreshOAuthToken(serviceName, userId, tokenUrl, clientId, client
     });
 
     if (result.status !== 200 || result.body.error) {
-      return { ok: false, error: result.body.error_description || result.body.error || 'Refresh failed', status: result.status };
+      const providerError = (result.body && result.body.error) || null;
+      const errorDescription = (result.body && result.body.error_description) || providerError || 'Refresh failed';
+
+      // F3 Pass 2: `invalid_grant` means the refresh_token itself is dead —
+      // the user revoked the grant on Google's side, Google rotated the
+      // token, or it was never valid to begin with. Retrying will never
+      // succeed. Null the column so the row transitions to a
+      // "connected-but-needs-reauth" state; the /oauth/status handler +
+      // proxy/execute endpoints use `refreshToken IS NULL && isTokenExpired`
+      // as the sentinel for REAUTH_REQUIRED.
+      //
+      // Other errors (invalid_client = our misconfig; 5xx = transient
+      // provider outage; network errors handled in the catch below) MUST
+      // NOT clear the token — they're retryable and clearing would force
+      // a gratuitous reauth on the user.
+      if (providerError === 'invalid_grant') {
+        try {
+          db.prepare(`
+            UPDATE oauth_tokens
+            SET refresh_token = NULL, updated_at = ?
+            WHERE service_name = ? AND user_id = ?
+          `).run(new Date().toISOString(), serviceName, userId);
+        } catch (clearErr) {
+          // Swallow: if the clear fails we still want the caller to see
+          // the original invalid_grant, and the next refresh attempt will
+          // retry the clear. Logged so operators can notice DB write
+          // failures.
+          console.error('[refreshOAuthToken] failed to clear invalid refresh_token:', clearErr.message);
+        }
+        return {
+          ok: false,
+          error: 'invalid_grant',
+          errorDescription,
+          reauthRequired: true,
+          status: result.status,
+        };
+      }
+
+      return { ok: false, error: errorDescription, status: result.status };
     }
 
     const newAccessToken = result.body.access_token;

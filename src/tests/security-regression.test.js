@@ -599,6 +599,82 @@ describe('[M3 wrap-up] signup-mode stores provider_subject end-to-end', () => {
   });
 });
 
+/**
+ * F3 Pass 2 — `REAUTH_REQUIRED` recovery path tripwires.
+ *
+ * Behavioural coverage for `refreshOAuthToken` on `invalid_grant` lives in
+ * `src/tests/oauth-refresh-invalid-grant.test.js` — that suite stands up a
+ * real DB + a loopback HTTP server and proves the column is cleared.
+ *
+ * This suite is the complementary static-analysis lock: if someone
+ * refactors `src/index.js` and removes the REAUTH_REQUIRED branches from
+ * the proxy + execute handlers (or the `reauth_required` status emission
+ * from /oauth/status), the behavioural tests would still pass on a
+ * non-expired token but silently regress the UX contract we documented
+ * in ADR-0017. These tripwires force any such removal to be deliberate.
+ */
+describe('[F3 Pass 2] REAUTH_REQUIRED envelope + status surface tripwires', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const indexSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'index.js'),
+    'utf8'
+  );
+
+  test('source contains a REAUTH_REQUIRED response envelope', () => {
+    // The proxy + execute handlers both emit this exact code on a dead
+    // grant. Two occurrences is the minimum (one per handler); we allow
+    // more in case the cache-invalidation helper is reused elsewhere.
+    const matches = indexSrc.match(/error:\s*['"]REAUTH_REQUIRED['"]/g) || [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('source invalidates the token cache when emitting REAUTH_REQUIRED', () => {
+    // Without this, a cached dead token would keep proxy/execute returning
+    // stale "connected" responses until the 5-minute TTL expired. See
+    // src/index.js cache helpers.
+    expect(indexSrc).toMatch(/invalidateCachedOAuthToken\(/);
+  });
+
+  test('/oauth/status emits the `reauth_required` state', () => {
+    expect(indexSrc).toMatch(/connectionStatus\s*=\s*['"]reauth_required['"]/);
+  });
+
+  test('refreshOAuthToken detects invalid_grant and nulls refresh_token', () => {
+    // Locking the contract `refreshOAuthToken` → `{reauthRequired: true}`
+    // surfaces on invalid_grant. The behavioural suite proves the full
+    // round-trip; this test just stops someone from silently removing
+    // the branch.
+    const dbSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'database.js'),
+      'utf8'
+    );
+    expect(dbSrc).toMatch(/providerError\s*===\s*['"]invalid_grant['"]/);
+    expect(dbSrc).toMatch(/reauthRequired:\s*true/);
+    expect(dbSrc).toMatch(/SET\s+refresh_token\s*=\s*NULL/);
+  });
+
+  test('google-adapter default prompt is `select_account` (F3 Pass 2 adapter flip)', () => {
+    // Pairs with the behavioural unit test in oauth-security-hardening.test.js
+    // ("GoogleAdapter default getAuthorizationUrl emits prompt=select_account").
+    // The static check here is a tripwire in case someone edits the adapter
+    // and the unit suite is silently skipped.
+    const adapterSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'google-adapter.js'),
+      'utf8'
+    );
+    expect(adapterSrc).toMatch(/prompt:\s*['"]select_account['"]/);
+    // Strip JS comments before checking that `prompt: 'consent'` isn't a
+    // real object property any more. The Pass 2 adapter file intentionally
+    // mentions the old `'consent'` default in a comment explaining the
+    // flip — we don't want that mention to satisfy the tripwire.
+    const stripped = adapterSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*\n/g, '\n');
+    expect(stripped).not.toMatch(/prompt:\s*['"]consent['"]/);
+  });
+});
+
 describe.skip('[M5] SSRF surface (to be added in T5.7)', () => {
   test.todo('proxy rejects http://169.254.169.254/');
   test.todo('proxy rejects http://[::ffff:127.0.0.1]/');

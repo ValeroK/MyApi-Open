@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-24**
+> - Last updated: **2026-04-24** (F3 Pass 2 landed)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **35 / 35 suites, 490 pass / 14 skip, exit 0** (~7 s in Docker; M3 wrap-up added the signup-mode E2E, the `storeOAuthToken` arity static gate, and the three legacy-export-absence gates) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **36 / 37 suites, 504 pass / 20 skip, exit 0** (~22 s in Docker; F3 Pass 2 added the `oauth-refresh-invalid-grant` suite + 2 adapter tests in `oauth-security-hardening` + 5 static tripwires in `security-regression`) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -1132,25 +1132,28 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
   onto an existing local account. The two expired-row tables
   (`oauth_state_tokens` + `oauth_pending_logins`) get pruned
   on a 10-min tick with structured operational logging.
-- **Next (operator-directed, queued for next work session):**
-  **`F3` Pass 2 — finish the OAuth prompt-policy cleanup.** Pass 1
-  landed on `main` (commit `959059c`, 2026-04-24): dropped
-  `max_age=0` from the Google login authorize URL, which was the
-  mechanical cause of "consent every login". Verified via expanded
-  unit coverage in `oauth-security-hardening.test.js` (landing-modal
-  snake_case path, connect-mode default, explicit `forcePrompt=0`),
-  a new `SMOKE_URL`-gated live smoke (`npm run smoke:oauth` →
-  `src/tests/oauth-authorize-url-live-smoke.test.js`) runnable
-  against any deployment, and browser-level verification with
-  Chrome DevTools MCP across all three login entry points. Pass 2
-  (queued): flip `google-adapter.js` default from `prompt:
-  'consent'` → `prompt: 'select_account'` (defence-in-depth;
-  server override wins today, but removes the trap), add
-  `invalid_grant` recovery in `refreshOAuthToken` so a revoked
-  grant self-surfaces a `REAUTH_REQUIRED` error for the dashboard
-  to render as an actionable banner, write `ADR-0017-oauth-prompt-
-  policy.md`. Full brief:
-  `.context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md`.
+- **Just landed (2026-04-24):** **`F3` complete — both passes shipped.**
+  - Pass 1 (commit `959059c`): dropped `max_age=0` from the Google
+    login authorize URL. The mechanical cause of "consent every
+    login" is gone.
+  - Pass 2 (this commit): flipped `google-adapter.js` default from
+    `prompt: 'consent'` → `'select_account'` so connect-mode inherits
+    the same UX; added `invalid_grant` recovery in
+    `refreshOAuthToken` (nulls the dead `refresh_token` column so the
+    row moves to a "reauth_required" state); surfaces
+    `REAUTH_REQUIRED` as a distinct 401 envelope on proxy + execute;
+    `/oauth/status` emits `reauth_required` as a third connection
+    state; `ServiceConnectors.jsx` renders an amber banner + per-card
+    "Reauthorize" CTA. ADR-0017 locks the policy. 12 new passing
+    tests across 4 files (behavioural + static tripwires + live
+    smoke), full Docker regression at 504 pass / 20 skip /
+    36 suites. Brief archived in
+    `.context/tasks/completed/F3-oauth-consent-prompt-once-per-grant.md`.
+- **Next (operator-directed, queued for next work session):** **M4**
+  (session + rate-limit dual-driver store) — see ADR-0002 +
+  `TASKS.md` M4. T4.9 still carries the ADR-0015 Option B follow-up
+  (representationally impossible `access_tokens.owner_id` →
+  `users(id)` FK).
 - **Other backlog (carried from M3 live smoke):**
   - **`F1`** — SPA routes freshly-authenticated users to `/`
     instead of `/dashboard/` after the confirm-gesture click
@@ -1160,10 +1163,7 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
     wrap-up stubbed the missing `onboardingUtils.js` exports as
     localStorage-backed no-ops to unblock the SPA build. Either
     ship the wizard properly or retire it. Bundles with M9.
-- **After `F3`:** pick up **M4** (session + rate-limit
-  dual-driver store) — see ADR-0002 + `TASKS.md` M4. T4.9 still
-  carries the ADR-0015 Option B follow-up (representationally
-  impossible `access_tokens.owner_id` → `users(id)` FK).
+- **After F3/M3 wrap-up:** next-up is **M4** (section above).
 - **Recently closed:** **M3 complete.** All ten tasks (T3.0–T3.9)
   + the wrap-up commit + the live Google smoke. Previous
   milestone **M2** complete: all eight in-scope tasks, three

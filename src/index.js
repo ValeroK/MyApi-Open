@@ -91,6 +91,14 @@ function setCachedOAuthToken(serviceName, userId, token) {
   });
 }
 
+// F3 Pass 2: called when a token is known-bad (invalid_grant, revoked, or
+// refresh returned REAUTH_REQUIRED) so the next read of this {service,user}
+// pair re-hits the DB and picks up the updated row (refresh_token NULL,
+// needs-reauth state).
+function invalidateCachedOAuthToken(serviceName, userId) {
+  tokenCache.delete(`${serviceName}:${userId}`);
+}
+
 // Clear cache every 10 minutes to prevent stale data
 setInterval(() => {
   const now = Date.now();
@@ -204,6 +212,7 @@ const {
   revokeOAuthToken,
   updateOAuthStatus,
   getOAuthStatus,
+  isTokenExpired,
   // `createStateToken` / `validateStateToken` / `cleanupExpiredStateTokens`
   // exported by `./database` are the pre-M3 variants (random state, no
   // PKCE verifier column, naive `expires_at < now` DELETE with no grace
@@ -9182,8 +9191,21 @@ app.get("/api/v1/oauth/status", async (req, res) => {
             setCachedOAuthToken(service, userId, token);
           }
         }
-        // Source of truth: actual token existence, not oauth_status table (which can be stale)
-        connectionStatus = token && !token.revoked_at ? "connected" : "disconnected";
+        // Source of truth: actual token existence, not oauth_status table (which can be stale).
+        //
+        // F3 Pass 2: a token row exists but its refresh_token is NULL AND the
+        // access_token is expired → the grant was revoked (Google returned
+        // invalid_grant on the last refresh and refreshOAuthToken nulled the
+        // dead column). Surface this as `reauth_required` so the dashboard
+        // can render a Reauthorize CTA instead of falsely showing
+        // "connected" for a row that can't make a single API call.
+        if (!token || token.revoked_at) {
+          connectionStatus = 'disconnected';
+        } else if (!token.refreshToken && isTokenExpired(token)) {
+          connectionStatus = 'reauth_required';
+        } else {
+          connectionStatus = 'connected';
+        }
       } catch (err) {
         // Log decryption errors but don't crash
         console.warn(`[OAuth Status] Failed to decrypt token for ${service}:`, err.message);
@@ -9909,16 +9931,37 @@ app.post('/api/v1/services/:serviceName/execute', authenticate, async (req, res)
       return res.status(403).json({ error: `Service '${serviceName}' not connected. Please connect it first.` });
     }
 
-    // Auto-refresh expired OAuth tokens for execute endpoint (parity with /proxy)
+    // Auto-refresh expired OAuth tokens for execute endpoint (parity with /proxy).
+    // F3 Pass 2: distinguish REAUTH_REQUIRED (dead refresh_token — user must
+    // re-authorize) from transient refresh failures (retryable). See ADR-0017.
     if (token && isTokenExpired(token)) {
       const provider = OAUTH_PROVIDER_DETAILS[serviceName];
-      if (provider?.tokenUrl && token.refreshToken) {
+      if (provider?.tokenUrl) {
+        if (!token.refreshToken) {
+          // Token expired, no refresh_token on file → either the provider
+          // never returned one, or `refreshOAuthToken` cleared a dead one
+          // on a prior invalid_grant. Either way, only remediation is
+          // re-auth.
+          invalidateCachedOAuthToken(serviceName, userId);
+          return res.status(401).json({
+            error: 'REAUTH_REQUIRED',
+            service: serviceName,
+            message: `${serviceName} access needs to be re-authorized. The previous grant is no longer valid.`,
+          });
+        }
         const clientId = process.env[`${serviceName.toUpperCase()}_CLIENT_ID`];
         const clientSecret = process.env[`${serviceName.toUpperCase()}_CLIENT_SECRET`];
         if (clientId && clientSecret) {
           const refreshResult = await refreshOAuthToken(serviceName, userId, provider.tokenUrl, clientId, clientSecret);
           if (refreshResult.ok) {
             token = refreshResult.token;
+          } else if (refreshResult.reauthRequired) {
+            invalidateCachedOAuthToken(serviceName, userId);
+            return res.status(401).json({
+              error: 'REAUTH_REQUIRED',
+              service: serviceName,
+              message: `${serviceName} access needs to be re-authorized. The previous grant is no longer valid.`,
+            });
           } else {
             return res.status(401).json({ error: 'Token expired and refresh failed', details: refreshResult.error });
           }
@@ -10028,16 +10071,33 @@ app.post('/api/v1/services/:serviceName/proxy', authenticate, async (req, res) =
       return res.status(403).json({ error: `Service '${serviceName}' not connected. Please connect it first.` });
     }
 
-    // Auto-refresh if expired (OAuth only)
+    // Auto-refresh if expired (OAuth only).
+    // F3 Pass 2: distinguish REAUTH_REQUIRED (dead refresh_token — user must
+    // re-authorize) from transient refresh failures (retryable). See ADR-0017.
     if (authType !== 'api_key' && isTokenExpired(token)) {
       const provider = OAUTH_PROVIDER_DETAILS[serviceName];
-      if (provider && provider.tokenUrl && token.refreshToken) {
+      if (provider && provider.tokenUrl) {
+        if (!token.refreshToken) {
+          invalidateCachedOAuthToken(serviceName, userId);
+          return res.status(401).json({
+            error: 'REAUTH_REQUIRED',
+            service: serviceName,
+            message: `${serviceName} access needs to be re-authorized. The previous grant is no longer valid.`,
+          });
+        }
         const clientId = process.env[`${serviceName.toUpperCase()}_CLIENT_ID`];
         const clientSecret = process.env[`${serviceName.toUpperCase()}_CLIENT_SECRET`];
         if (clientId && clientSecret) {
           const refreshResult = await refreshOAuthToken(serviceName, userId, provider.tokenUrl, clientId, clientSecret);
           if (refreshResult.ok) {
             token = refreshResult.token;
+          } else if (refreshResult.reauthRequired) {
+            invalidateCachedOAuthToken(serviceName, userId);
+            return res.status(401).json({
+              error: 'REAUTH_REQUIRED',
+              service: serviceName,
+              message: `${serviceName} access needs to be re-authorized. The previous grant is no longer valid.`,
+            });
           } else {
             return res.status(401).json({ error: 'Token expired and refresh failed', details: refreshResult.error });
           }

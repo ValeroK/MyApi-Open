@@ -67,12 +67,15 @@ describeIf(`OAuth authorize-URL live smoke @ ${SMOKE_URL}`, () => {
     expect(u.searchParams.get('max_age')).toBeNull();
   });
 
-  test('connect mode (no override) currently falls through to adapter default prompt=consent', async () => {
-    // Documents current behavior. F3 Pass 2 will flip the adapter default to
-    // 'select_account'; this test should flip with it.
+  test('connect mode (no override) emits prompt=select_account via adapter default (F3 Pass 2)', async () => {
+    // Adapter default is `select_account` post-F3-Pass-2. Google itself still
+    // escalates to a consent screen when there is no active grant for this
+    // client+user (fresh grant or post-revocation), which is the correct
+    // threat model. What we're asserting here is MyApi's URL, not Google's
+    // downstream behavior.
     const u = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=connect&json=1');
     expect(u.hostname).toBe('accounts.google.com');
-    expect(u.searchParams.get('prompt')).toBe('consent');
+    expect(u.searchParams.get('prompt')).toBe('select_account');
     expect(u.searchParams.get('max_age')).toBeNull();
   });
 

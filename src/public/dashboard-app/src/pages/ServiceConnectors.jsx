@@ -131,8 +131,8 @@ function ServiceConnectors() {
       const matchesStatus = selectedStatus === 'all'
         || (selectedStatus === 'connected' && s.status === 'connected')
         || (selectedStatus === 'pending' && s.status === 'pending')
-        || (selectedStatus === 'error' && s.status === 'error')
-        || (selectedStatus === 'available' && s.status !== 'connected' && s.status !== 'pending' && s.status !== 'error');
+        || (selectedStatus === 'error' && (s.status === 'error' || s.status === 'reauth_required'))
+        || (selectedStatus === 'available' && s.status !== 'connected' && s.status !== 'pending' && s.status !== 'error' && s.status !== 'reauth_required');
       return matchesSearch && matchesCategory && matchesStatus && s.label;
     });
     // Sort: connected first, then by label
@@ -150,17 +150,26 @@ function ServiceConnectors() {
     { key: 'all', label: 'All', count: services.length },
     { key: 'connected', label: 'Connected', count: services.filter(s => s.status === 'connected').length },
     { key: 'pending', label: 'Pending', count: services.filter(s => s.status === 'pending').length },
-    { key: 'error', label: 'Needs attention', count: services.filter(s => s.status === 'error').length },
-    { key: 'available', label: 'Available', count: services.filter(s => s.status !== 'connected' && s.status !== 'pending' && s.status !== 'error').length },
+    { key: 'error', label: 'Needs attention', count: services.filter(s => s.status === 'error' || s.status === 'reauth_required').length },
+    { key: 'available', label: 'Available', count: services.filter(s => s.status !== 'connected' && s.status !== 'pending' && s.status !== 'error' && s.status !== 'reauth_required').length },
   ];
+
+  // F3 Pass 2: services whose grant was revoked (Google returned
+  // invalid_grant on the last refresh, so refreshOAuthToken nulled the
+  // dead refresh_token). Each of these needs a user-visible "Reauthorize"
+  // CTA — the access_token can't be renewed without a fresh authorize
+  // round-trip. /api/v1/oauth/status surfaces the state as
+  // `status: 'reauth_required'` for these rows.
+  const reauthServices = services.filter(s => s.status === 'reauth_required');
 
   // Status chip renderer
   const StatusChip = ({ status }) => {
     const map = {
-      connected:    { color: 'var(--green)',   bg: 'var(--green-bg)',  label: 'connected' },
-      pending:      { color: 'var(--amber)',    bg: 'color-mix(in srgb, var(--amber) 12%, transparent)', label: 'pending' },
-      error:        { color: 'var(--accent)',   bg: 'var(--accent-bg)', label: 'needs attention' },
-      disconnected: { color: 'var(--ink-3)',    bg: 'transparent',      label: 'not connected' },
+      connected:       { color: 'var(--green)', bg: 'var(--green-bg)',  label: 'connected' },
+      pending:         { color: 'var(--amber)',  bg: 'color-mix(in srgb, var(--amber) 12%, transparent)', label: 'pending' },
+      error:           { color: 'var(--accent)', bg: 'var(--accent-bg)', label: 'needs attention' },
+      reauth_required: { color: 'var(--amber)',  bg: 'color-mix(in srgb, var(--amber) 12%, transparent)', label: 'reauth required' },
+      disconnected:    { color: 'var(--ink-3)',  bg: 'transparent',      label: 'not connected' },
     };
     const s = map[status] || map.disconnected;
     const isOutline = status === 'disconnected';
@@ -219,6 +228,7 @@ function ServiceConnectors() {
     const c = {
       connected: 'var(--green)', active: 'var(--green)',
       pending: 'var(--amber)', error: 'var(--red)', revoked: 'var(--red)',
+      reauth_required: 'var(--amber)',
       disconnected: 'var(--ink-4)',
     }[s] || 'var(--ink-4)';
     return <span className="tick" style={{ background: c }} />;
@@ -230,13 +240,15 @@ function ServiceConnectors() {
     const isConnected = service.status === 'connected';
     const isError = service.status === 'error';
     const isPending = service.status === 'pending';
+    const isReauthRequired = service.status === 'reauth_required';
     const isNotConfigured = service.notConfigured;
 
     const statusMap = {
-      connected:    { chip: 'green',   label: 'connected' },
-      pending:      { chip: 'amber',   label: 'pending auth' },
-      error:        { chip: 'accent',  label: 'needs attention' },
-      disconnected: { chip: 'outline', label: 'not connected' },
+      connected:       { chip: 'green',   label: 'connected' },
+      pending:         { chip: 'amber',   label: 'pending auth' },
+      error:           { chip: 'accent',  label: 'needs attention' },
+      reauth_required: { chip: 'amber',   label: 'reauth required' },
+      disconnected:    { chip: 'outline', label: 'not connected' },
     };
     const st = statusMap[service.status] || statusMap.disconnected;
 
@@ -272,6 +284,11 @@ function ServiceConnectors() {
             <>
               <span className="accent">auth failed</span>
               <button type="button" onClick={() => handleConnect(service)} className="ml-auto btn btn-accent text-[12px] px-2 py-1">Reconnect</button>
+            </>
+          ) : isReauthRequired ? (
+            <>
+              <span style={{ color: 'var(--amber)' }}>access revoked</span>
+              <button type="button" onClick={() => handleConnect(service)} className="ml-auto btn text-[12px] px-2 py-1" style={{ background: 'var(--amber)', color: '#000', borderColor: 'var(--amber)' }}>Reauthorize</button>
             </>
           ) : isPending ? (
             <>
@@ -339,6 +356,36 @@ function ServiceConnectors() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
+        </div>
+      )}
+
+      {/* F3 Pass 2: Reauthorize banner — one or more services have a
+          revoked OAuth grant and can't make any API calls until the user
+          re-authorizes. Rendered in the amber "warning" tone (not red
+          error) because nothing is broken — the user's existing config
+          is fine, they just need to re-confirm the grant with the
+          provider. */}
+      {reauthServices.length > 0 && (
+        <div style={{
+          border: '1px solid color-mix(in srgb, var(--amber) 30%, transparent)',
+          background: 'color-mix(in srgb, var(--amber) 8%, transparent)',
+          borderRadius: '6px', padding: '12px 16px',
+          display: 'flex', alignItems: 'flex-start', gap: '10px',
+        }} role="alert">
+          <svg style={{ width: 15, height: 15, color: 'var(--amber)', flexShrink: 0, marginTop: '1px' }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+          </svg>
+          <div style={{ flex: 1, fontSize: '13px', color: 'var(--amber)' }}>
+            <strong>
+              {reauthServices.length === 1
+                ? `${reauthServices[0].label || reauthServices[0].name} access was revoked`
+                : `${reauthServices.length} services need to be re-authorized`}
+            </strong>
+            <p style={{ margin: '4px 0 0', color: 'var(--ink-2)', lineHeight: 1.5 }}>
+              The stored grant is no longer valid (usually because it was revoked on the provider&apos;s side).
+              {' '}Click <em>Reauthorize</em> on each affected service below to restore agent access.
+            </p>
+          </div>
         </div>
       )}
 

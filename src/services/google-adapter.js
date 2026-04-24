@@ -35,7 +35,26 @@ class GoogleAdapter {
       scope: defaultScope,
       state: state,
       access_type: 'offline',
-      prompt: 'consent', // always force consent screen so Google returns a fresh refresh_token
+      // F3 Pass 2 (2026-04-24): adapter default flipped from `consent` to
+      // `select_account`. The previous default forced the scope-approval
+      // screen on every single authorize — even for returning users whose
+      // grant was still valid — because it asked Google to re-prompt
+      // regardless of state. `select_account` asks Google for an account
+      // picker instead; Google itself will still escalate to a full consent
+      // screen when there's no active grant for this client+user (fresh
+      // grant, revoked grant, or new scopes), which is the correct threat
+      // model.
+      //
+      // Callers that genuinely need forced consent (e.g. an admin tool that
+      // wants to re-read the grant choices) can still pass
+      // `runtimeAuthParams: { prompt: 'consent' }`; the spread below
+      // overrides this default without us re-hardcoding it at the adapter.
+      //
+      // Dead refresh_tokens (Google returns `invalid_grant`) are handled
+      // separately by `refreshOAuthToken` in src/database.js, which nulls
+      // the dead column so the status endpoint can surface REAUTH_REQUIRED.
+      // See ADR-0017 and .context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md.
+      prompt: 'select_account',
       ...(runtimeAuthParams || {}),
     };
     // Filter out null/undefined values to allow runtime overrides to suppress defaults

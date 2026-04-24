@@ -106,25 +106,51 @@ describe('OAuth security hardening', () => {
     expect(authUrl.searchParams.get('max_age')).toBeNull();
   });
 
-  test('google connect mode currently falls through to adapter default prompt=consent (F3 Pass 2 marker)', async () => {
-    // Connect mode (user clicks "Connect Google" from the Services page to add
-    // a service) today emits `prompt=consent` because `google-adapter.js`
-    // defaults `prompt: 'consent'` at the adapter layer and connect-mode
-    // doesn't override it. This test documents the current behavior so any
-    // behavior change is intentional and visible in review.
+  test('google connect mode emits prompt=select_account via adapter default (F3 Pass 2)', async () => {
+    // F3 Pass 2 flipped `google-adapter.js` default from `prompt: 'consent'`
+    // to `prompt: 'select_account'`. Connect mode (user clicks "Connect
+    // Google" from the Services page) doesn't set any runtime prompt
+    // override, so it falls through to the adapter default. Before Pass 2
+    // this was `consent` on every single connect click; after Pass 2 it's
+    // `select_account`, which gives the user an account picker instead of
+    // a full scope-approval screen. The consent screen still appears
+    // naturally when Google has no existing grant for this client+user
+    // (the correct threat model — fresh grant or revoked grant needs
+    // explicit scope approval).
     //
-    // F3 Pass 2 plans to flip the adapter default from 'consent' to
-    // 'select_account' as code-hygiene (defense-in-depth: the adapter should
-    // not be the most aggressive option by default). When that lands, this
-    // test should be updated to expect 'select_account' or null.
+    // The `invalid_grant` recovery path (F3 Pass 2 Item B, `refreshOAuthToken`
+    // nulling the dead refresh_token) is the OTHER way consent legitimately
+    // re-surfaces: after a grant revocation on Google's side, the next
+    // re-authorize attempt will see `prompt=select_account` from us but
+    // Google itself will escalate to consent because it has no active grant.
     const res = await request(app)
       .get('/api/v1/oauth/authorize/google?mode=connect&json=1');
 
     expect(res.status).toBe(200);
     const authUrl = new URL(res.body.authUrl);
     expect(authUrl.hostname).toBe('accounts.google.com');
-    expect(authUrl.searchParams.get('prompt')).toBe('consent');
+    expect(authUrl.searchParams.get('prompt')).toBe('select_account');
     expect(authUrl.searchParams.get('max_age')).toBeNull();
+  });
+
+  test('GoogleAdapter default getAuthorizationUrl emits prompt=select_account (F3 Pass 2, defence-in-depth)', () => {
+    // Direct unit test against the adapter (not via HTTP). The server-side
+    // override in `src/index.js` translates login-mode `forcePrompt=1` to
+    // `prompt=select_account` today, so a stray code path that calls the
+    // adapter without going through the authorize handler would previously
+    // have silently forced `prompt=consent`. Making `select_account` the
+    // adapter default closes that trap — the adapter is now safe-by-default
+    // and the server override is policy, not rescue.
+    const GoogleAdapter = require('../services/google-adapter');
+    const adapter = new GoogleAdapter({
+      clientId: 'test-id',
+      clientSecret: 'test-secret',
+      redirectUri: 'http://localhost:4500/cb',
+    });
+    const url = new URL(adapter.getAuthorizationUrl('some-state', {}));
+    expect(url.searchParams.get('prompt')).toBe('select_account');
+    expect(url.searchParams.get('max_age')).toBeNull();
+    expect(url.searchParams.get('access_type')).toBe('offline');
   });
 
   test('facebook login forcePrompt adds reauthenticate hint', async () => {

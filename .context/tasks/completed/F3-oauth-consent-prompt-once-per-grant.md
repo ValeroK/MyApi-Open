@@ -16,12 +16,15 @@
 
 ## Status
 
-- **State.** **Pass 1 landed on main (2026-04-24, commit `959059c`)**;
-  Pass 2 (adapter + recovery + ADR) queued.
+- **State.** **Pass 1 + Pass 2 landed on main (2026-04-24)**. F3 is now
+  ✅ **Complete**. Pass 1 = `959059c` (drop `max_age=0` + unit +
+  live-smoke coverage). Pass 2 = atomic commit shipping the adapter
+  default flip, `invalid_grant` recovery, `REAUTH_REQUIRED` envelope,
+  dashboard banner, and ADR-0017.
 - **Assignee.** anyone
 - **Started.** 2026-04-24.
 - **Target done.** Same week.
-- **Actually done.** Pass 1 only. Pass 2 pending.
+- **Actually done.** 2026-04-24.
 
 ### Pass 1 (landed 2026-04-24, commit `959059c`)
 
@@ -54,33 +57,55 @@
   all three login entry points (landing modal, React LogIn.jsx, React
   SignUp.jsx) confirmed to emit `prompt=select_account`, no `max_age`.
 
-### Pass 2 (queued — code hygiene + recovery + ADR)
+### Pass 2 (landed 2026-04-24 — code hygiene + recovery + ADR)
 
-- Flip `src/services/google-adapter.js:38` default
-  `prompt: 'consent'` → `prompt: 'select_account'`. Removes the trap
-  where a future code path bypassing the server override would silently
-  force consent. Today the server override wins, so this is pure
-  defence-in-depth.
-- Implement `invalid_grant` recovery in `src/database.js`
-  `refreshOAuthToken`: on Google returning `error === 'invalid_grant'`,
-  delete the stored refresh_token (move the row to a "needs re-auth"
-  state). Distinguish transient errors (5xx, network, `invalid_client`)
-  — those keep the refresh_token and are retryable.
-- Surface `REAUTH_REQUIRED` as a distinct error code on
-  `/api/v1/services/:name/proxy` and `/execute` so the dashboard can
-  render an actionable banner linking the user back to the
-  `?mode=login&forcePrompt=1` authorize URL (Pass-1 semantics, so the
-  new grant gets a proper consent screen — the one legitimate consent
-  surfacing post-Pass-1).
-- `Services.jsx` dashboard page: banner + CTA for
-  `status === 'reauth_required'`.
-- Update the `mode=connect` live-smoke + unit tests when flipping
-  adapter default.
-- New ADR-0017-oauth-prompt-policy.md documenting the policy:
-  **silent pass-through for returning users with valid grants; picker
-  for multi-account explicit login; consent only for new or revoked
-  grants (Google's own decision or our explicit `invalid_grant`
-  recovery)**.
+All four work items landed in one atomic commit:
+
+- **Adapter default flip.** `src/services/google-adapter.js:38` now
+  defaults `prompt: 'select_account'` instead of `'consent'`.
+  Connect-mode (the "Connect Google" button on the Services page) no
+  longer has any path that forces the scope-approval screen by
+  default. Callers that genuinely need forced consent still get it by
+  passing `runtimeAuthParams: { prompt: 'consent' }`.
+- **`invalid_grant` recovery.** `src/database.js` `refreshOAuthToken`
+  now detects `result.body.error === 'invalid_grant'`, nulls the
+  `refresh_token` column for that `(service, user)` pair, and returns
+  `{ ok: false, error: 'invalid_grant', reauthRequired: true }`.
+  Transient errors (5xx, network, `invalid_client`) continue to bubble
+  up and do NOT clear the column — they're retryable.
+- **`REAUTH_REQUIRED` surface.** `src/index.js`:
+  - `/api/v1/services/:name/proxy` + `/execute`: when the stored token
+    is expired AND (`refresh_token` is null OR the refresh returned
+    `reauthRequired: true`), the handler returns
+    `401 { error: 'REAUTH_REQUIRED', service, message }` and
+    invalidates the in-memory token cache.
+  - `/api/v1/oauth/status`: `connectionStatus` now emits
+    `reauth_required` as a third state alongside `connected` and
+    `disconnected`, exactly when the token row exists, isn't revoked,
+    has a null `refresh_token`, and the access_token is expired.
+- **Dashboard banner.**
+  `src/public/dashboard-app/src/pages/ServiceConnectors.jsx` now has
+  first-class `reauth_required` rendering: amber status chip, per-card
+  "Reauthorize" button, and a top-of-page warning banner when any
+  service is in the state.
+- **Tests.** 12 new passing tests across 4 files:
+  - `src/tests/oauth-refresh-invalid-grant.test.js` — 5 behavioural
+    cases against a loopback HTTP mock of the token endpoint.
+  - `src/tests/oauth-security-hardening.test.js` — 2 new: direct
+    adapter unit test + HTTP-level connect-mode expectation flip.
+  - `src/tests/oauth-authorize-url-live-smoke.test.js` — connect-mode
+    live smoke expectation flipped.
+  - `src/tests/security-regression.test.js` — 5 static-analysis
+    tripwires locking the Pass 2 contract against silent refactors.
+- **ADR-0017-oauth-prompt-policy.md** documents the full decision
+  matrix for all three work items.
+- **Regression.** Full Docker jest run: **36 / 37 suites, 504 pass /
+  20 skip, exit 0** (up from 490 at M3 wrap-up; +14 from Pass 1 +
+  Pass 2 combined).
+- **Live smoke.** All 6 authorize-URL live-smoke tests pass against
+  the Pass-2-patched smoke container (`SMOKE_URL=http://localhost:4500
+  npx jest src/tests/oauth-authorize-url-live-smoke.test.js`),
+  including the connect-mode flip.
 
 ## Why (1-paragraph context)
 
@@ -198,9 +223,42 @@ scope upgrade; fresh-device sensitive actions).
   the provider's own cache?". Short; slots between ADR-0014 and ADR-0016.
 - Related session notes: `../sessions/2026-04-24-m3-smoke.md`.
 
-## Outcome (fill in when completing)
+## Outcome (2026-04-24)
 
-- Summary of what actually landed: …
-- Deviation from plan and why: …
-- Follow-ups created (new task IDs): …
-- Lessons learned: …
+- **Summary of what actually landed.** Two-pass delivery.
+  - **Pass 1 (commit `959059c`).** Dropped `max_age=0` from Google
+    login authorize URL; pinned `prompt=select_account` on login-mode
+    with `forcePrompt=1`. Unit + live-smoke coverage. All observed
+    returning-user consent-screen loops eliminated from that
+    parameter.
+  - **Pass 2 (this commit).** Flipped adapter default to
+    `select_account` so `mode=connect` inherits the same UX.
+    Implemented `invalid_grant` recovery in `refreshOAuthToken` (null
+    the dead refresh_token, surface `reauthRequired: true`). Added
+    `REAUTH_REQUIRED` envelope on proxy + execute, `reauth_required`
+    state on `/oauth/status`, amber banner + per-card CTA in the
+    Services page. ADR-0017 locks the policy.
+- **Deviation from plan and why.** None material. Original plan called
+  for "delete unconditional `forcePrompt=1` in LogIn.jsx" — investigation
+  showed the hard-coding was cosmetic (server-side override already did
+  the right thing in login mode), so the actual fix was server-side
+  (Pass 1) + adapter default (Pass 2), not frontend. Plan otherwise
+  followed to the letter.
+- **Follow-ups created.** None required for F3 itself. F1 (SPA routing
+  race) and F2 (onboarding wizard completion) remain separate and
+  untouched.
+- **Lessons learned.**
+  1. `max_age=0` in OAuth URLs is a trap that explicitly forces
+     re-consent even on valid grants — never hard-code it in a login
+     path.
+  2. Google's `invalid_grant` is a terminal state for a stored
+     refresh_token; retrying is wasted bandwidth. Treat it as a signal
+     to null the column and raise a user-visible CTA.
+  3. Adapter defaults are policy. "The server override will save us"
+     is wrong when a single new call site forgets the override. Make
+     the adapter safe-by-default and the server's role becomes
+     enforcement, not rescue.
+  4. A live-smoke test harness (`SMOKE_URL=...`) that runs against a
+     real deployment catches Docker-image-staleness bugs that pure
+     unit tests miss. Worth the ~50ms per assertion for the
+     confidence.
