@@ -133,6 +133,18 @@ const {
   PendingConfirmError,
 } = require('./domain/oauth/pending-confirm');
 
+// M3 / T3.9 — background scheduler that prunes expired rows from
+// oauth_state_tokens + oauth_pending_logins on a recurring tick.
+// Bound near the other setInterval blocks below (see bootstrap()).
+// Supersedes the legacy `cleanupExpiredStateTokens()` path in
+// `src/database.js`, which is simpler and doesn't honour graceSec
+// or used_at-past-grace — left on disk for now so any out-of-tree
+// caller keeps resolving, but no longer invoked from here.
+const {
+  startPruneScheduler: startOAuthPruneScheduler,
+  DEFAULTS: OAUTH_PRUNE_DEFAULTS,
+} = require('./domain/oauth/prune-scheduler');
+
 const {
   db,
   initDatabase,
@@ -192,12 +204,15 @@ const {
   revokeOAuthToken,
   updateOAuthStatus,
   getOAuthStatus,
-  // `createStateToken` / `validateStateToken` exported by `./database`
-  // are the pre-M3 variants (random state, no PKCE verifier column).
-  // After M3 Step 5 they are not imported here — every caller in this
-  // file goes through `src/domain/oauth/state.js`. Left in `database.js`
-  // for now; a later cleanup milestone may retire them.
-  cleanupExpiredStateTokens,
+  // `createStateToken` / `validateStateToken` / `cleanupExpiredStateTokens`
+  // exported by `./database` are the pre-M3 variants (random state, no
+  // PKCE verifier column, naive `expires_at < now` DELETE with no grace
+  // window and no pending-confirm pruning). After M3 Step 5 none of them
+  // is imported here — every caller goes through
+  // `src/domain/oauth/state.js` (authorize + callback) and
+  // `src/domain/oauth/prune-scheduler.js` (T3.9 background scheduler).
+  // Left in `database.js` for now; a later cleanup milestone may retire
+  // them.
   cleanupOldRateLimits,
   createConversation,
   getConversations,
@@ -12608,10 +12623,36 @@ if (process.env.NODE_ENV !== 'test') {
       }
     })();
 
-    // BUG-11: Cleanup expired OAuth state tokens every hour
-    // BUG-10: Also cleanup old rate limit records
+    // M3 / T3.9 — OAuth state + pending-confirm prune scheduler.
+    // Supersedes the ancient BUG-11 `cleanupExpiredStateTokens()` hourly
+    // tick: the domain primitive honours graceSec, cleans up used rows
+    // past grace, AND also drives `oauth_pending_logins` prune in the
+    // same tick. Env-configurable cadence + grace; see prune-scheduler.js.
+    const oauthPruneIntervalMs = (() => {
+      const raw = parseInt(process.env.OAUTH_PRUNE_INTERVAL_MS || '', 10);
+      return Number.isFinite(raw) && raw >= 1000
+        ? raw
+        : OAUTH_PRUNE_DEFAULTS.intervalMs;
+    })();
+    const oauthPruneGraceSec = (() => {
+      const raw = parseInt(process.env.OAUTH_PRUNE_GRACE_SEC || '', 10);
+      return Number.isFinite(raw) && raw >= 0
+        ? raw
+        : OAUTH_PRUNE_DEFAULTS.graceSec;
+    })();
+    startOAuthPruneScheduler({
+      db,
+      intervalMs: oauthPruneIntervalMs,
+      graceSec: oauthPruneGraceSec,
+    });
+    console.log(
+      `✅ OAuth prune scheduled (interval=${oauthPruneIntervalMs}ms, grace=${oauthPruneGraceSec}s)`
+    );
+
+    // BUG-10: Keep rate-limit history bounded. OAuth state-token pruning
+    // used to piggyback on this same tick; that job now lives on its
+    // own schedule above.
     setInterval(() => {
-      cleanupExpiredStateTokens();
       cleanupOldRateLimits(24); // Keep 24 hours of history
     }, 60 * 60 * 1000); // 1 hour
 

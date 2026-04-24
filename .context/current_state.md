@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **34 / 34 suites, 475 pass / 14 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **35 / 35 suites, 485 pass / 14 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,62 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-24 (latest)** — **M3 Step 7 / T3.8 landed: §5.4 OAuth
+- **2026-04-24 (latest)** — **M3 Step 8 / T3.9 landed: OAuth
+  prune scheduler (state + pending-confirm, env-configurable).**
+  Closes M3 at the implementation level; only the M3 wrap-up
+  commit (docs + legacy-export retirement + one live Google
+  smoke) remains. New module `src/domain/oauth/prune-scheduler.js`
+  is a thin composition layer over the two pure primitives shipped
+  earlier (`pruneExpiredStateTokens` T3.2, `pruneExpiredPendingConfirms`
+  T3.7). **Surface:**
+    - `runPruneOnce({ db, now?, graceSec?, logger? })`
+      → `{ prunedState, prunedPending, elapsedMs }`. Synchronous,
+      NEVER throws — independent try/catch around each prune so a
+      failure in one doesn't skip the other; both swallow-and-log
+      via `logger.error`. Ticks with non-zero prunes emit ONE
+      structured `logger.info('pruned expired OAuth rows',
+      { pruned_state, pruned_pending, elapsed_ms })` line;
+      empty ticks are silent at INFO so healthy steady state
+      never spams the log.
+    - `startPruneScheduler({ db, intervalMs?, graceSec?, logger?,
+      timers? })` → `stop()`. Registers via `timers.setInterval`,
+      calls `handle.unref()` when available so an idle scheduler
+      never blocks `process.exit()`. Injected `timers` seam lets
+      the suite test interval wiring without real time passing.
+    - `DEFAULTS = Object.freeze({ intervalMs: 600_000, graceSec:
+      3600 })`. One source of truth shared by tests and the
+      bootstrap.
+  **`src/index.js` bootstrap wiring.** New block near the other
+  `setInterval` sites reads `OAUTH_PRUNE_INTERVAL_MS` (integer
+  ≥ 1000) and `OAUTH_PRUNE_GRACE_SEC` (integer ≥ 0) from env
+  and calls `startOAuthPruneScheduler({ db, intervalMs,
+  graceSec })`. The legacy `cleanupExpiredStateTokens()`
+  invocation from the old BUG-11 hourly tick (naive
+  `DELETE … WHERE expires_at < now`, no grace window, no
+  pending-confirm awareness) is **removed**; its companion
+  `cleanupOldRateLimits(24)` is kept on its own tick. The
+  `cleanupExpiredStateTokens` import is dropped from the
+  `./database` destructure; the primitive is left on disk in
+  `src/database.js` for now so any stray caller keeps resolving
+  (retirement tracked for M3 wrap-up). **Red-first suite**
+  `src/tests/oauth-prune-scheduler.test.js` (10 assertions) filed
+  at 10/10 FAIL (MODULE_NOT_FOUND) → 10/10 green after impl,
+  covering module surface, DEFAULTS shape + frozenness, empty-DB
+  silence, state-side happy path + structured log payload,
+  pending-confirm-side happy path, `graceSec` override (zero-grace
+  prunes where default-grace keeps), fault isolation (one prune
+  throws → scheduler returns the other's count, logs error,
+  does not throw), interval wiring via injected timers,
+  DEFAULTS fallback, and `.unref()` behaviour. **Full Docker
+  regression green:** **35 suites / 485 pass / 14 skip / 0
+  fail** (+1 suite / +10 tests vs T3.8 baseline of 34 / 475 /
+  14 / 0). **M3 is now 10/10 at the implementation level
+  (T3.0–T3.9 complete).** Remaining: the M3 wrap-up commit
+  (`CLAUDE.md` + `SECURITY.md` + `README.md` updates, legacy
+  state-token export retirement, signup/connect-mode
+  `provider_subject` threading, one live Google smoke).
+
+- **2026-04-24** — **M3 Step 7 / T3.8 landed: §5.4 OAuth
   regression matrix in `security-regression.test.js`.** The
   `describe.skip('[M3] OAuth state + PKCE hardening (to be added in
   T3.8)')` placeholder is flipped to a live `describe` with 5 named
@@ -950,29 +1005,35 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 Steps 1–7 landed** (T3.0–T3.8 / 9 of 10). C3
-  ("OAuth state not DB-validated" + the session-fixation variant
-  that rode on top of it) and C6 ("Discord state bypass") from
-  `plan.md` §6.3 are now **fully closed** end-to-end and
-  **locked in the §5.4 regression frame** via the 5 named
-  behavioural tests in `security-regression.test.js`. H1
+- **Now:** **M3 Steps 1–8 landed** (T3.0–T3.9 / 10 of 10 at the
+  implementation level). C3 ("OAuth state not DB-validated" +
+  the session-fixation variant that rode on top of it) and C6
+  ("Discord state bypass") from `plan.md` §6.3 are now **fully
+  closed** end-to-end, **locked in the §5.4 regression frame**
+  via the 5 named behavioural tests in
+  `security-regression.test.js`, and the two expired-row tables
+  (`oauth_state_tokens` + `oauth_pending_logins`) now get pruned
+  on a 10-min tick with structured operational logging. H1
   (deterministic PKCE verifier) remains closed. The OAuth
   callback can no longer set `req.session.user` without a
   user-driven gesture, and the first-seen key
   (`{service, user, provider_subject}`) prevents both
   gesture-fatigue on returning users and silent aliasing of a
   different provider identity onto an existing local account.
-- **Next:** **M3 Step 8 / T3.9** — background scheduler wiring
-  for `pruneExpiredStateTokens` and
-  `pruneExpiredPendingConfirms`. Both primitives are already on
-  disk (shipped with T3.2 and T3.7 respectively), so this step
-  is just the scheduling glue (10-min tick, structured log line
-  with `{pruned_state, pruned_pending}`) plus an
-  `__TEST_pruneOnce` hook for the regression test. After that
-  the M3 wrap-up commit: docs, signup/connect-mode
-  `provider_subject` threading (closes the `COALESCE`-fallback
-  gap documented in ADR-0016), legacy export retirement, and
-  one live smoke on real Google end-to-end.
+- **Next:** **M3 wrap-up commit.** Five work items: (1)
+  `CLAUDE.md` + `SECURITY.md` + `README.md` updated to document
+  the new OAuth state subsystem + confirm gesture + prune
+  scheduler; (2) signup-mode + connect-mode OAuth call sites
+  threaded with `provider_subject` so `storeOAuthToken` is
+  NEVER called with `providerSubject=null` in M4+ (closes the
+  `COALESCE`-fallback gap documented in ADR-0016); (3) retire
+  the legacy `createStateToken` / `validateStateToken` /
+  `cleanupExpiredStateTokens` exports in `src/database.js`
+  (zero callers since T3.9); (4) one live Google OAuth smoke
+  end-to-end (docker:smoke compose file) to exercise the full
+  authorize → callback → confirm-gesture → session flow
+  against a real provider; (5) flip M3 header in `TASKS.md` to
+  `✅ Complete (YYYY-MM-DD)`.
 - **Recently closed:** **M2 complete.** All eight in-scope tasks
   (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
   per ADR-0013 (T2.2, T2.3, T2.6). Plus the M2 wrap-up commit
