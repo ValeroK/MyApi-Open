@@ -95,7 +95,12 @@ describe('[M3 / T3.9] OAuth prune scheduler', () => {
   // runPruneOnce — happy paths
   // ------------------------------------------------------------------
 
-  test('runPruneOnce with an empty DB returns zero counts and is silent at INFO', () => {
+  test('runPruneOnce with an empty DB returns zero counts and logs one heartbeat', () => {
+    // 2026-04-24 F4 hardening: the scheduler now emits one INFO line per
+    // tick regardless of outcome so operators can verify the scheduler
+    // is actually firing during an incident. Zero-row ticks show as
+    // `{ pruned_state: 0, pruned_pending: 0 }`. See prune-scheduler.js
+    // contract block.
     const info = jest.fn();
     const error = jest.fn();
     const result = scheduler.runPruneOnce({
@@ -108,7 +113,12 @@ describe('[M3 / T3.9] OAuth prune scheduler', () => {
       prunedPending: 0,
       elapsedMs: expect.any(Number),
     });
-    expect(info).not.toHaveBeenCalled();
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0][1]).toMatchObject({
+      pruned_state: 0,
+      pruned_pending: 0,
+      elapsed_ms: expect.any(Number),
+    });
     expect(error).not.toHaveBeenCalled();
     expect(result.elapsedMs).toBeGreaterThanOrEqual(0);
   });

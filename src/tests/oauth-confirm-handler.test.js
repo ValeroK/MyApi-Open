@@ -217,23 +217,14 @@ describe('[M3 / T3.7] OAuth confirm handlers', () => {
     expect(res.body.ok).toBe(true);
   });
 
-  test('POST /oauth/confirm (accept) stamps first_confirmed_at on oauth_tokens', async () => {
+  test('POST /oauth/confirm (accept) stamps first_confirmed_at on user_identity_links', async () => {
+    // F4 (ADR-0018): first-seen identity state moved from oauth_tokens to
+    // user_identity_links. The confirm-accept endpoint now writes the
+    // identity-link row (creating if absent) and stamps
+    // first_confirmed_at, without touching oauth_tokens at all for
+    // login-mode confirms.
     const { token, userId, providerSubject, serviceName } =
       seedPendingConfirm();
-    // Seed an oauth_tokens row the way storeOAuthToken would have.
-    db.prepare(
-      `INSERT INTO oauth_tokens
-         (id, service_name, user_id, access_token, provider_subject,
-          first_confirmed_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)`
-    ).run(
-      'oauth_seed_t37_' + crypto.randomBytes(4).toString('hex'),
-      serviceName,
-      userId,
-      'enc-access-token',
-      new Date().toISOString(),
-      new Date().toISOString()
-    );
 
     const res = await request(app)
       .post('/api/v1/oauth/confirm')
@@ -243,10 +234,11 @@ describe('[M3 / T3.7] OAuth confirm handlers', () => {
 
     const row = db
       .prepare(
-        `SELECT provider_subject, first_confirmed_at
-           FROM oauth_tokens WHERE service_name = ? AND user_id = ?`
+        `SELECT provider, provider_subject, first_confirmed_at
+           FROM user_identity_links WHERE provider = ? AND user_id = ?`
       )
       .get(serviceName, userId);
+    expect(row).toBeTruthy();
     expect(row.provider_subject).toBe(providerSubject);
     expect(row.first_confirmed_at).not.toBeNull();
   });

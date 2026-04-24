@@ -91,12 +91,32 @@ function setCachedOAuthToken(serviceName, userId, token) {
   });
 }
 
-// F3 Pass 2: called when a token is known-bad (invalid_grant, revoked, or
-// refresh returned REAUTH_REQUIRED) so the next read of this {service,user}
-// pair re-hits the DB and picks up the updated row (refresh_token NULL,
-// needs-reauth state).
-function invalidateCachedOAuthToken(serviceName, userId) {
-  tokenCache.delete(`${serviceName}:${userId}`);
+// Called whenever a row in oauth_tokens is mutated under our feet so the
+// next read of this {service,user} pair re-hits the DB and picks up the
+// updated state. Originally introduced for F3 Pass 2 (invalid_grant /
+// REAUTH_REQUIRED paths); 2026-04-24 B9/B10 hardening widened the call
+// sites to include connect-mode store and disconnect (see those bug
+// entries in security-regression.test.js).
+//
+// `reason` is a short free-form tag ('disconnect', 'store_after_callback',
+// 'store_after_confirm', 'refresh_invalid_grant', …) captured in the log
+// line so "why is this service showing the wrong status?" incidents are
+// decidable from logs without re-running the flow.
+function invalidateCachedOAuthToken(serviceName, userId, reason) {
+  const cacheKey = `${serviceName}:${userId}`;
+  const had = tokenCache.has(cacheKey);
+  tokenCache.delete(cacheKey);
+  try {
+    logger.info('tokenCache invalidated', {
+      service: serviceName,
+      userId,
+      reason: reason || 'unspecified',
+      had_entry: had,
+    });
+  } catch (_) {
+    // Logger is best-effort — cache invalidation must succeed even if the
+    // logger happens to throw (e.g. during early-boot before logger wired).
+  }
 }
 
 // Clear cache every 10 minutes to prevent stale data
@@ -140,6 +160,15 @@ const {
   recordFirstConfirmation,
   PendingConfirmError,
 } = require('./domain/oauth/pending-confirm');
+
+// F4 (ADR-0018): login-mode OAuth callback writes to user_identity_links
+// (identity-only) instead of oauth_tokens (service grants). The two tables
+// and their lifecycles are intentionally independent so the login-provider
+// account and the service-provider account can differ.
+const {
+  upsertIdentityLink,
+  findUserByProviderSubject,
+} = require('./domain/oauth/identity-links');
 
 // M3 / T3.9 — background scheduler that prunes expired rows from
 // oauth_state_tokens + oauth_pending_logins on a recurring tick.
@@ -500,7 +529,15 @@ const oauthAdapters = {
     authUrl: 'https://www.facebook.com/v19.0/dialog/oauth',
     tokenUrl: 'https://graph.facebook.com/v19.0/oauth/access_token',
     verifyUrl: 'https://graph.facebook.com/me?fields=id,name,email,picture.type(large)',
-    scope: process.env.FACEBOOK_SCOPE || 'email,public_profile',
+    // F4 (ADR-0018): identity vs service scope split. Login-mode sends
+    // `email public_profile` only (identity); connect-mode appends any
+    // service scopes declared via FACEBOOK_SERVICE_SCOPE. The legacy
+    // FACEBOOK_SCOPE env var is honoured as a fallback for operators
+    // upgrading in-place — if set, it's used as the combined-scope value
+    // for connect-mode.
+    identityScope: process.env.FACEBOOK_IDENTITY_SCOPE || 'email public_profile',
+    serviceScope: process.env.FACEBOOK_SERVICE_SCOPE || '',
+    scope: process.env.FACEBOOK_SCOPE || '',
     redirectUri: process.env.FACEBOOK_REDIRECT_URI || oauthConfig.facebook?.redirectUri || `http://localhost:${PORT}/api/v1/oauth/callback/facebook`,
     clientId: process.env.FACEBOOK_CLIENT_ID || oauthConfig.facebook?.clientId,
     clientSecret: process.env.FACEBOOK_CLIENT_SECRET || oauthConfig.facebook?.clientSecret,
@@ -7315,45 +7352,32 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
   req.session.masterTokenId = tokenId;
   req.session.isFirstLogin = true;
 
-  if (pending.oauthToken) {
-    const t = pending.oauthToken;
-    // M3 wrap-up (ADR-0016): thread `provider_subject` through the
-    // signup-completion store. The signup-required redirect in the
-    // callback handler already stashes `providerUserId` on
-    // `req.session.oauth_signup`, so no upstream plumbing is needed
-    // — we just forward it here so `oauth_tokens.provider_subject`
-    // is never NULL after a fresh signup.
-    storeOAuthToken(
-      pending.service,
-      createdUser.id,
-      t.accessToken,
-      t.refreshToken || null,
-      t.expiresAt || null,
-      t.scope || null,
-      pending.providerUserId || null
-    );
-
-    // Signup carries IMPLICIT consent to the OAuth identity: the user
-    // just clicked "Create account with <service>" and filled in a
-    // form. Stamp `first_confirmed_at` so the very next login-mode
-    // callback short-circuits past the confirm-gesture screen instead
-    // of forcing a returning-user gesture immediately after signup.
-    // Best-effort: a failure here only costs the user one extra
-    // gesture screen on their next login.
-    if (pending.providerUserId) {
-      try {
-        recordFirstConfirmation({
-          db,
-          userId: createdUser.id,
-          serviceName: pending.service,
-          providerSubject: pending.providerUserId,
-        });
-      } catch (markerErr) {
-        console.error(
-          '[OAuth Signup] recordFirstConfirmation failed:',
-          markerErr.message
-        );
-      }
+  // F4 (ADR-0018) + choice 3a: signup is identity-only. We no longer
+  // write oauth_tokens at signup — if the user wants to connect the
+  // provider as a proxiable service (Gmail, repo, etc.) they do so
+  // explicitly from the Services page afterwards, with a separate
+  // consent screen for the elevated scopes. This gives us principle-of-
+  // least-authority onboarding AND removes the "full Google consent
+  // screen on every login" friction we tried to fix in F3.
+  //
+  // We do still record the identity link: the signup form was explicit
+  // consent to this OAuth identity, so stamp `first_confirmed_at` so
+  // the user's next login-mode callback short-circuits past the
+  // confirm-gesture screen.
+  if (pending.providerUserId) {
+    try {
+      recordFirstConfirmation({
+        db,
+        userId: createdUser.id,
+        serviceName: pending.service,
+        providerSubject: pending.providerUserId,
+        email: createdUser.email || null,
+      });
+    } catch (markerErr) {
+      console.error(
+        '[OAuth Signup] recordFirstConfirmation failed:',
+        markerErr.message
+      );
     }
   }
 
@@ -8577,7 +8601,12 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
       runtimeAuthParams.code_challenge = stateRow.codeChallenge;
       runtimeAuthParams.code_challenge_method = 'S256';
     }
-    authUrl = adapter.getAuthorizationUrl(state, runtimeAuthParams);
+    // F4 (ADR-0018): thread `{ mode }` so adapters can pick the right
+    // scope set. Login/signup → identity-only; connect → identity+service.
+    // Adapters that don't care about mode (single-purpose service
+    // adapters like Slack/Discord/Twitter) accept and ignore the third
+    // arg per their existing signatures.
+    authUrl = adapter.getAuthorizationUrl(state, runtimeAuthParams, { mode });
   } catch (authError) {
     console.error(`[OAuth] Failed to generate authorization URL for ${service}:`, authError);
     return res.status(500).json({
@@ -8745,6 +8774,19 @@ app.get([
     if (['twitter', 'airtable', 'canva'].includes(service)) {
       runtimeTokenParams.code_verifier = stateMeta.codeVerifier;
     }
+    // Observability timeline (2026-04-24 F4 hardening): one structured
+    // entry line per callback so grepping container logs is enough to
+    // reconstruct "where did this flow die" without correlating
+    // timestamps. Every routing branch below adds its own follow-up
+    // with `routing=<decision>`. Tripwire in security-regression.test.js
+    // enforces the set of routing labels stays complete.
+    logger.info('[OAuth Callback] entry', {
+      service,
+      mode: stateMeta.mode || 'connect',
+      ownerId: stateMeta.ownerId || null,
+      hasCode: !!code,
+    });
+
     console.log(`[OAuth] Exchanging code for token with ${service} adapter...`);
     const tokenData = await adapter.exchangeCodeForToken(code, runtimeTokenParams);
 
@@ -8753,12 +8795,59 @@ app.get([
       ? new Date(Date.now() + tokenData.expiresIn * 1000).toISOString()
       : null;
 
-    updateOAuthStatus(service, "connected");
+    // B7 (2026-04-24 F4 hardening): `updateOAuthStatus(service,"connected")`
+    // used to fire HERE, immediately after `exchangeCodeForToken` resolved.
+    // That's wrong — nothing has been persisted yet (plan-limit check and
+    // storeOAuthToken are still ahead), and if either throws we leave the
+    // `oauth_status` row saying "connected" despite having no token row.
+    // It moved to the success branches below (after `storeOAuthToken` for
+    // connect-mode, after `upsertIdentityLink` for login-mode returning
+    // fast-path). `/api/v1/oauth/status` sources its truth from
+    // `oauth_tokens`, not `oauth_status`, so this is a defense-in-depth
+    // cleanup — but it matters for anything else that reads the table.
 
     let tokenStoredForUser = false;
+    // Hoisted to outer-try scope so the connect-mode branch below (which
+    // stores the provider subject on oauth_tokens for revocation and
+    // future identity-linking) can reference it without triggering a
+    // ReferenceError. Prior to this, `providerUserId` was declared with
+    // `const` inside the login branch only, and the connect branch
+    // blindly referenced it — a silent ReferenceError that surfaced
+    // when connect-mode threw inside the storeOAuthToken call and
+    // bounced the user to the landing page. 2026-04-24 F4 follow-up.
+    let providerUserId = null;
 
-    if ((service === 'google' || service === 'facebook' || service === 'github') && stateMeta.mode === 'login') {
-      const profileResp = await oauthAdapters[service].verifyToken(tokenData.accessToken).catch(() => ({ valid: false, data: {} }));
+    // F4 (ADR-0018): identity providers handle BOTH login-mode AND
+    // signup-mode here. Both are identity flows (no service grant);
+    // the only difference is the SPA page that initiated them, which
+    // is preserved on stateMeta.mode for audit/telemetry. Treat them
+    // identically in the resolution branch below — the existing
+    // "unknown-email → signup_required" routing does the right thing
+    // regardless of which mode the user started from.
+    const isIdentityMode = stateMeta.mode === 'login' || stateMeta.mode === 'signup';
+    if ((service === 'google' || service === 'facebook' || service === 'github') && isIdentityMode) {
+      // B3 (2026-04-24 F4 hardening): verifyToken used to be silently
+      // swallowed with `.catch(() => ({ valid:false, data:{} }))`. A
+      // transient provider outage would then route a VALID returning
+      // user to the signup_required screen with no trace. We still
+      // proceed with empty data (UX unchanged — the signup routing is
+      // still the right safe default when we can't verify identity),
+      // but emit both a console.warn and an audit row so the incident
+      // is greppable afterwards.
+      let profileResp;
+      try {
+        profileResp = await oauthAdapters[service].verifyToken(tokenData.accessToken);
+      } catch (verifyErr) {
+        console.warn(`[OAuth Callback] verifyToken failed for ${service} login:`, verifyErr.message);
+        createAuditLog({
+          requesterId: req.ip,
+          action: "oauth_verify_token_failed",
+          resource: `/oauth/callback/${service}`,
+          ip: req.ip,
+          details: { service, mode: stateMeta.mode, error: verifyErr.message },
+        });
+        profileResp = { valid: false, data: {} };
+      }
       const p = profileResp?.data || {};
 
       let idTokenPayload = {};
@@ -8773,7 +8862,7 @@ app.get([
       }
 
       const email = String(p.email || idTokenPayload.email || '').trim().toLowerCase() || null;
-      const providerUserId = String(
+      providerUserId = String(
         p.id
         || p.sub
         || p.user_id
@@ -8825,6 +8914,11 @@ app.get([
           createdAt: new Date().toISOString(),
         };
 
+        logger.info('[OAuth Callback] routing=signup_required', {
+          service,
+          email: email || null,
+          providerSubject: providerUserId || null,
+        });
         const redirectUrl = `/dashboard/?oauth_service=${service}&oauth_status=signup_required&signup=true`;
         return req.session.save(() => {
           res.redirect(redirectUrl);
@@ -8851,6 +8945,10 @@ app.get([
         if (safeReturnTo && safeReturnTo !== '/dashboard/') {
           req.session.pending_2fa_returnTo = safeReturnTo;
         }
+        logger.info('[OAuth Callback] routing=pending_2fa', {
+          service,
+          userId: appUser.id,
+        });
         console.log(`[OAuth Callback] 2FA required for user: ${appUser.id}, routing to 2FA challenge`);
         return req.session.save((err) => {
           if (err) console.error('[OAuth Callback] Session save error before 2FA redirect:', err);
@@ -8874,23 +8972,39 @@ app.get([
       if (!firstSeen) {
         // Returning user who has already gestured this provider subject
         // for this local account: silently complete the login with NO
-        // gesture screen. We still re-persist the token (refresh rotations,
-        // scope drift, etc.) and keep `provider_subject` in sync.
+        // gesture screen.
+        //
+        // F4 (ADR-0018): login-mode no longer writes oauth_tokens. The
+        // access token returned from this login is an identity-only
+        // grant (scope = `openid email profile`) — it cannot call Gmail
+        // / Calendar / Drive even if we stored it. Instead we refresh
+        // the identity-link's metadata (email, updated_at) so the
+        // dashboard "connected as <email>" display stays current.
+        logger.info('[OAuth Callback] routing=fast_path_returning', {
+          service,
+          userId: appUser.id,
+          providerSubject: providerUserId || null,
+        });
         try {
-          storeOAuthToken(
-            service,
-            appUser.id,
-            tokenData.accessToken,
-            tokenData.refreshToken || null,
-            expiresAt,
-            tokenData.scope || null,
-            providerUserId
-          );
-        } catch (storeErr) {
-          console.error('[OAuth Callback] Failed to refresh OAuth token on returning login:', storeErr.message);
-          // Non-fatal: the access token the user just authenticated with
-          // should still work; the next call through getCachedOAuthToken
-          // will surface the real error if this matters.
+          upsertIdentityLink({
+            db,
+            userId: appUser.id,
+            provider: service,
+            providerSubject: providerUserId,
+            email: appUser.email || email,
+          });
+        } catch (linkErr) {
+          console.error('[OAuth Callback] Failed to refresh identity link on returning login:', linkErr.message);
+          createAuditLog({
+            requesterId: req.ip,
+            action: "identity_link_error",
+            resource: `/oauth/callback/${service}`,
+            ip: req.ip,
+            details: { service, userId: appUser.id, branch: 'returning_fast_path', error: linkErr.message },
+          });
+          // Non-fatal: the link row already exists (otherwise firstSeen
+          // would be true); this UPDATE is metadata polish, not
+          // correctness.
         }
 
         req.session.user = {
@@ -8920,9 +9034,20 @@ app.get([
       }
 
       // First-seen (or subject changed): mint a pending-confirm row and
-      // redirect to the gesture screen. The row carries the token bundle
-      // so the accept endpoint can call storeOAuthToken once the user
-      // clicks "Continue".
+      // redirect to the gesture screen. The confirm endpoint writes the
+      // identity-link first-seen marker once the user clicks "Continue".
+      //
+      // F4 (ADR-0018): login-mode pending-confirm no longer carries
+      // access/refresh tokens in its payload. The token from the
+      // identity authorize call is scope=`openid email profile` — it
+      // cannot call any service API and is discarded after this block.
+      // Fewer secrets sit in `oauth_pending_logins` rows waiting 5
+      // minutes for a user decision.
+      logger.info('[OAuth Callback] routing=first_seen_gesture', {
+        service,
+        userId: appUser.id,
+        providerSubject: providerUserId || null,
+      });
       const { token: confirmToken } = createPendingConfirm({
         db,
         serviceName: service,
@@ -8935,12 +9060,6 @@ app.get([
           displayName: appUser.displayName || name,
           avatarUrl: appUser.avatarUrl || avatarUrl || null,
           hasTwoFa: appUser.twoFactorEnabled,
-          tokenData: {
-            accessToken: tokenData.accessToken,
-            refreshToken: tokenData.refreshToken || null,
-            expiresAt,
-            scope: tokenData.scope || null,
-          },
         },
       });
 
@@ -8955,24 +9074,49 @@ app.get([
     // Never auto-login users in connect mode.
     // If user is unauthenticated, abort to prevent unexpected account restoration.
     if (!oauthOwnerId && stateMeta?.mode === 'connect' && !tokenStoredForUser) {
+      logger.info('[OAuth Callback] routing=login_required_for_connect', { service });
       return res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent('login_required_for_connect')}`);
     }
 
     if (oauthOwnerId && !tokenStoredForUser) {
+      logger.info('[OAuth Callback] routing=connect_mode_store', {
+        service,
+        userId: oauthOwnerId,
+      });
       // Enforce service connection plan limit before storing
       const currentConnections = countConnectedOAuthServices(oauthOwnerId);
       const planCheckReq = { user: req.user || { id: oauthOwnerId }, session: req.session, tokenMeta: req.tokenMeta, headers: req.headers };
       const connLimitErr = enforcePlanLimit(planCheckReq, 'serviceConnections', currentConnections, 1);
       if (connLimitErr) {
         console.warn(`[OAuth Callback] Plan limit reached for user ${oauthOwnerId}: serviceConnections=${currentConnections}`);
+        createAuditLog({
+          requesterId: req.ip,
+          action: "connect_plan_limit_blocked",
+          resource: `/oauth/callback/${service}`,
+          ip: req.ip,
+          details: { service, userId: oauthOwnerId, currentConnections },
+        });
         return res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent('plan_limit_reached')}`);
       }
 
       // M3 wrap-up (ADR-0016): thread `provider_subject` on connect-mode
-      // + non-primary-login-mode stores. `providerUserId` was extracted
-      // from the OAuth adapter's verifyToken() result earlier in this
-      // same handler — same source the login-mode / returning-user
-      // branches already use, so no new plumbing.
+      // + non-primary-login-mode stores. For login-mode, `providerUserId`
+      // was already extracted from verifyToken() in the login branch
+      // above. For connect-mode (login-mode branch was skipped), extract
+      // it here best-effort so the stored oauth_tokens row carries the
+      // stable subject identifier — useful for future revocation /
+      // identity-linking / audit without requiring a re-call to Google.
+      if (!providerUserId && typeof oauthAdapters[service]?.verifyToken === 'function') {
+        try {
+          const profileResp = await oauthAdapters[service].verifyToken(tokenData.accessToken);
+          const p = profileResp?.data || {};
+          providerUserId = String(p.id || p.sub || p.user_id || p.login || '').trim() || null;
+        } catch (verifyErr) {
+          // Non-fatal: we can still store the token without a subject.
+          console.warn(`[OAuth Callback] connect-mode verifyToken failed for ${service}:`, verifyErr.message);
+        }
+      }
+
       const storeResult = storeOAuthToken(
         service,
         oauthOwnerId,
@@ -8983,7 +9127,27 @@ app.get([
         providerUserId || null
       );
       tokenStoredForUser = true;
-      logger.info('[OAuth Callback] token stored', { service });
+      // B10 (2026-04-24 post-F4 hardening): drop any pre-disconnect entry
+      // for this {service,user} from the in-memory token cache so the
+      // dashboard's next `/oauth/status` poll picks up the freshly stored
+      // grant instead of serving a stale "disconnected" (or wrong-scope)
+      // view for up to TOKEN_CACHE_TTL. The disconnect→reconnect cycle
+      // inside a 5-minute window is the realistic case users hit while
+      // debugging a failed grant. See B10 tripwire in
+      // security-regression.test.js.
+      invalidateCachedOAuthToken(service, oauthOwnerId, 'store_after_callback');
+      // B7 (2026-04-24 F4 hardening): flip oauth_status ONLY after the
+      // service grant has actually landed. See the comment block at the
+      // top of the try for rationale.
+      updateOAuthStatus(service, "connected");
+      logger.info('[OAuth Callback] token stored', { service, userId: oauthOwnerId });
+      createAuditLog({
+        requesterId: req.ip,
+        action: "oauth_status_persisted",
+        resource: `/oauth/callback/${service}`,
+        ip: req.ip,
+        details: { service, userId: oauthOwnerId, mode: stateMeta.mode || 'connect' },
+      });
 
       // CRITICAL: Ensure req.session.user is populated for subsequent API calls
       // This is absolutely essential for /api/v1/oauth/status to find the user
@@ -9096,6 +9260,13 @@ app.get([
       res.redirect(redirectUrl);
     });
   } catch (error) {
+    // Loud, always-on diagnostic: silent rejection here caused a 2026-04-24
+    // regression where connect-mode callbacks consumed the state token,
+    // failed in the exchange/store pipeline, and bounced the user to the
+    // landing page with no server-side trace. Keep the full error surfaced
+    // to console AND audit so "not connected" is never mysterious again.
+    console.error(`[OAuth Callback] ❌ caught error for service=${service} mode=${stateMeta?.mode}:`, error?.message);
+    console.error(`[OAuth Callback] stack:`, error?.stack);
     createAuditLog({
       requesterId: req.ip,
       action: "oauth_callback_error",
@@ -9199,7 +9370,14 @@ app.get("/api/v1/oauth/status", async (req, res) => {
         // dead column). Surface this as `reauth_required` so the dashboard
         // can render a Reauthorize CTA instead of falsely showing
         // "connected" for a row that can't make a single API call.
-        if (!token || token.revoked_at) {
+        //
+        // B11 (2026-04-24 post-F4 hardening): dropped the `|| token.revoked_at`
+        // branch — `oauth_tokens` has no `revoked_at` column (disconnect
+        // physically DELETEs the row via revokeOAuthToken), so the
+        // condition was always false and only served to mislead anyone
+        // auditing the code path. The `!token` check handles the "row
+        // deleted" case correctly.
+        if (!token) {
           connectionStatus = 'disconnected';
         } else if (!token.refreshToken && isTokenExpired(token)) {
           connectionStatus = 'reauth_required';
@@ -9331,23 +9509,31 @@ app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
   const providerSubject = payload.providerSubject || null;
   const tokenData = payload.tokenData || {};
 
-  // Persist the OAuth token bundle and stamp the first-seen marker. Both
-  // operations are idempotent — if the user somehow retries the accept
-  // (cookie fight, back button, etc.) the second call would have landed
-  // on a REUSED row above and never gotten here.
-  try {
-    storeOAuthToken(
-      serviceName,
-      userId,
-      tokenData.accessToken,
-      tokenData.refreshToken || null,
-      tokenData.expiresAt || null,
-      tokenData.scope || null,
-      providerSubject
-    );
-  } catch (storeErr) {
-    console.error('[OAuth Confirm] storeOAuthToken failed:', storeErr.message);
-    return res.status(500).json({ error: 'Failed to persist OAuth token' });
+  // F4 (ADR-0018): legacy payloads (rows issued before F4) may still
+  // carry a tokenData bundle; F4 login-mode payloads do not. Honour both:
+  // if tokens are present, persist them (backwards compat during the
+  // brief window while in-flight pre-F4 rows still exist); otherwise
+  // skip straight to the identity-link stamp.
+  if (tokenData && tokenData.accessToken) {
+    try {
+      storeOAuthToken(
+        serviceName,
+        userId,
+        tokenData.accessToken,
+        tokenData.refreshToken || null,
+        tokenData.expiresAt || null,
+        tokenData.scope || null,
+        providerSubject
+      );
+      // B10 (2026-04-24 post-F4 hardening): invalidate the token cache
+      // for this {service,user} so the dashboard's next poll sees the
+      // newly persisted grant, not a stale pre-disconnect entry. See
+      // the mirror comment + tripwire for the OAuth callback path.
+      invalidateCachedOAuthToken(serviceName, userId, 'store_after_confirm');
+    } catch (storeErr) {
+      console.error('[OAuth Confirm] storeOAuthToken failed:', storeErr.message);
+      return res.status(500).json({ error: 'Failed to persist OAuth token' });
+    }
   }
 
   if (providerSubject) {
@@ -9357,6 +9543,7 @@ app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
         userId,
         serviceName,
         providerSubject,
+        email: payload.email || null,
       });
     } catch (markerErr) {
       console.error('[OAuth Confirm] recordFirstConfirmation failed:', markerErr.message);
@@ -9476,6 +9663,16 @@ app.post("/api/v1/oauth/disconnect/:service", authenticate, async (req, res) => 
 
     // Delete token from database (always do this)
     revokeOAuthToken(service, userId);
+
+    // B9 (2026-04-24 post-F4 hardening): invalidate the in-memory token
+    // cache so the next `/oauth/status` read hits the DB and correctly
+    // reports the service as disconnected. Without this, `tokenCache`
+    // continues to serve the pre-disconnect token object for up to
+    // TOKEN_CACHE_TTL (5 min), causing the dashboard to render the
+    // service as still-connected immediately after a successful
+    // disconnect — surfaced by the user as "pressed Disconnect, looks
+    // stuck". See B9 tripwire in security-regression.test.js.
+    invalidateCachedOAuthToken(service, userId, 'disconnect');
 
     // Update OAuth status
     updateOAuthStatus(service, "disconnected");
@@ -9942,7 +10139,7 @@ app.post('/api/v1/services/:serviceName/execute', authenticate, async (req, res)
           // never returned one, or `refreshOAuthToken` cleared a dead one
           // on a prior invalid_grant. Either way, only remediation is
           // re-auth.
-          invalidateCachedOAuthToken(serviceName, userId);
+          invalidateCachedOAuthToken(serviceName, userId, 'reauth_required_no_refresh');
           return res.status(401).json({
             error: 'REAUTH_REQUIRED',
             service: serviceName,
@@ -9956,7 +10153,7 @@ app.post('/api/v1/services/:serviceName/execute', authenticate, async (req, res)
           if (refreshResult.ok) {
             token = refreshResult.token;
           } else if (refreshResult.reauthRequired) {
-            invalidateCachedOAuthToken(serviceName, userId);
+            invalidateCachedOAuthToken(serviceName, userId, 'reauth_required_refresh_failed');
             return res.status(401).json({
               error: 'REAUTH_REQUIRED',
               service: serviceName,
@@ -10078,7 +10275,7 @@ app.post('/api/v1/services/:serviceName/proxy', authenticate, async (req, res) =
       const provider = OAUTH_PROVIDER_DETAILS[serviceName];
       if (provider && provider.tokenUrl) {
         if (!token.refreshToken) {
-          invalidateCachedOAuthToken(serviceName, userId);
+          invalidateCachedOAuthToken(serviceName, userId, 'reauth_required_no_refresh');
           return res.status(401).json({
             error: 'REAUTH_REQUIRED',
             service: serviceName,
@@ -10092,7 +10289,7 @@ app.post('/api/v1/services/:serviceName/proxy', authenticate, async (req, res) =
           if (refreshResult.ok) {
             token = refreshResult.token;
           } else if (refreshResult.reauthRequired) {
-            invalidateCachedOAuthToken(serviceName, userId);
+            invalidateCachedOAuthToken(serviceName, userId, 'reauth_required_refresh_failed');
             return res.status(401).json({
               error: 'REAUTH_REQUIRED',
               service: serviceName,

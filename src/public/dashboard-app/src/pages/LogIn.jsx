@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
-import { handleOAuthCallback } from '../utils/oauth';
+import { handleOAuthCallback, startOAuthFlow } from '../utils/oauth';
 import { AVAILABLE_SERVICES } from '../utils/oauth';
 import BrandLogo from '../components/BrandLogo';
 import { clearAuthArtifacts } from '../utils/authRuntime';
@@ -177,10 +177,20 @@ function Login() {
   const handleOAuthClick = async (serviceId) => {
     setError('');
     clearAuthArtifacts();
-    const mode = (serviceId === 'google' || serviceId === 'facebook' || serviceId === 'github') ? 'login' : 'connect';
-    const forcePrompt = mode === 'login' ? '1' : '0';
-    const params = new URLSearchParams({ mode, forcePrompt, returnTo: '/dashboard/', redirect: '1' });
-    window.location.href = `/api/v1/oauth/authorize/${serviceId}?${params.toString()}`;
+    // B5/B6 (F4 hardening): route through the shared helper so any
+    // defensive addition there (CSRF nonce, telemetry, etc.) applies
+    // uniformly. Identity-capable providers (google/github/facebook)
+    // start in login-mode; everything else starts in connect-mode and
+    // requires the user to be signed in first (but the page gates on
+    // that separately).
+    const mode = (serviceId === 'google' || serviceId === 'facebook' || serviceId === 'github')
+      ? 'login'
+      : 'connect';
+    try {
+      await startOAuthFlow(serviceId, { mode, returnTo: '/dashboard/' });
+    } catch (err) {
+      setError(`Could not start sign-in: ${err.message || 'unknown error'}`);
+    }
   };
 
   // M3 / T3.7 — user pressed "Continue" on the confirm-gesture screen.

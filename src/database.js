@@ -319,6 +319,37 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_oauth_pending_logins_token ON oauth_pending_logins(token);
     CREATE INDEX IF NOT EXISTS idx_oauth_pending_logins_expires ON oauth_pending_logins(expires_at);
 
+    -- F4 (ADR-0018): decouple login-provider identity from service-provider
+    -- tokens. Pre-F4, oauth_tokens.provider_subject + first_confirmed_at
+    -- doubled as both "service token row" AND "login-identity first-seen
+    -- marker", which broke as soon as the login-provider account differed
+    -- from the service-provider account (e.g. log in with personal Gmail,
+    -- connect work Gmail as a service). F4 moves identity into this table;
+    -- oauth_tokens stays for service tokens only and its provider_subject
+    -- column is no longer written on login-mode going forward.
+    --
+    -- Invariants (enforced at the DB):
+    --   * PK (user_id, provider)       — one identity per provider per user.
+    --                                    A subject change triggers ADR-0016
+    --                                    Case B (re-gesture) rather than a
+    --                                    silent overwrite.
+    --   * UNIQUE (provider, subject)   — one MyApi user per provider account.
+    --                                    Prevents account-takeover via a
+    --                                    second MyApi user claiming the
+    --                                    same Google/GitHub/Facebook id.
+    CREATE TABLE IF NOT EXISTS user_identity_links (
+      user_id            TEXT NOT NULL,
+      provider           TEXT NOT NULL,
+      provider_subject   TEXT NOT NULL,
+      email              TEXT,
+      first_confirmed_at TEXT,
+      created_at         TEXT NOT NULL,
+      updated_at         TEXT NOT NULL,
+      PRIMARY KEY (user_id, provider)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identity_links_provider_subject
+      ON user_identity_links (provider, provider_subject);
+
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -840,6 +871,66 @@ function initDatabase() {
   safeMigration("ALTER TABLE oauth_pending_logins ADD COLUMN outcome TEXT");
   safeMigration("ALTER TABLE oauth_tokens ADD COLUMN provider_subject TEXT");
   safeMigration("ALTER TABLE oauth_tokens ADD COLUMN first_confirmed_at TEXT");
+
+  // F4 (ADR-0018): backfill user_identity_links from oauth_tokens' legacy
+  // {provider_subject, first_confirmed_at} columns so existing deployments
+  // keep working across the atomic cutover. After F4 ships, login-mode
+  // callbacks write to user_identity_links and stop writing those columns
+  // on oauth_tokens; connect-mode keeps writing oauth_tokens as before.
+  //
+  // Idempotency: INSERT OR IGNORE + the UNIQUE (provider, provider_subject)
+  // index means repeat runs are safe. If two rows in oauth_tokens ever
+  // claim the same (provider, subject) across different users (should not
+  // happen, but could if a pre-F3 bug slipped through), we keep the first
+  // one; the migration does not attempt to reconcile.
+  //
+  // The backfill runs ONLY for rows with BOTH provider_subject and
+  // first_confirmed_at populated — those are the rows that represent a
+  // real first-seen confirmation. Rows with just access/refresh tokens
+  // (connect-mode grants without an identity gesture) are intentionally
+  // skipped.
+  try {
+    const existingRows = db.prepare(
+      `SELECT user_id, service_name AS provider, provider_subject,
+              first_confirmed_at, created_at, updated_at
+         FROM oauth_tokens
+        WHERE provider_subject IS NOT NULL
+          AND first_confirmed_at IS NOT NULL`
+    ).all();
+    const insert = db.prepare(
+      `INSERT OR IGNORE INTO user_identity_links
+         (user_id, provider, provider_subject, email,
+          first_confirmed_at, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?)`
+    );
+    let copied = 0;
+    for (const r of existingRows) {
+      const result = insert.run(
+        r.user_id,
+        r.provider,
+        r.provider_subject,
+        r.first_confirmed_at,
+        r.created_at,
+        r.updated_at
+      );
+      if (result.changes) copied += 1;
+    }
+    if (copied > 0) {
+      console.log(`[F4 migration] Backfilled ${copied} identity link(s) from oauth_tokens`);
+    }
+  } catch (err) {
+    // Non-fatal: the table was just created, so on a brand-new DB this
+    // pass will insert 0 rows. On upgrade-in-place from a pre-F4 DB, an
+    // error here would block boot; log and continue rather than crash —
+    // the login flow will re-capture identity on the next login anyway.
+    //
+    // Observability (2026-04-24 F4 hardening): we used to log only
+    // `err.message`. A schema-drift bug would strip all context from
+    // the only boot-time diagnostic we had. Log the stack too —
+    // boot-time silent migration failure is the worst class of bug.
+    console.error(`[F4 migration] identity-links backfill skipped: ${err.message}`);
+    if (err.stack) console.error(`[F4 migration] stack:`, err.stack);
+  }
 
   // Encryption key management table
   try {
@@ -2595,34 +2686,22 @@ function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expires
   }
 
   // Upsert: replace existing token for same service+user instead of creating duplicates.
-  // M3 / T3.7: on UPDATE we also keep `provider_subject` in sync and reset
-  // `first_confirmed_at` to NULL whenever the incoming provider_subject
-  // differs from the stored one. That ensures a subsequent login-mode
-  // callback correctly re-gates on the confirm-gesture screen instead of
-  // silently aliasing a DIFFERENT provider account onto a pre-confirmed
-  // row (ADR-0016 Case B). Callers that don't know the provider_subject
-  // (pre-T3.7 callers) pass null — COALESCE keeps the existing value.
-  const existing = db.prepare('SELECT id, provider_subject FROM oauth_tokens WHERE service_name = ? AND user_id = ?').get(serviceName, userId);
+  // F4 (ADR-0018): `provider_subject` on oauth_tokens now identifies which
+  // provider-side account holds the SERVICE grant (which may differ from
+  // the user's login-identity provider account; that's tracked separately
+  // in `user_identity_links`). First-seen confirmation state is no longer
+  // co-mingled with service tokens — the previous "reset first_confirmed_at
+  // on subject change" branch has moved to `src/domain/oauth/identity-links.js`.
+  // Callers that don't know the subject pass null → COALESCE keeps the
+  // stored value.
+  const existing = db.prepare('SELECT id FROM oauth_tokens WHERE service_name = ? AND user_id = ?').get(serviceName, userId);
 
   if (existing) {
-    const providerSubjectChanged =
-      providerSubject !== null &&
-      existing.provider_subject !== null &&
-      existing.provider_subject !== providerSubject;
-
-    if (providerSubjectChanged) {
-      db.prepare(`
-        UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
-                                provider_subject = ?, first_confirmed_at = NULL
-        WHERE service_name = ? AND user_id = ?
-      `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
-    } else {
-      db.prepare(`
-        UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
-                                provider_subject = COALESCE(?, provider_subject)
-        WHERE service_name = ? AND user_id = ?
-      `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
-    }
+    db.prepare(`
+      UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
+                              provider_subject = COALESCE(?, provider_subject)
+      WHERE service_name = ? AND user_id = ?
+    `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
     return { id: existing.id, serviceName, userId, expiresAt, scope, createdAt: now, updated: true };
   }
 

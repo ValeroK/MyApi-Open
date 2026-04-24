@@ -4,6 +4,19 @@ const querystring = require('querystring');
 const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 
+// F4 (ADR-0018): scope separation — identity vs service.
+//
+// Identity scopes are baked into the adapter and NOT env-overridable.
+// `read:user` returns name/avatar/bio; `user:email` returns the verified
+// email set. Together they're the minimal "who is this person" surface
+// for sign-in. They do NOT grant any repo, gist, or org access.
+//
+// Service scopes are env-overridable via GITHUB_SCOPE so operators can
+// widen/narrow the agent surface. Default grants the common automation
+// set (repo + gist + workflow) that most agent use cases require.
+const IDENTITY_SCOPES = 'read:user user:email';
+const DEFAULT_SERVICE_SCOPES = 'repo gist workflow';
+
 class GitHubAdapter {
   constructor(config) {
     this.clientId = config.clientId || process.env.GITHUB_CLIENT_ID;
@@ -18,24 +31,42 @@ class GitHubAdapter {
     );
   }
 
-  getAuthorizationUrl(state, runtimeAuthParams = {}) {
+  /**
+   * @param {string} state
+   * @param {object} [runtimeAuthParams]
+   * @param {object} [options]
+   * @param {'login'|'signup'|'connect'} [options.mode]  F4: scope hint.
+   */
+  getAuthorizationUrl(state, runtimeAuthParams = {}, options = {}) {
+    const mode = options && options.mode;
+    const isIdentityOnly = mode === 'login' || mode === 'signup';
+
+    const serviceScope = process.env.GITHUB_SCOPE || DEFAULT_SERVICE_SCOPES;
+    const scope = isIdentityOnly
+      ? IDENTITY_SCOPES
+      : `${IDENTITY_SCOPES} ${serviceScope}`;
+
     const params = {
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
-      scope: 'user repo gist',
+      scope,
       state: state,
       ...(runtimeAuthParams || {}),
     };
     return `${GITHUB_AUTH_URL}?${querystring.stringify(params)}`;
   }
 
-  async exchangeCodeForToken(code) {
+  // B2 (2026-04-24 F4 hardening): mirror the Google adapter — accept and
+  // spread `runtimeTokenParams` so a future PKCE addition for GitHub
+  // doesn't silently lose its code_verifier.
+  async exchangeCodeForToken(code, runtimeTokenParams = {}) {
     return new Promise((resolve, reject) => {
       const postData = querystring.stringify({
         client_id: this.clientId,
         client_secret: this.clientSecret,
         code: code,
-        redirect_uri: this.redirectUri
+        redirect_uri: this.redirectUri,
+        ...(runtimeTokenParams || {}),
       });
 
       const options = {

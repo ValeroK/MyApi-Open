@@ -79,9 +79,37 @@ describeIf(`OAuth authorize-URL live smoke @ ${SMOKE_URL}`, () => {
     expect(u.searchParams.get('max_age')).toBeNull();
   });
 
-  test('offline access_type is requested for Google (refresh_token guarantee)', async () => {
+  test('offline access_type requested ONLY for connect mode (F4 identity/service split)', async () => {
+    // Post-F4: login mode is identity-only (no long-lived service access
+    // needed), so no refresh token is requested → no access_type=offline.
+    // Connect mode still needs offline access to maintain service tokens
+    // across sessions (gmail/calendar/drive polling, proxy calls).
+    const loginUrl = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=login&forcePrompt=1&json=1');
+    expect(loginUrl.searchParams.get('access_type')).toBeNull();
+
+    const connectUrl = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=connect&json=1');
+    expect(connectUrl.searchParams.get('access_type')).toBe('offline');
+  });
+
+  test('include_granted_scopes ONLY for connect mode (F3 follow-up revised)', async () => {
+    // For login/signup, this flag causes Google to re-render any prior
+    // connect-mode grant on the consent screen (Drive/Calendar/Gmail), even
+    // though we only requested identity scopes. Observed bug 2026-04-24.
+    // For connect mode, it enables incremental authorization against prior
+    // grants — correct behavior.
+    const loginUrl = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=login&forcePrompt=1&json=1');
+    expect(loginUrl.searchParams.get('include_granted_scopes')).toBeNull();
+
+    const connectUrl = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=connect&json=1');
+    expect(connectUrl.searchParams.get('include_granted_scopes')).toBe('true');
+  });
+
+  test('login mode requests ONLY identity scopes (F4 contract)', async () => {
     const u = await fetchAuthUrl('/api/v1/oauth/authorize/google?mode=login&forcePrompt=1&json=1');
-    expect(u.searchParams.get('access_type')).toBe('offline');
+    const scope = u.searchParams.get('scope') || '';
+    expect(scope.split(/\s+/).sort()).toEqual(['email', 'openid', 'profile']);
+    // Explicitly assert no service scopes leaked in.
+    expect(scope).not.toMatch(/gmail|calendar|drive|spreadsheets/);
   });
 
   test('state token is present and of expected length', async () => {

@@ -28,10 +28,11 @@
  *     Synchronous. NEVER throws — a failure in either underlying
  *     prune is swallowed, reported via `logger.error`, and the other
  *     prune still runs. The return value reflects whatever did land.
- *     Emits exactly one `logger.info` line when
- *     `prunedState + prunedPending > 0`; silent at INFO level when
- *     nothing got pruned (so healthy steady state does not spam the
- *     log).
+ *     Emits exactly one `logger.info` line PER TICK ("prune tick
+ *     completed" + counts) so operators can verify the scheduler is
+ *     actually firing. The prior "silent when nothing got pruned"
+ *     design traded observability for noise budget; at default
+ *     intervalMs=600_000 that's ~144 lines/day which is fine.
  *
  *   startPruneScheduler({ db, intervalMs?, graceSec?, logger?, timers? })
  *     → stop(): void
@@ -150,16 +151,21 @@ function runPruneOnce({
 
   const elapsedMs = Date.now() - t0;
 
-  if (prunedState + prunedPending > 0) {
-    try {
-      logger.info('pruned expired OAuth rows', {
-        pruned_state: prunedState,
-        pruned_pending: prunedPending,
-        elapsed_ms: elapsedMs,
-      });
-    } catch (_) {
-      // Logger is best-effort.
-    }
+  // Observability (2026-04-24 F4 hardening): emit a heartbeat line on
+  // EVERY tick, not only when something got pruned. Previously the
+  // scheduler was silent at info level during healthy steady state —
+  // fine for noise budget, dangerous for "is the scheduler even
+  // running?" incidents. 1 line / 10 min (default interval) = ~144
+  // lines per day, well within sane logging budgets, and during an
+  // outage you can immediately confirm the tick is firing.
+  try {
+    logger.info('prune tick completed', {
+      pruned_state: prunedState,
+      pruned_pending: prunedPending,
+      elapsed_ms: elapsedMs,
+    });
+  } catch (_) {
+    // Logger is best-effort.
   }
 
   return { prunedState, prunedPending, elapsedMs };

@@ -48,8 +48,15 @@ const crypto = require('crypto');
  * every caller, we accept the legacy label here and store it verbatim —
  * the callback handler (M3 Step 5) treats `connect` and `link` as
  * equivalent for its redirect-string decisions.
+ *
+ * 2026-04-24 F4 hardening (B5/B6): `signup` joined the list so that
+ * SignUp.jsx can distinguish its authorize call from LogIn.jsx's
+ * authorize call in audit logs. The server-side resolution branch
+ * (src/index.js) treats `login` and `signup` identically — both are
+ * identity-only flows — so adding it here is a label-only change,
+ * not a semantic one. See B5/B6 notes in security-regression.test.js.
  */
-const VALID_MODES = Object.freeze(['login', 'link', 'install', 'connect']);
+const VALID_MODES = Object.freeze(['login', 'signup', 'link', 'install', 'connect']);
 
 /** Symbolic error codes surfaced to HTTP handlers. */
 const CODES = Object.freeze({

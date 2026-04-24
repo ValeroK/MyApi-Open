@@ -1,9 +1,37 @@
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
-import { handleOAuthCallback, AVAILABLE_SERVICES } from '../utils/oauth';
+import { handleOAuthCallback, AVAILABLE_SERVICES, startOAuthFlow } from '../utils/oauth';
 import WaitlistForm from '../components/WaitlistForm';
 import { clearAuthArtifacts } from '../utils/authRuntime';
 import { fetchPublicConfig } from '../utils/publicConfig';
+
+// B4 (2026-04-24 F4 hardening): hand off to LogIn.jsx with an
+// ALLOW-LIST of known callback keys, not the whole query string. A
+// stale `oauth_status=error&error=...` left over in the URL from a
+// prior crash (e.g. the user hit back-button after a failure and then
+// navigated to /dashboard/signup) would otherwise ride along to
+// /dashboard/ and render a phantom error banner. The only keys the
+// server ever emits on an OAuth callback redirect are the ones below;
+// anything else is someone else's query-string.
+const CALLBACK_PARAM_ALLOW_LIST = [
+  'oauth_service',
+  'oauth_status',
+  'token',
+  'mode',
+  'error',
+  'error_description',
+];
+
+function redirectToLoginPreservingQuery(pathname = '/dashboard/') {
+  const incoming = new URLSearchParams(window.location.search || '');
+  const preserved = new URLSearchParams();
+  for (const key of CALLBACK_PARAM_ALLOW_LIST) {
+    const value = incoming.get(key);
+    if (value != null) preserved.append(key, value);
+  }
+  const qs = preserved.toString();
+  window.location.replace(qs ? `${pathname}?${qs}` : pathname);
+}
 
 const OAuthIcons = {
   google: (
@@ -43,9 +71,14 @@ function LogoMark() {
 
 function SignUp() {
   const [error, setError] = useState('');
-  const { setMasterToken, setUser, isAuthenticated } = useAuthStore();
+  const { isAuthenticated } = useAuthStore();
   const [betaFull, setBetaFull] = useState(false);
   const [prefillEmail, setPrefillEmail] = useState('');
+  // While an OAuth callback is being handed off to `/dashboard/` (the
+  // LogIn page), we render a tiny "Completing sign-in…" state so the
+  // user never sees the sign-up buttons flash between the callback
+  // landing and the browser navigation firing.
+  const [handingOff, setHandingOff] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -61,49 +94,90 @@ function SignUp() {
     return () => { cancelled = true; };
   }, []);
 
+  // M3 / T3.7 invariant: the SPA never auto-POSTs /api/v1/oauth/confirm.
+  // The gesture screen lives entirely in `LogIn.jsx`; any callback that
+  // happens to land on /dashboard/signup (e.g. if a tampered `returnTo`
+  // sent us here, or a future refactor ever points the callback at the
+  // signup page) is handed off intact so LogIn.jsx can render the right
+  // screen for the status (gesture / 2FA form / connected-hydrate).
   useEffect(() => {
     const callback = handleOAuthCallback();
     if (!callback) return;
 
-    if (callback.status === 'signup_required') {
-      window.location.replace(`/dashboard/${window.location.search}`);
-    } else if (callback.status === 'confirm_login' || callback.status === 'connected') {
-      const confirmToken = callback.token;
-      const doConfirm = confirmToken
-        ? fetch('/api/v1/oauth/confirm', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'include',
-            body: JSON.stringify({ token: confirmToken }),
-          }).then((r) => (r.ok ? r.json() : null))
-        : Promise.resolve({ ok: true });
-
-      doConfirm
-        .then(() => fetch('/api/v1/auth/me', { credentials: 'include' }).then((r) => (r.ok ? r.json() : null)))
-        .then((sessionUser) => {
-          if (sessionUser?.user) {
-            if (sessionUser.bootstrap?.masterToken) setMasterToken(sessionUser.bootstrap.masterToken);
-            setUser(sessionUser.user);
-          }
-          window.location.replace('/dashboard/');
-        })
-        .catch(() => setError('Failed to complete sign-in. Please try again.'));
-    } else if (callback.error) {
-      setError(`OAuth error: ${callback.error}`);
-      window.history.replaceState({}, document.title, '/dashboard/signup');
+    switch (callback.status) {
+      case 'signup_required':
+        // New-user path (the expected case when a user signs up with
+        // OAuth). `LogIn.jsx` at `/dashboard/` handles step-2 of the
+        // signup flow (profile confirmation + Terms).
+        setHandingOff(true);
+        redirectToLoginPreservingQuery('/dashboard/');
+        return;
+      case 'confirm_login':
+        // Returning-user first-seen gesture. `LogIn.jsx` fetches the
+        // confirm preview and renders the Continue/Cancel screen.
+        setHandingOff(true);
+        redirectToLoginPreservingQuery('/dashboard/');
+        return;
+      case 'pending_2fa':
+        // 2FA-enabled user. `LogIn.jsx` at `/dashboard/login` renders
+        // the authenticator-code form.
+        setHandingOff(true);
+        redirectToLoginPreservingQuery('/dashboard/login');
+        return;
+      case 'connected':
+        // Returning user silently logged in on the server; hydrate the
+        // auth store from /auth/me on the LogIn page so routing + store
+        // stay in one place.
+        setHandingOff(true);
+        redirectToLoginPreservingQuery('/dashboard/');
+        return;
+      default:
+        if (callback.error) {
+          setError(`OAuth error: ${callback.error}`);
+          window.history.replaceState({}, document.title, '/dashboard/signup');
+        }
+        return;
     }
-  }, [setMasterToken, setUser]);
+  }, []);
 
   if (isAuthenticated) {
     window.location.replace('/dashboard/');
     return null;
   }
 
-  const handleOAuthClick = (serviceId) => {
+  if (handingOff) {
+    return (
+      <div className="min-h-screen grid place-items-center" style={{ background: 'var(--bg)', color: 'var(--ink)' }}>
+        <div className="text-center">
+          <div
+            className="mx-auto mb-4"
+            style={{
+              width: 32, height: 32, borderRadius: '50%',
+              border: '2px solid var(--line-2)', borderTopColor: 'var(--accent)',
+              animation: 'spin 0.7s linear infinite',
+            }}
+          />
+          <p className="ink-2" style={{ fontSize: '14px' }}>Completing sign-in…</p>
+        </div>
+      </div>
+    );
+  }
+
+  const handleOAuthClick = async (serviceId) => {
     setError('');
     clearAuthArtifacts();
-    const params = new URLSearchParams({ mode: 'login', forcePrompt: '1', returnTo: '/dashboard/', redirect: '1' });
-    window.location.href = `/api/v1/oauth/authorize/${serviceId}?${params.toString()}`;
+    // B5/B6 (F4 hardening): SignUp.jsx starts signup-mode explicitly
+    // (not login-mode). Server-side routing still sends unknown-email
+    // callers to `oauth_status=signup_required` regardless of mode, so
+    // behaviour is unchanged — but `mode=signup` surfaces in the audit
+    // log + state-token row so "which page did this flow come from" is
+    // decidable without correlating timestamps. forcePrompt defaults
+    // to true for identity flows (see startOAuthFlow).
+    try {
+      await startOAuthFlow(serviceId, { mode: 'signup', returnTo: '/dashboard/' });
+    } catch (err) {
+      setError(`Could not start sign-up: ${err.message || 'unknown error'}`);
+    }
   };
 
   const oauthServices = [AVAILABLE_SERVICES[0], AVAILABLE_SERVICES[1], AVAILABLE_SERVICES[2]].filter(Boolean);

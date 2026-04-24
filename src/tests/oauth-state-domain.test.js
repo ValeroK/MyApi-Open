@@ -202,6 +202,25 @@ describe('[M3 / T3.2 + T3.3] src/domain/oauth/state.js', () => {
     );
   });
 
+  // B5/B6 (2026-04-24 F4 hardening): signup was historically collapsed
+  // into login at authorize-time. Post-F4, SignUp.jsx sends `mode=signup`
+  // through startOAuthFlow so audit rows can distinguish which SPA page
+  // initiated a flow. Regression-lock the positive case here — a revert
+  // of VALID_MODES (dropping 'signup') would surface as a 500 at the
+  // authorize endpoint in production, which we learned the hard way
+  // during browser testing.
+  test('createStateToken accepts mode "signup" and persists it verbatim', () => {
+    const { state } = stateDomain.createStateToken({
+      db,
+      serviceName: 'google',
+      mode: 'signup',
+    });
+    const row = db
+      .prepare('SELECT mode FROM oauth_state_tokens WHERE state_token = ?')
+      .get(state);
+    expect(row.mode).toBe('signup');
+  });
+
   test('createStateToken rejects missing/empty serviceName as INVALID_SERVICE', () => {
     expect(() =>
       stateDomain.createStateToken({ db, serviceName: '', mode: 'login' })

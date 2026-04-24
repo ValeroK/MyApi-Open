@@ -335,93 +335,27 @@ function consumePendingConfirm({
 
 // ---------------------------------------------------------------------------
 // hasConfirmedBefore / recordFirstConfirmation
+//
+// F4 (ADR-0018): these two entry points moved from reading/writing
+// `oauth_tokens.{provider_subject, first_confirmed_at}` to the new
+// `user_identity_links` table. Call-site signatures are preserved —
+// `serviceName` is accepted as an alias for `provider` inside
+// identity-links — so the upgrade is a call-site no-op for the OAuth
+// callback handlers.
+//
+// Why the move: if a user logs in with Google account A and later
+// connects Google account B as a proxiable service, the old design
+// mashed both subjects onto one `oauth_tokens` row and thrashed the
+// gesture screen back and forth. Identity state now has its own table
+// keyed `(user_id, provider)` with a UNIQUE (provider, subject) index;
+// connect-mode `oauth_tokens` writes no longer touch it. See F4 task
+// brief + ADR-0018 for the full story.
 // ---------------------------------------------------------------------------
 
-/**
- * Is this `{service, user, provider_subject}` tuple already known to
- * have been confirmed? Callers (the OAuth callback) use this to decide
- * whether to short-circuit the gesture screen — if the user has
- * previously confirmed THIS provider subject for THIS local account,
- * show-again would be a pointless speed-bump.
- *
- * Keyed on provider_subject per ADR-0016: keying on just (service,
- * user_id) would let an attacker who temporarily gains callback-URL
- * control silently alias a SECOND provider account onto the pre-
- * confirmed row.
- *
- * @param {object} opts
- * @param {import('better-sqlite3').Database} opts.db
- * @param {string} opts.userId
- * @param {string} opts.serviceName
- * @param {string} opts.providerSubject
- * @returns {boolean}
- */
-function hasConfirmedBefore({
-  db,
-  userId,
-  serviceName,
-  providerSubject,
-} = {}) {
-  if (!userId || !serviceName || !providerSubject) {
-    return false;
-  }
-  const row = db
-    .prepare(
-      `SELECT 1
-         FROM oauth_tokens
-        WHERE service_name = ?
-          AND user_id = ?
-          AND provider_subject = ?
-          AND first_confirmed_at IS NOT NULL
-        LIMIT 1`
-    )
-    .get(serviceName, userId, providerSubject);
-  return !!row;
-}
+const identityLinks = require('./identity-links');
 
-/**
- * Stamp the first-seen marker on the `oauth_tokens` row for this
- * `{service, user, provider_subject}` tuple. Idempotent: if the row
- * already has a `first_confirmed_at` for the same provider_subject we
- * leave it alone. If the row exists with a DIFFERENT
- * (or NULL) provider_subject, we OVERWRITE provider_subject *and*
- * (re)set first_confirmed_at to now — the previous subject is no
- * longer the identity on this row.
- *
- * If no `oauth_tokens` row exists for (service, user) this is a no-op
- * (the callback is expected to call `storeOAuthToken` before stamping
- * the marker; this module refuses to invent a token-less oauth_tokens
- * row because there's no access token to store).
- *
- * @param {object} opts
- * @param {import('better-sqlite3').Database} opts.db
- * @param {string} opts.userId
- * @param {string} opts.serviceName
- * @param {string} opts.providerSubject
- * @param {number} [opts.now=Date.now()]
- */
-function recordFirstConfirmation({
-  db,
-  userId,
-  serviceName,
-  providerSubject,
-  now = Date.now(),
-} = {}) {
-  if (!userId || !serviceName || !providerSubject) {
-    return;
-  }
-  const confirmedAt = iso(now);
-  db.prepare(
-    `UPDATE oauth_tokens
-        SET provider_subject = ?,
-            first_confirmed_at = CASE
-              WHEN provider_subject = ? AND first_confirmed_at IS NOT NULL
-                THEN first_confirmed_at
-              ELSE ?
-            END
-      WHERE service_name = ? AND user_id = ?`
-  ).run(providerSubject, providerSubject, confirmedAt, serviceName, userId);
-}
+const hasConfirmedBefore = identityLinks.hasConfirmedBefore;
+const recordFirstConfirmation = identityLinks.recordFirstConfirmation;
 
 // ---------------------------------------------------------------------------
 // pruneExpiredPendingConfirms

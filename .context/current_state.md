@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-24** (F3 Pass 2 landed)
+> - Last updated: **2026-04-25** (F4 — OAuth identity vs service separation landed)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **36 / 37 suites, 504 pass / 20 skip, exit 0** (~22 s in Docker; F3 Pass 2 added the `oauth-refresh-invalid-grant` suite + 2 adapter tests in `oauth-security-hardening` + 5 static tripwires in `security-regression`) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **38 / 38 suites, 539 pass / 14 skip, exit 0** (~6 s locally with `--forceExit`; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,47 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-24 (latest)** — **M3 wrap-up commit landed — M3 is now
+- **2026-04-25 (latest)** — **F4 landed: OAuth identity role separated
+  from service role across Google, GitHub, and Facebook.** Single atomic
+  commit. Motivation: F3 Pass 1 + Pass 2 tried to eliminate Google's
+  per-login consent screen by dropping `max_age=0` and flipping the
+  adapter default to `prompt=select_account`, but both attempts still
+  triggered consent because the *root cause* was scope conflation —
+  every "Sign in with Google" call was requesting Gmail + Calendar +
+  Drive, which Google rightfully treats as sensitive and re-prompts for.
+  Same structural bug existed on GitHub (`repo gist` on every sign-in)
+  and Facebook. F4 fixes this at the architectural layer by splitting
+  each login-capable adapter into `IDENTITY_SCOPES` (baked into the
+  adapter, NOT env-overridable — security primitive) and `SERVICE_SCOPES`
+  (env-overridable via `GOOGLE_SCOPE` / `GITHUB_SCOPE` /
+  `FACEBOOK_SERVICE_SCOPE`). The authorize handler threads a new
+  `{ mode }` argument into `getAuthorizationUrl` so login/signup pick
+  identity-only and connect picks identity + service. Alongside the
+  scope split, F4 introduces a new `user_identity_links` table
+  (`PRIMARY KEY (user_id, provider)` + `UNIQUE (provider,
+  provider_subject)`) that owns identity state separately from
+  `oauth_tokens`, plus a new `src/domain/oauth/identity-links.js`
+  domain module. The login-mode callback branch in `src/index.js` no
+  longer writes `oauth_tokens` — it writes the identity link instead
+  (first-seen marker + returning-user fast path both migrated). Signup
+  flow follows choice 3a (identity-only at signup; user explicitly
+  connects services afterwards). Test baseline jumped to **539
+  passing / 14 skipped / 38 suites, exit 0**. New coverage:
+  `src/tests/oauth-identity-service-separation.test.js` (22 tests:
+  adapter scope matrix across all three providers, identity-link
+  invariants, login/service decoupling) plus 7 static tripwires in
+  `security-regression.test.js`. Two pre-F4 assertions that locked in
+  the old "login writes oauth_tokens" contract were rewritten to the
+  new `user_identity_links` contract. Migration backfills existing
+  rows with populated `(provider_subject, first_confirmed_at)` on
+  `oauth_tokens` into `user_identity_links` so upgrade-in-place is a
+  no-op for returning users. See ADR-0018, F4 task brief, and
+  `.context/tasks/backlog/F5-password-auth-hardening-and-consolidation.md`
+  (filed as a follow-up: the UI has no password inputs today and the
+  backend has three duplicate password-auth route files that need
+  consolidation). Next: M4 (scope + consent per ADR-0014 roadmap).
+
+- **2026-04-24** — **M3 wrap-up commit landed — M3 is now
   ✅ Complete.** Atomic commit ships the four work items that were
   intentionally deferred out of T3.7–T3.9 so they could be batched behind
   one live-smoke run:

@@ -1,49 +1,67 @@
+// B5/B6 (2026-04-24 F4 hardening): single entry point for every
+// "start an OAuth flow" call in the SPA. Previously LogIn.jsx and
+// SignUp.jsx hand-rolled their own URLSearchParams construction while
+// ServiceConnectors.jsx called this helper — the drift meant any
+// defensive addition here (CSRF nonce, telemetry, mode sanitisation)
+// silently skipped identity flows. Every call site routes through here
+// now and the security-regression tripwires enforce it.
+//
+// `options`:
+//   - mode: 'login' | 'signup' | 'connect'   (default: 'connect')
+//   - returnTo: internal path to redirect to after the callback
+//   - forcePrompt: boolean — tells the server to set provider-specific
+//                  "force re-consent" params (e.g. Google
+//                  prompt=select_account, Facebook auth_type=reauthenticate).
+//                  Defaults to true for login/signup and false for connect.
 export function startOAuthFlow(service, options = {}) {
   try {
-    // Validate service parameter
     if (!service || typeof service !== 'string' || service.trim().length === 0) {
       throw new Error(`Invalid service parameter: "${service}"`);
     }
 
-    console.log(`[OAuth] Starting OAuth flow for: ${service}`);
-    console.log(`[OAuth] Options:`, options);
+    const mode = options.mode || 'connect';
+    const isIdentityMode = mode === 'login' || mode === 'signup';
+    const forcePrompt = options.forcePrompt != null
+      ? !!options.forcePrompt
+      : isIdentityMode;
 
-    // Store state in session storage for callback handling
+    console.log(`[OAuth] Starting OAuth flow for: ${service}`, { mode, forcePrompt });
+
     sessionStorage.setItem('oauth_service', service);
-    if (options.mode) sessionStorage.setItem('oauth_mode', options.mode);
+    sessionStorage.setItem('oauth_mode', mode);
     if (options.returnTo) sessionStorage.setItem('oauth_returnTo', options.returnTo);
 
-    // Build query params for the authorize endpoint
     const params = new URLSearchParams();
-    if (options.mode) params.append('mode', options.mode);
-    if (options.forcePrompt != null) params.append('forcePrompt', String(options.forcePrompt));
+    params.append('mode', mode);
+    params.append('forcePrompt', forcePrompt ? '1' : '0');
     if (options.returnTo) params.append('returnTo', options.returnTo);
-    
-    // CRITICAL FIX: Pass masterToken from localStorage to authenticate the OAuth flow
-    // This ensures the ownerId is captured in the state metadata
-    const masterToken = localStorage.getItem('masterToken');
-    if (masterToken) {
-      params.append('token', masterToken);
-      console.log(`[OAuth] Injecting masterToken from localStorage`);
-    } else {
-      console.warn(`[OAuth] No masterToken found in localStorage! OAuth flow may fail.`);
+
+    // Connect-mode MUST bind the state row to the signed-in user on the
+    // server. The authorize endpoint resolves ownerId from (session →
+    // bearer → cookie); masterToken on the query string is one of the
+    // fallback channels and is only relevant when the dashboard runs
+    // without a session cookie. Login/signup-mode has no signed-in
+    // user yet, so injecting a stale masterToken would bind the state
+    // row to the wrong account. Skip injection for identity flows.
+    if (!isIdentityMode) {
+      const masterToken = localStorage.getItem('masterToken');
+      if (masterToken) {
+        params.append('token', masterToken);
+      } else {
+        console.warn(`[OAuth] Connect-mode started without masterToken in localStorage; relying on session cookie.`);
+      }
     }
 
     const endpoint = `/api/v1/oauth/authorize/${service}?${params.toString()}`;
     console.log(`[OAuth] Redirecting to: ${endpoint}`);
-    
-    // Use direct window navigation to initiate OAuth flow
-    // This is the most reliable way to trigger browser-based OAuth
+
     window.location.href = endpoint;
-    
-    // Return a promise that never resolves (page will navigate away)
+
     return new Promise(() => {
-      // This promise intentionally never resolves
-      // Navigation will unload the page before any callback occurs
+      // Intentionally never resolves — navigation unloads the page.
     });
   } catch (error) {
     console.error(`[OAuth] Error starting OAuth flow for ${service}:`, error);
-    // Return a rejected promise so the calling code knows there was an error
     return Promise.reject(error);
   }
 }
