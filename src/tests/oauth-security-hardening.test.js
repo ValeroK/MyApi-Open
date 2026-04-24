@@ -56,7 +56,15 @@ describe('OAuth security hardening', () => {
     await safeUnlink(process.env.SESSION_DB_PATH);
   });
 
-  test('google login defaults to forcePrompt and includes select_account + max_age', async () => {
+  test('google login defaults to select_account WITHOUT max_age=0 (F3)', async () => {
+    // F3: dropping `max_age=0` stops Google forcing a full re-auth (which
+    // cascades into the consent screen) on every returning-user login. We
+    // keep `prompt=select_account` so users with multiple Google accounts
+    // still see an account-picker — that's useful UX, not friction. With
+    // only `prompt=select_account` Google silently passes through a
+    // returning user with a valid grant + a single account; with multiple
+    // accounts it shows the picker; it only shows the consent screen on
+    // fresh grants or revoked grants — which is the correct threat model.
     const res = await request(app)
       .get('/api/v1/oauth/authorize/google?mode=login&json=1');
 
@@ -64,7 +72,7 @@ describe('OAuth security hardening', () => {
     const authUrl = new URL(res.body.authUrl);
 
     expect(authUrl.searchParams.get('prompt')).toBe('select_account');
-    expect(authUrl.searchParams.get('max_age')).toBe('0');
+    expect(authUrl.searchParams.get('max_age')).toBeNull();
   });
 
   test('google login can disable forcePrompt explicitly', async () => {

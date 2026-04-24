@@ -8534,8 +8534,19 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
 
     if (forcePrompt && mode === 'login') {
       if (service === 'google') {
+        // F3 (2026-04-24): keep `prompt=select_account` so users with
+        // multiple Google accounts get an account picker (useful UX),
+        // but DROP `max_age=0`. max_age=0 was asking Google to treat the
+        // user as if they'd never authenticated, which in Google's
+        // pipeline cascades into a full re-consent screen on every
+        // single login — even for returning users whose grant is
+        // still valid. With only select_account, Google silently
+        // passes through returning users with a valid grant, shows
+        // the picker when multiple accounts are present, and only
+        // re-surfaces consent on actual grant changes (revoke,
+        // scope upgrade, brand-new account) which IS the correct
+        // threat model. See .context/tasks/backlog/F3-oauth-...md.
         runtimeAuthParams.prompt = 'select_account';
-        runtimeAuthParams.max_age = '0';
       } else if (service === 'facebook') {
         runtimeAuthParams.auth_type = 'reauthenticate';
       } else if (service === 'github') {
