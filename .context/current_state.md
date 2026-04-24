@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **34 / 34 suites, 470 pass / 18 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **34 / 34 suites, 475 pass / 14 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,40 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-24 (latest)** — **M3 Step 6 / T3.7 landed: user-facing
+- **2026-04-24 (latest)** — **M3 Step 7 / T3.8 landed: §5.4 OAuth
+  regression matrix in `security-regression.test.js`.** The
+  `describe.skip('[M3] OAuth state + PKCE hardening (to be added in
+  T3.8)')` placeholder is flipped to a live `describe` with 5 named
+  tests pinning the plan.md §5.4 bullets: (1) replayed state → 400
+  `STATE_REUSED`, (2) Discord missing-state + `guild_id` → 400
+  (carve-out gone), (3) expired state → 400 `STATE_EXPIRED` with
+  `row.used_at` kept NULL (benign-retry path preserved), (4) valid
+  happy-path → 302 whose `Location` carries
+  `oauth_status=confirm_login` + a fresh confirm `token=…`, and (5)
+  replayed pending-confirm token → 400 `pending_confirm_reused` +
+  attacker agent's `/auth/me` does NOT leak the victim's email.
+  Status-code deviation from §5.4 wording ("→ 401" for the confirm
+  replay) is documented inline: implementation returns the
+  discriminated-400 taxonomy, same family as the state-row 400s.
+  Env + mock bootstrap (test-grade `GOOGLE_CLIENT_*`, stubbed
+  `google-adapter` returning a deterministic `verifyToken` profile)
+  added at the file level; a seeded users row matching the mocked
+  email funnels tests 4 + 5 through the T3.7 first-seen branch
+  rather than `signup_required`. Not re-coverage of
+  `oauth-state-domain.test.js` / `oauth-authorize-handler.test.js` /
+  `oauth-callback-handler.test.js` / `oauth-confirm-handler.test.js`
+  — this suite's job is the §5.4 **regression lock** on five named
+  threat-model bullets, not re-exercising already-pinned surfaces.
+  **Full Docker regression green:** **34 suites / 475 pass / 14
+  skip / 0 fail** (+5 tests vs T3.7 baseline; three previously-
+  skipped M3 `test.todo`s promoted into passing tests, hence -4
+  in the skip bucket). No production code touched — pure
+  test-first regression lock-in per ADR-0012. **M3 is now 9/10
+  (T3.0–T3.8 done); T3.9 — scheduler wiring for
+  `pruneExpiredStateTokens` + `pruneExpiredPendingConfirms` — is
+  the only remaining before the M3 wrap-up commit.**
+
+- **2026-04-24** — **M3 Step 6 / T3.7 landed: user-facing
   OAuth confirm-gesture screen + first-seen gating + row-as-SSOT
   refactor.** Closes the session-fixation variant of C3 end-to-end.
   ADR-0016 records the first-seen keying decision
@@ -917,27 +950,29 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 Steps 1–6 landed** (T3.0–T3.7 / 8 of 10). C3
+- **Now:** **M3 Steps 1–7 landed** (T3.0–T3.8 / 9 of 10). C3
   ("OAuth state not DB-validated" + the session-fixation variant
   that rode on top of it) and C6 ("Discord state bypass") from
-  `plan.md` §6.3 are now **fully closed** end-to-end. H1
+  `plan.md` §6.3 are now **fully closed** end-to-end and
+  **locked in the §5.4 regression frame** via the 5 named
+  behavioural tests in `security-regression.test.js`. H1
   (deterministic PKCE verifier) remains closed. The OAuth
   callback can no longer set `req.session.user` without a
   user-driven gesture, and the first-seen key
   (`{service, user, provider_subject}`) prevents both
   gesture-fatigue on returning users and silent aliasing of a
   different provider identity onto an existing local account.
-- **Next:** **M3 Step 7 / T3.8** — replay / missing / expired /
-  valid regression matrix. Mostly a reshape of the existing
-  `oauth-callback-handler.test.js` + `oauth-confirm-handler.test.js`
-  assertions into the §5.4 security-regression frame; no new
-  primitives, no new schema. Followed by Step 8 / T3.9
-  (background prune scheduler wiring
-  `pruneExpiredStateTokens` and
-  `pruneExpiredPendingConfirms` — both primitives are already
-  on disk), then the M3 wrap-up commit (docs, signup/connect
-  mode `provider_subject` threading, legacy export retirement,
-  one live smoke on real Google).
+- **Next:** **M3 Step 8 / T3.9** — background scheduler wiring
+  for `pruneExpiredStateTokens` and
+  `pruneExpiredPendingConfirms`. Both primitives are already on
+  disk (shipped with T3.2 and T3.7 respectively), so this step
+  is just the scheduling glue (10-min tick, structured log line
+  with `{pruned_state, pruned_pending}`) plus an
+  `__TEST_pruneOnce` hook for the regression test. After that
+  the M3 wrap-up commit: docs, signup/connect-mode
+  `provider_subject` threading (closes the `COALESCE`-fallback
+  gap documented in ADR-0016), legacy export retirement, and
+  one live smoke on real Google end-to-end.
 - **Recently closed:** **M2 complete.** All eight in-scope tasks
   (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
   per ADR-0013 (T2.2, T2.3, T2.6). Plus the M2 wrap-up commit
