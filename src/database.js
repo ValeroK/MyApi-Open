@@ -2917,56 +2917,16 @@ function getOAuthStatus(serviceName = null) {
   }
 }
 
-function createStateToken(serviceName, expiresInMinutes = 10) {
-  const stateToken = crypto.randomBytes(32).toString('hex');
-  const now = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000).toISOString();
-  const id = 'state_' + crypto.randomBytes(8).toString('hex');
-  
-  const stmt = db.prepare(`
-    INSERT INTO oauth_state_tokens (id, state_token, service_name, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-  
-  stmt.run(id, stateToken, serviceName, now, expiresAt);
-  return stateToken;
-}
-
-function validateStateToken(serviceName, stateToken) {
-  const stmt = db.prepare(`
-    SELECT * FROM oauth_state_tokens
-    WHERE service_name = ? AND state_token = ? AND expires_at > ?
-  `);
-  
-  const now = new Date().toISOString();
-  const row = stmt.get(serviceName, stateToken, now);
-  
-  if (row) {
-    // Delete the state token after validation (one-time use)
-    const deleteStmt = db.prepare('DELETE FROM oauth_state_tokens WHERE id = ?');
-    deleteStmt.run(row.id);
-    return true;
-  }
-  
-  return false;
-}
-
-// BUG-11: Cleanup expired OAuth state tokens
-// Call this periodically to prevent accumulation of expired tokens
-function cleanupExpiredStateTokens() {
-  try {
-    const now = new Date().toISOString();
-    const stmt = db.prepare('DELETE FROM oauth_state_tokens WHERE expires_at < ?');
-    const result = stmt.run(now);
-    if (result.changes > 0) {
-      console.log(`[OAuth] Cleaned up ${result.changes} expired state tokens`);
-    }
-    return result.changes;
-  } catch (error) {
-    console.error('Error cleaning up expired state tokens:', error);
-    return 0;
-  }
-}
+// M3 wrap-up (ADR-0014): legacy `createStateToken` / `validateStateToken`
+// / `cleanupExpiredStateTokens` deleted. Every production caller since
+// T3.5 has gone through `src/domain/oauth/state.js` (random-32B PKCE
+// verifier stored alongside the state row, single-use guarded UPDATE,
+// discriminated error codes); T3.9 retired the hourly cleanup tick in
+// favour of `src/domain/oauth/prune-scheduler.js` (env-configurable
+// cadence + grace, pending-confirm pruning in the same tick). The
+// retired primitives here had no PKCE verifier column, no grace window,
+// and no pending-login awareness — keeping them on disk was just
+// attractive-nuisance surface.
 
 // Phase 5.1: Token Encryption Key Rotation
 function createKeyVersion(version, algorithm = 'aes-256-gcm') {
@@ -7084,9 +7044,9 @@ module.exports = {
   revokeOAuthToken,
   updateOAuthStatus,
   getOAuthStatus,
-  createStateToken,
-  validateStateToken,
-  cleanupExpiredStateTokens, // BUG-11: Cleanup expired OAuth state tokens
+  // M3 wrap-up: createStateToken / validateStateToken /
+  // cleanupExpiredStateTokens removed — see the ADR-0014 note next to
+  // the (deleted) function bodies above. Use the domain modules.
   // Phase 5: Key rotation and rate limiting
   createKeyVersion,
   getKeyVersions,

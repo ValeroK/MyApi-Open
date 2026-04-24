@@ -91,6 +91,53 @@ MyApi follows a coordinated vulnerability disclosure model:
   known literal. Enforced by
   `src/tests/default-vault-key-removed.test.js`.
 
+### OAuth state + PKCE (M3)
+
+- **DB-backed single-use state rows.** Every `/api/v1/oauth/authorize/:service`
+  writes a row into `oauth_state_tokens` carrying the random 32-byte
+  state, a random 32-byte PKCE verifier (`code_verifier`), the PKCE
+  S256 challenge, the originating user + mode + return-to, and a
+  10-min TTL. The callback looks the row up by `state` and consumes
+  it with a guarded `UPDATE ... WHERE used_at IS NULL`, so a replayed
+  `state` value is rejected with a discriminated 400 (`STATE_REUSED`).
+  Expired, used, or cross-service-mismatched rows are also rejected
+  with their own discriminated 400 codes (`STATE_EXPIRED`,
+  `STATE_SERVICE_MISMATCH`, `STATE_NOT_FOUND`). The entire lifecycle
+  lives in `src/domain/oauth/state.js`; no handler builds PKCE
+  verifiers, no session map mirrors the state, and the pre-M3
+  Discord `guild_id` bypass is gone. See ADR-0006, ADR-0014.
+- **First-seen confirm gesture.** A fresh `{service, user_id,
+  provider_subject}` tuple cannot log a user in silently — the
+  callback redirects to a user-facing screen that requires an
+  explicit accept/reject click. The pending-login row in
+  `oauth_pending_logins` is the single source of truth (no
+  `req.session.oauth_*` state anywhere), and the accept endpoint
+  stamps `oauth_tokens.first_confirmed_at` so subsequent logins for
+  the same tuple short-circuit past the screen. Signup carries
+  implicit consent and stamps `first_confirmed_at` in the same step
+  (M3 wrap-up) so a freshly-signed-up user isn't immediately asked
+  to gesture again. Domain module: `src/domain/oauth/pending-confirm.js`.
+  See ADR-0016.
+- **Background prune.** `src/domain/oauth/prune-scheduler.js` runs
+  a 10-min tick that deletes expired / used-past-grace rows from
+  both `oauth_state_tokens` and `oauth_pending_logins`. Cadence and
+  grace window are env-configurable via `OAUTH_PRUNE_INTERVAL_MS`
+  (default 600_000) and `OAUTH_PRUNE_GRACE_SEC` (default 3600).
+- **Regression matrix.** Five §5.4-mandated scenarios are pinned in
+  `src/tests/security-regression.test.js`:
+    1. Replayed `state` → `400 STATE_REUSED`.
+    2. Missing `state` + Discord `guild_id` → `400` (bypass removed).
+    3. Expired `state` → `400 STATE_EXPIRED` (row stays `used_at=NULL`).
+    4. Valid flow end-to-end → `302` to the confirm-gesture screen
+       with a fresh pending-confirm token.
+    5. Replayed pending-confirm token → `400 pending_confirm_reused`,
+       NO session established for the replayer.
+  Plus a source-level gate that asserts every `storeOAuthToken(...)`
+  call site in `src/index.js` passes `provider_subject`, and a
+  runtime gate that walks the signup-mode callback end-to-end and
+  asserts the row actually lands with `provider_subject` set and
+  `first_confirmed_at` stamped. See ADR-0014.
+
 ### Boot-time secret validation
 
 - **Runs on every NODE_ENV.** `src/lib/validate-secrets.js` checks

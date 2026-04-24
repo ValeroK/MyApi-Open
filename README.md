@@ -47,7 +47,7 @@ You connect your services (Google, GitHub, Slack, and 30+ more) through MyApi on
 
 | Feature | Description |
 |---|---|
-| **OAuth Aggregation** | Connect 30+ (and counting) services (Google, GitHub, Slack, Notion, Salesforce, Jira...) in one place. Tokens auto-refresh. Agents proxy through MyApi — never touch credentials. |
+| **OAuth Aggregation** | Connect 30+ (and counting) services (Google, GitHub, Slack, Notion, Salesforce, Jira...) in one place. Tokens auto-refresh. Agents proxy through MyApi — never touch credentials. OAuth flows are DB-backed (single-use PKCE state rows, 10-min TTL, background prune) and a user-driven confirm gesture gates every first-seen provider identity — no silent logins, no session fixation. See [SECURITY.md](SECURITY.md#oauth-state--pkce-m3). |
 | **AI Agent Gateway** | Issue scoped Bearer tokens to any AI agent. First access requires your approval. Every request is logged. |
 | **Persona System** | Multiple AI identities, each with its own soul content (SOUL.md), attached knowledge docs, and skills. Active persona shapes every API response. |
 | **Knowledge Base** | Upload or write Markdown/PDF documents. Attach them to specific personas for grounded, contextual responses. |
@@ -282,6 +282,8 @@ openssl rand -hex 32
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in ms (default: `900000` / 15 min) |
 | `EMAIL_PROVIDER` | `smtp`, `sendgrid`, or `resend` for outbound email notifications |
 | `CORS_ORIGIN` | Comma-separated allowed origins |
+| `OAUTH_PRUNE_INTERVAL_MS` | Cadence of the background OAuth-state prune job (default: `600000` / 10 min; min `1000`) |
+| `OAUTH_PRUNE_GRACE_SEC` | Seconds an expired or used OAuth state/pending-confirm row is retained before it's eligible for prune (default: `3600` / 1 h) |
 
 ### OAuth Service Credentials
 

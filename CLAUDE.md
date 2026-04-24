@@ -71,9 +71,43 @@ Request → auth middleware (src/middleware/auth.js)
   backward compatibility and requires the real `VAULT_KEY` — no
   publicly-known default fallback).
 - **OAuth tokens** (`oauth_tokens` table): Access + refresh tokens from
-  the 45+ providers, AES-256-GCM with scoped `ENCRYPTION_KEY`.
+  the 45+ providers, AES-256-GCM with scoped `ENCRYPTION_KEY`. Carries
+  `provider_subject` (provider stable id — Google `sub`, GitHub `id`,
+  …) and `first_confirmed_at` (M3 / ADR-0016) for the first-seen
+  confirm-gesture gate. **Always call `storeOAuthToken(service,
+  userId, accessToken, refreshToken, expiresAt, scope, providerSubject)`
+  with the 7th arg** — a source-level test in
+  `src/tests/oauth-state-inventory.test.js` fails the build on any
+  6-arg call.
 - Scope hierarchy for access tokens: `admin:*` > `services:*` >
   `services:{name}:read`.
+
+### OAuth state + confirm gesture (M3)
+
+- **Do NOT stash OAuth state on `req.session`.** The legacy keys
+  (`req.session.oauth_state`, `req.session.oauth_confirm`,
+  `req.session.oauth_login_pending`, …) have been removed. All
+  state lives in two DB tables: `oauth_state_tokens` (authorize ↔
+  callback handshake, random PKCE verifier) and `oauth_pending_logins`
+  (callback ↔ confirm-gesture accept/reject). The only session key
+  that still survives from the OAuth flow is `req.session.oauth_signup`,
+  which carries signup-wizard pending data.
+- **All state-lifecycle calls go through `src/domain/oauth/`.**
+  `state.js` owns `createStateToken` / `consumeStateToken` /
+  `pruneExpiredStateTokens`. `pending-confirm.js` owns
+  `createPendingConfirm` / `previewPendingConfirm` /
+  `consumePendingConfirm` / `hasConfirmedBefore` /
+  `recordFirstConfirmation` / `pruneExpiredPendingConfirms`.
+  `prune-scheduler.js` composes the two `pruneExpired...` primitives
+  into a single env-configurable background tick
+  (`OAUTH_PRUNE_INTERVAL_MS`, `OAUTH_PRUNE_GRACE_SEC`).
+- The pre-M3 `createStateToken` / `validateStateToken` /
+  `cleanupExpiredStateTokens` exports have been deleted from
+  `src/database.js`. Adding them back will fail
+  `oauth-state-inventory.test.js`.
+- Regression matrix for all five §5.4 scenarios lives in
+  `src/tests/security-regression.test.js`. See `.context/decisions/`
+  ADR-0006, ADR-0014, ADR-0016 for the full design rationale.
 
 ### Key Source Files
 
@@ -99,7 +133,7 @@ for removal outside M2.
 ### Database
 
 SQLite at `src/data/myapi.db` (controlled by `DB_PATH` env var). Key table groups:
-- **Auth**: `vault_tokens`, `access_tokens`, `oauth_tokens`, `oauth_state_tokens`
+- **Auth**: `vault_tokens`, `access_tokens`, `oauth_tokens`, `oauth_state_tokens`, `oauth_pending_logins`
 - **Users/Identity**: `users`, `personas`, `handshakes`
 - **AI/Knowledge**: `kb_documents`, `persona_documents`, `conversations`, `messages`, `context_cache`
 - **Skills/Marketplace**: `skills`, `skill_versions`, `marketplace_listings`, `marketplace_ratings`

@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **35 / 35 suites, 485 pass / 14 skip, exit 0** (~7 s in Docker) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **35 / 35 suites, 490 pass / 14 skip, exit 0** (~7 s in Docker; M3 wrap-up added the signup-mode E2E, the `storeOAuthToken` arity static gate, and the three legacy-export-absence gates) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,119 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-24 (latest)** — **M3 Step 8 / T3.9 landed: OAuth
+- **2026-04-24 (latest)** — **M3 wrap-up commit landed — M3 is now
+  ✅ Complete.** Atomic commit ships the four work items that were
+  intentionally deferred out of T3.7–T3.9 so they could be batched behind
+  one live-smoke run:
+    - **Task A — `provider_subject` threading through every
+      `storeOAuthToken` call site.** Signup-complete handler in
+      `src/index.js` now forwards `pending.providerUserId` (already
+      stashed on `req.session.oauth_signup` by the callback's
+      signup-required redirect — no upstream plumbing needed) and also
+      calls `recordFirstConfirmation(...)` so signup carries **implicit
+      consent** and the very next login-mode callback short-circuits
+      past the confirm-gesture screen. Connect-mode + non-primary-
+      login-mode branches in the callback handler also pass
+      `providerUserId` (same `verifyToken()`-derived value the login-mode
+      branch was already using). Net effect: no more
+      `oauth_tokens.provider_subject = NULL` rows after a fresh signup
+      or a connect-mode link. Closes the `COALESCE`-fallback window
+      flagged in ADR-0016 §Follow-ups.
+    - **Task B — legacy state-token exports retired.** Deleted the
+      now-unused `createStateToken` / `validateStateToken` /
+      `cleanupExpiredStateTokens` functions **and their exports** from
+      `src/database.js`. Verified zero live callers remain (the T3.4+T3.5
+      handler refactor dropped the authorize/callback sites; T3.9's
+      prune scheduler took over `cleanupExpiredStateTokens`'s tick; the
+      test-suite destructures of the legacy names were never
+      executed). Everything OAuth-state now goes through
+      `src/domain/oauth/state.js` (authorize, callback) and
+      `src/domain/oauth/prune-scheduler.js` (tick), with zero
+      hand-rolled SQL outside those two modules.
+    - **Task C — docs rebaseline.** `SECURITY.md` / `README.md` /
+      `CLAUDE.md` / `.env.smoke.example` updated to describe the M3
+      reality: DB-backed single-use state rows, random 32-byte PKCE
+      verifier stored in-row, no Discord carve-out, first-seen confirm
+      gesture with `provider_subject` keying, `OAUTH_PRUNE_INTERVAL_MS`
+      + `OAUTH_PRUNE_GRACE_SEC` env knobs for the scheduler. Stale
+      references to `buildPkcePairFromState` / `req.session.oauthStateMeta`
+      / the Discord bypass are gone.
+    - **Task D — live Google OAuth smoke.** Ran a real round-trip
+      through `docker:smoke` against a live GCP project. Five phases
+      all passed their M3-relevant assertions:
+        1. **Token auto-refresh** — aged the token's `expires_at` into
+           the past; proxy call succeeded and refreshed the row. (First
+           attempt false-negatived because `TOKEN_CACHE_TTL=5min` served
+           a stale-but-not-expired cache entry; container restart
+           flushed the cache and the retry correctly exercised the
+           refresh path. The cache TTL is a separate concern, not M3.)
+        2. **Prune scheduler** — aged every `oauth_state_tokens` row
+           into the past; invoked `runPruneOnce({ db })`; all aged rows
+           deleted; empty ticks silent at INFO as designed.
+        3. **Real proxy (Gmail + Calendar + Drive)** — Gmail proxy
+           round-trip succeeded end-to-end (scope granted, call made,
+           token refresh verified). Calendar + Drive calls returned
+           `403 PERMISSION_DENIED` from Google because those APIs were
+           not enabled in the operator's GCP project — **MyApi proxied
+           correctly, Google refused; not a MyApi defect** and not in
+           M3 scope.
+        4. **SSRF guards** — proxy calls with targets pointing at
+           `127.0.0.1`, `169.254.169.254`, `localhost:4500`,
+           `0177.0.0.1`, `2130706433` all rejected at the
+           `isPrivateHost` guard before the outbound request fired.
+           (Full SSRF unification is M5; M3's defence-in-depth still
+           holds under live conditions.)
+        5. **Returning-user login skips the gesture** — a second
+           login-mode authorize → callback cycle for a user with
+           stamped `first_confirmed_at` 302'd directly to
+           `/dashboard/`; no `oauth_status=confirm_login`, no
+           `oauth_pending_logins` row created. Confirms the ADR-0016
+           first-seen key does what it says — one gesture ever, not
+           one per login.
+    - **Task E — `TASKS.md` + this file flipped.** M3 header in
+      `TASKS.md` now reads ✅ Complete (2026-04-24); this file's §6
+      updates the "Active focus" to M3-complete / next-up = `F3`.
+  **Non-M3 follow-ups surfaced during the live smoke** (filed as task
+  briefs in `.context/tasks/backlog/`, to be picked up after the wrap-up
+  push):
+    - **`F1` — SPA post-OAuth routing race.** After the confirm-gesture
+      click, `App.jsx`'s `redirectToLoginOnce()` fires before the
+      auth-store has hydrated, bouncing the user to `/` instead of
+      `/dashboard/`. Pure UX defect; backend session was always fine.
+      Filed as
+      `.context/tasks/backlog/F1-spa-post-oauth-routing-race.md`.
+      Bundles with M9.
+    - **`F2` — onboarding wizard is half-wired.** The frontend `vite
+      build` initially failed with `"dismissModal" is not exported by
+      onboardingUtils.js` — the module only exported one of the eight
+      helpers `App.jsx` / `Settings.jsx` / `Dashboard.jsx` /
+      `OnboardingModal.jsx` import. Stubbed the other seven as
+      localStorage-backed no-ops that keep onboarding inert (shipped in
+      the separate `fix(dashboard):` commit that preceded the M3
+      wrap-up). Product-level "ship it vs. retire it" decision filed
+      as
+      `.context/tasks/backlog/F2-onboarding-wizard-completion.md`.
+      Bundles with M9.
+    - **`F3` — Google consent screen shown on every login.**
+      `src/public/dashboard-app/src/pages/LogIn.jsx` hard-codes
+      `forcePrompt=1` on login-mode authorize URLs, which the server
+      translates to Google's `prompt=consent`. Intentional
+      belt-and-suspenders defense from the original signup hardening;
+      redundant now that DB-backed state + first-seen confirm gesture
+      are live. User-hostile. Filed as
+      `.context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md`.
+      **Queued as the next work session per operator direction on
+      2026-04-24.**
+  **Full Docker regression after the wrap-up:** **35 suites / 490 pass
+  / 14 skip / 0 fail** (+5 tests vs the T3.9 baseline of 485: signup-
+  mode E2E in `security-regression.test.js` plus the `storeOAuthToken`
+  arity static gate + the three legacy-export-absence gates in
+  `oauth-state-inventory.test.js`, all written red-first). **M3
+  header in `TASKS.md` is now ✅ Complete (2026-04-24).** C3 + C6 are
+  closed end-to-end; H1 remains closed. Session log:
+  `.context/sessions/2026-04-24-m3-smoke.md`.
+
+- **2026-04-24** — **M3 Step 8 / T3.9 landed: OAuth
   prune scheduler (state + pending-confirm, env-configurable).**
   Closes M3 at the implementation level; only the M3 wrap-up
   commit (docs + legacy-export retirement + one live Google
@@ -1005,39 +1117,49 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 Steps 1–8 landed** (T3.0–T3.9 / 10 of 10 at the
-  implementation level). C3 ("OAuth state not DB-validated" +
-  the session-fixation variant that rode on top of it) and C6
-  ("Discord state bypass") from `plan.md` §6.3 are now **fully
-  closed** end-to-end, **locked in the §5.4 regression frame**
-  via the 5 named behavioural tests in
-  `security-regression.test.js`, and the two expired-row tables
-  (`oauth_state_tokens` + `oauth_pending_logins`) now get pruned
-  on a 10-min tick with structured operational logging. H1
-  (deterministic PKCE verifier) remains closed. The OAuth
-  callback can no longer set `req.session.user` without a
-  user-driven gesture, and the first-seen key
-  (`{service, user, provider_subject}`) prevents both
-  gesture-fatigue on returning users and silent aliasing of a
-  different provider identity onto an existing local account.
-- **Next:** **M3 wrap-up commit.** Five work items: (1)
-  `CLAUDE.md` + `SECURITY.md` + `README.md` updated to document
-  the new OAuth state subsystem + confirm gesture + prune
-  scheduler; (2) signup-mode + connect-mode OAuth call sites
-  threaded with `provider_subject` so `storeOAuthToken` is
-  NEVER called with `providerSubject=null` in M4+ (closes the
-  `COALESCE`-fallback gap documented in ADR-0016); (3) retire
-  the legacy `createStateToken` / `validateStateToken` /
-  `cleanupExpiredStateTokens` exports in `src/database.js`
-  (zero callers since T3.9); (4) one live Google OAuth smoke
-  end-to-end (docker:smoke compose file) to exercise the full
-  authorize → callback → confirm-gesture → session flow
-  against a real provider; (5) flip M3 header in `TASKS.md` to
-  `✅ Complete (YYYY-MM-DD)`.
-- **Recently closed:** **M2 complete.** All eight in-scope tasks
-  (T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10); three cancelled
-  per ADR-0013 (T2.2, T2.3, T2.6). Plus the M2 wrap-up commit
-  folded in a frontend open-redirect hardening for `LogIn.jsx`.
+- **Now:** **M3 ✅ Complete (2026-04-24).** All ten tasks
+  (T3.0–T3.9) landed plus the M3 wrap-up commit. C3 ("OAuth state
+  not DB-validated" + the session-fixation variant) and C6
+  ("Discord state bypass") from `plan.md` §6.3 are closed
+  end-to-end, locked in the §5.4 regression frame
+  (`security-regression.test.js`), and exercised against a
+  real Google OAuth round-trip in the 2026-04-24 live smoke.
+  H1 (deterministic PKCE verifier) remains closed. The OAuth
+  callback cannot set `req.session.user` without a user-driven
+  gesture; the first-seen key `{service, user_id,
+  provider_subject}` prevents both gesture-fatigue on returning
+  users and silent aliasing of a different provider identity
+  onto an existing local account. The two expired-row tables
+  (`oauth_state_tokens` + `oauth_pending_logins`) get pruned
+  on a 10-min tick with structured operational logging.
+- **Next (operator-directed, queued for next work session):**
+  **`F3` — stop forcing `prompt=consent` on every login-mode
+  authorize.** `LogIn.jsx` hard-codes `forcePrompt=1` so Google
+  re-asks for consent every single login; this was belt-and-
+  suspenders defense from before T3.7 shipped the MyApi-side
+  confirm gesture and is now redundant + user-hostile. Plan:
+  keep `forcePrompt` on signup-mode + explicit re-consent flows
+  only; plain returning-user logins defer to the provider's own
+  grant cache. Red-first test + inline ADR, then ship. Full
+  brief: `.context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md`.
+- **Other backlog (carried from M3 live smoke):**
+  - **`F1`** — SPA routes freshly-authenticated users to `/`
+    instead of `/dashboard/` after the confirm-gesture click
+    (`App.jsx` redirect effect races the auth-store hydration).
+    UX only. Bundles with M9.
+  - **`F2`** — the onboarding-wizard surface is half-wired; M3
+    wrap-up stubbed the missing `onboardingUtils.js` exports as
+    localStorage-backed no-ops to unblock the SPA build. Either
+    ship the wizard properly or retire it. Bundles with M9.
+- **After `F3`:** pick up **M4** (session + rate-limit
+  dual-driver store) — see ADR-0002 + `TASKS.md` M4. T4.9 still
+  carries the ADR-0015 Option B follow-up (representationally
+  impossible `access_tokens.owner_id` → `users(id)` FK).
+- **Recently closed:** **M3 complete.** All ten tasks (T3.0–T3.9)
+  + the wrap-up commit + the live Google smoke. Previous
+  milestone **M2** complete: all eight in-scope tasks, three
+  cancelled per ADR-0013; M2 wrap-up also folded in the
+  frontend open-redirect hardening for `LogIn.jsx`.
 - **Blocked / waiting on a human:**
   - **Google OAuth credential rotation** at the provider — tracked for M3
     hardening. Not urgent since `REMOVED_…` fallbacks are gone and

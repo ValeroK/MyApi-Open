@@ -455,6 +455,150 @@ describe('[M3 / T3.8] OAuth state + PKCE + confirm regression matrix', () => {
   });
 });
 
+// ---------------------------------------------------------------------
+// M3 wrap-up — provider_subject threading end-to-end.
+//
+// The static gate in `oauth-state-inventory.test.js` asserts that every
+// `storeOAuthToken(...)` call site in src/index.js passes a 7th arg.
+// That catches drift at the source level. This describe block pins the
+// RUNTIME invariant: after a full signup-mode walk-through, the row in
+// `oauth_tokens` actually lands with `provider_subject` non-null.
+//
+// Why signup-mode specifically? The login-mode + connect-mode returning-
+// user paths are already covered end-to-end by T3.7 / T3.8 (the
+// confirm-gesture happy path in `oauth-confirm-handler.test.js` and the
+// "valid state → 302 to confirm screen" test above). The signup branch
+// (new user, oauth_status=signup_required, POST /auth/oauth-signup/complete)
+// is the only production path that writes `oauth_tokens` WITHOUT going
+// through the gesture screen — so it's the remaining hole and
+// deservedly gets its own assertion here.
+// ---------------------------------------------------------------------
+describe('[M3 wrap-up] signup-mode stores provider_subject end-to-end', () => {
+  const request3 = require('supertest');
+  let rawDb;
+  const SIGNUP_EMAIL = 'wrapup-signup@example.com';
+  const SIGNUP_SUB = 'google-wrapup-sub';
+
+  // We cannot reshape the top-of-file `jest.mock('../services/google-adapter')`
+  // at a per-test level, but we CAN monkey-patch the mock class prototype
+  // before each test runs. Jest hoists `jest.mock(...)` but does NOT
+  // freeze the resulting constructor — so grabbing it via the module
+  // registry here is the same object the OAuth callback will `new`.
+  beforeAll(() => {
+    const dbApi = require('../database');
+    rawDb = dbApi.getRawDB ? dbApi.getRawDB() : dbApi.db;
+  });
+
+  beforeEach(() => {
+    // Ensure NO user exists for SIGNUP_EMAIL — the callback's email
+    // lookup must miss so it routes to `oauth_status=signup_required`.
+    rawDb.prepare('DELETE FROM users WHERE email = ?').run(SIGNUP_EMAIL);
+
+    // Rewire the mock google adapter for this test — return the signup
+    // email + a deterministic `sub` so we can assert on it.
+    const MockAdapter = require('../services/google-adapter');
+    MockAdapter.prototype.verifyToken = async function () {
+      return {
+        data: {
+          email: SIGNUP_EMAIL,
+          name: 'Wrap-up Signup',
+          sub: SIGNUP_SUB,
+        },
+      };
+    };
+  });
+
+  afterAll(() => {
+    // Restore the default verify-token profile so subsequent suites in
+    // the same Jest worker aren't affected. In practice security-regression
+    // is the last consumer of the mock, but being careful costs nothing.
+    const MockAdapter = require('../services/google-adapter');
+    MockAdapter.prototype.verifyToken = async function () {
+      return {
+        data: {
+          email: 'regression-user@example.com',
+          name: 'Regression User',
+          sub: 'google-regression-sub',
+        },
+      };
+    };
+  });
+
+  test('full authorize → callback → /oauth-signup/complete writes oauth_tokens.provider_subject', async () => {
+    const agent = request3.agent(app);
+
+    // 1. authorize — grab the state token via ?json=1.
+    const authz = await agent.get(
+      `/api/v1/oauth/authorize/google?json=1&mode=login&returnTo=/dashboard/`
+    );
+    expect(authz.status).toBe(200);
+    const state = authz.body?.state;
+    expect(typeof state).toBe('string');
+
+    // 2. callback — unknown email → redirect to signup-required.
+    const cb = await agent
+      .get(
+        `/api/v1/oauth/callback/google?code=abc&state=${encodeURIComponent(
+          state
+        )}`
+      )
+      .redirects(0);
+    expect(cb.status).toBe(302);
+    expect(cb.headers.location || '').toMatch(/oauth_status=signup_required/);
+
+    // Session now carries req.session.oauth_signup with the full payload,
+    // including the `providerUserId` field we want to see land in
+    // oauth_tokens.provider_subject. Pull the nonce via the pending
+    // endpoint (same one the frontend signup wizard consumes).
+    const pending = await agent.get('/api/v1/auth/oauth-signup/pending');
+    expect(pending.status).toBe(200);
+    expect(pending.body?.data?.nonce).toEqual(expect.any(String));
+    expect(pending.body?.data?.email).toBe(SIGNUP_EMAIL);
+    const nonce = pending.body.data.nonce;
+
+    // 3. Complete the signup. The provider_subject threading through
+    //    L7311 is what this test is really about.
+    const complete = await agent
+      .post('/api/v1/auth/oauth-signup/complete')
+      .set('Content-Type', 'application/json')
+      .send({
+        oauthSignupConfirm: true,
+        oauthSignupNonce: nonce,
+        termsAccepted: true,
+        username: 'wrapup_signup',
+        displayName: 'Wrap-up Signup',
+        email: SIGNUP_EMAIL,
+        timezone: 'UTC',
+      });
+
+    expect([200, 201]).toContain(complete.status);
+    expect(complete.body?.ok).toBe(true);
+
+    // 4. Assert oauth_tokens.provider_subject landed non-null.
+    const newUser = rawDb
+      .prepare('SELECT id FROM users WHERE email = ?')
+      .get(SIGNUP_EMAIL);
+    expect(newUser?.id).toBeTruthy();
+
+    const tokenRow = rawDb
+      .prepare(
+        `SELECT provider_subject, first_confirmed_at
+           FROM oauth_tokens
+          WHERE user_id = ? AND service_name = ?`
+      )
+      .get(newUser.id, 'google');
+
+    expect(tokenRow).toBeTruthy();
+    expect(tokenRow.provider_subject).toBe(SIGNUP_SUB);
+    // first_confirmed_at is set by storeOAuthToken the first time
+    // provider_subject is seen for this (user, service) tuple — so it
+    // should also be non-null here, even though signup does NOT route
+    // through the confirm-gesture screen (by design: consent is
+    // implicit in the signup flow itself).
+    expect(tokenRow.first_confirmed_at).toBeTruthy();
+  });
+});
+
 describe.skip('[M5] SSRF surface (to be added in T5.7)', () => {
   test.todo('proxy rejects http://169.254.169.254/');
   test.todo('proxy rejects http://[::ffff:127.0.0.1]/');

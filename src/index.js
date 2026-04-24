@@ -7308,6 +7308,12 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
 
   if (pending.oauthToken) {
     const t = pending.oauthToken;
+    // M3 wrap-up (ADR-0016): thread `provider_subject` through the
+    // signup-completion store. The signup-required redirect in the
+    // callback handler already stashes `providerUserId` on
+    // `req.session.oauth_signup`, so no upstream plumbing is needed
+    // — we just forward it here so `oauth_tokens.provider_subject`
+    // is never NULL after a fresh signup.
     storeOAuthToken(
       pending.service,
       createdUser.id,
@@ -7315,7 +7321,31 @@ app.post('/api/v1/auth/oauth-signup/complete', async (req, res) => {
       t.refreshToken || null,
       t.expiresAt || null,
       t.scope || null,
+      pending.providerUserId || null
     );
+
+    // Signup carries IMPLICIT consent to the OAuth identity: the user
+    // just clicked "Create account with <service>" and filled in a
+    // form. Stamp `first_confirmed_at` so the very next login-mode
+    // callback short-circuits past the confirm-gesture screen instead
+    // of forcing a returning-user gesture immediately after signup.
+    // Best-effort: a failure here only costs the user one extra
+    // gesture screen on their next login.
+    if (pending.providerUserId) {
+      try {
+        recordFirstConfirmation({
+          db,
+          userId: createdUser.id,
+          serviceName: pending.service,
+          providerSubject: pending.providerUserId,
+        });
+      } catch (markerErr) {
+        console.error(
+          '[OAuth Signup] recordFirstConfirmation failed:',
+          markerErr.message
+        );
+      }
+    }
   }
 
   // Store structured identity fields in profile_metadata (persists to DB)
@@ -8918,7 +8948,20 @@ app.get([
         return res.redirect(`/dashboard/?oauth_service=${service}&oauth_status=error&error=${encodeURIComponent('plan_limit_reached')}`);
       }
 
-      const storeResult = storeOAuthToken(service, oauthOwnerId, tokenData.accessToken, tokenData.refreshToken || null, expiresAt, tokenData.scope);
+      // M3 wrap-up (ADR-0016): thread `provider_subject` on connect-mode
+      // + non-primary-login-mode stores. `providerUserId` was extracted
+      // from the OAuth adapter's verifyToken() result earlier in this
+      // same handler — same source the login-mode / returning-user
+      // branches already use, so no new plumbing.
+      const storeResult = storeOAuthToken(
+        service,
+        oauthOwnerId,
+        tokenData.accessToken,
+        tokenData.refreshToken || null,
+        expiresAt,
+        tokenData.scope,
+        providerUserId || null
+      );
       tokenStoredForUser = true;
       logger.info('[OAuth Callback] token stored', { service });
 

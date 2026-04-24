@@ -301,3 +301,171 @@ describe('[M3 / Step 6] oauth_pending_logins + oauth_tokens schema (T3.7)', () =
     expect(columnNames(table).includes(col)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------
+// M3 wrap-up — static gates that pin invariants the wrap-up commit
+// establishes:
+//
+//   (A) Every `storeOAuthToken(...)` call in `src/index.js` passes
+//       at least 7 positional arguments, so `provider_subject` is
+//       NEVER written NULL. Closes the `COALESCE`-fallback gap flagged
+//       in ADR-0016 for signup-mode + connect-mode call sites.
+//
+//   (B) The legacy state-token surface on `./database` (pre-M3
+//       variants: random state, no PKCE verifier column, naive
+//       expiry-only cleanup) is retired. Every production caller has
+//       gone through `src/domain/oauth/state.js` since T3.5, and
+//       the prune scheduler (T3.9) superseded the cleanup primitive.
+//       Keeping the exports around is just clutter + footgun.
+//
+// Red-first: both gates fail against HEAD pre-wrap. They flip green
+// in the same commit that threads `providerUserId` through L7311 +
+// L8921 and deletes the three exports from `src/database.js`.
+// ---------------------------------------------------------------------
+
+describe('[M3 wrap-up] provider_subject threading (storeOAuthToken call-site audit)', () => {
+  /** Count the top-level commas inside a single balanced `(...)` that
+   *  starts at `source[startIdx]` (which must be '('). Returns the
+   *  comma count (= arity - 1) and the index just after the closing ')'.
+   *
+   *  Parens are counted with trivial awareness of single- / double- /
+   *  backtick-quoted strings so an `('x,y')`-style arg doesn't trip
+   *  the commas counter. Regex alone is not sufficient because
+   *  `storeOAuthToken(a, (b || c), d)` has nested parens. */
+  function countTopLevelArgs(source, openIdx) {
+    if (source[openIdx] !== '(') {
+      throw new Error(`countTopLevelArgs: expected '(' at ${openIdx}`);
+    }
+    let i = openIdx + 1;
+    let depth = 1;
+    let commas = 0;
+    let sawNonWs = false;
+    const len = source.length;
+    while (i < len && depth > 0) {
+      const ch = source[i];
+      if (ch === "'" || ch === '"' || ch === '`') {
+        // Skip to matching quote, honouring backslash escapes.
+        const quote = ch;
+        i += 1;
+        while (i < len) {
+          if (source[i] === '\\') {
+            i += 2;
+            continue;
+          }
+          if (source[i] === quote) {
+            i += 1;
+            break;
+          }
+          i += 1;
+        }
+        sawNonWs = true;
+        continue;
+      }
+      if (ch === '/' && source[i + 1] === '/') {
+        // Line comment — skip to EOL.
+        while (i < len && source[i] !== '\n') i += 1;
+        continue;
+      }
+      if (ch === '/' && source[i + 1] === '*') {
+        // Block comment — skip to */.
+        i += 2;
+        while (i < len - 1 && !(source[i] === '*' && source[i + 1] === '/')) {
+          i += 1;
+        }
+        i += 2;
+        continue;
+      }
+      if (ch === '(') depth += 1;
+      else if (ch === ')') depth -= 1;
+      else if (ch === ',' && depth === 1) commas += 1;
+      else if (!/\s/.test(ch)) sawNonWs = true;
+      i += 1;
+    }
+    if (depth !== 0) {
+      throw new Error(`countTopLevelArgs: unbalanced parens from ${openIdx}`);
+    }
+    // If the parens are empty (no non-whitespace between them), arity is 0;
+    // otherwise arity is commas + 1.
+    const arity = sawNonWs ? commas + 1 : 0;
+    return { arity, end: i };
+  }
+
+  test('every storeOAuthToken(...) call in src/index.js passes >= 7 positional args', () => {
+    const serverSrc = fs.readFileSync(SERVER_ENTRY, 'utf8');
+
+    // Find every call site. We don't want the FUNCTION DEFINITION in
+    // src/database.js, so we're fine scanning just the server entry.
+    // The name only appears in `import from './database'`-style
+    // destructures and in actual call sites — the destructure is a
+    // single occurrence with no adjacent '(', so our
+    // `storeOAuthToken\s*\(` pattern naturally excludes it.
+    const re = /\bstoreOAuthToken\s*\(/g;
+    const sites = [];
+    let m;
+    while ((m = re.exec(serverSrc)) !== null) {
+      const openIdx = m.index + m[0].length - 1;
+      // Re-anchor: openIdx points at the '('.
+      const { arity, end } = countTopLevelArgs(serverSrc, openIdx);
+      const line = serverSrc.slice(0, m.index).split('\n').length;
+      sites.push({ line, arity });
+      re.lastIndex = end;
+    }
+
+    expect(sites.length).toBeGreaterThan(0);
+
+    const shortCalls = sites.filter((s) => s.arity < 7);
+    if (shortCalls.length > 0) {
+      // Fail-loud with the exact offending line numbers so the next
+      // developer can find them in seconds.
+      throw new Error(
+        `storeOAuthToken(...) must always pass providerSubject ` +
+          `(7th positional arg). Offending call sites in src/index.js: ` +
+          shortCalls
+            .map((s) => `L${s.line} (arity=${s.arity})`)
+            .join(', ')
+      );
+    }
+  });
+});
+
+describe('[M3 wrap-up] legacy state-token exports retired from ./database', () => {
+  beforeAll(() => {
+    // Make sure the app-side singleton has run so the destructure at
+    // the top of src/database.js has resolved.
+    const database = require('../database');
+    database.initDatabase();
+  });
+
+  test.each([
+    'createStateToken',
+    'validateStateToken',
+    'cleanupExpiredStateTokens',
+  ])(
+    'require("./database") does NOT export %s any more (flipped by M3 wrap-up)',
+    (name) => {
+      const dbModule = require('../database');
+      expect(dbModule[name]).toBeUndefined();
+    }
+  );
+
+  test('src/index.js does NOT destructure the retired symbols from ./database', () => {
+    const serverSrc = fs.readFileSync(SERVER_ENTRY, 'utf8');
+    // Strip comments so the wrap-up commit's inline explanation of
+    // WHY the symbols are gone doesn't re-trigger the gate.
+    const stripped = serverSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+    // Each symbol may appear as a bare identifier on its own destructure
+    // line:  `  createStateToken,`  — that's what the gate refuses.
+    // Domain-module imports use an alias (`createStateToken: createOAuthStateRow`)
+    // so those survive the regex.
+    for (const name of [
+      'createStateToken',
+      'validateStateToken',
+      'cleanupExpiredStateTokens',
+    ]) {
+      const bareDestructure = new RegExp(`^\\s*${name}\\s*,?\\s*$`, 'm');
+      expect(stripped).not.toMatch(bareDestructure);
+    }
+  });
+});
