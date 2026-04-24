@@ -16,12 +16,71 @@
 
 ## Status
 
-- **State.** backlog → **queued for next work session** (operator direction
-  2026-04-24).
+- **State.** **Pass 1 landed on main (2026-04-24, commit `959059c`)**;
+  Pass 2 (adapter + recovery + ADR) queued.
 - **Assignee.** anyone
-- **Started.** —
+- **Started.** 2026-04-24.
 - **Target done.** Same week.
-- **Actually done.** —
+- **Actually done.** Pass 1 only. Pass 2 pending.
+
+### Pass 1 (landed 2026-04-24, commit `959059c`)
+
+- Dropped `max_age=0` from the Google login-mode authorize URL in
+  `src/index.js`. `max_age=0` was forcing Google to treat every returning
+  user as unauthenticated, which cascaded into a full re-consent screen on
+  every login. With only `prompt=select_account`, Google silently passes
+  returning users through (or shows the picker for multiple-account users)
+  and only re-surfaces consent on genuine grant changes (revoke, scope
+  upgrade, brand-new account) — which is the correct threat model.
+- **Unit-test coverage added** to
+  `src/tests/oauth-security-hardening.test.js`:
+  - `prompt=select_account`, `max_age=null` on `forcePrompt=1` login.
+  - `prompt=null`, `max_age=null` on explicit `forcePrompt=0` (agent
+    silent flow).
+  - `prompt=select_account`, `max_age=null` on landing-modal snake_case
+    `force_prompt=1` path (regression guard — that path falls through to
+    the `mode==='login'` default; pinning the behavior so any future
+    default change is visible in review).
+  - `prompt=consent`, `max_age=null` on `mode=connect` — documents the
+    current adapter-default fall-through and leaves an explicit Pass 2
+    marker.
+- **Live smoke test harness added** in
+  `src/tests/oauth-authorize-url-live-smoke.test.js`, runnable against
+  any MyApi deployment via `SMOKE_URL=... npm run smoke:oauth`. Skipped
+  silently in normal `npm test`. Catches failure modes unit tests miss
+  (stale Docker image, bind-mount/COPY mismatch, env-var misconfig).
+- **Browser-level verification** performed 2026-04-24 with Chrome
+  DevTools MCP against the running smoke container:
+  all three login entry points (landing modal, React LogIn.jsx, React
+  SignUp.jsx) confirmed to emit `prompt=select_account`, no `max_age`.
+
+### Pass 2 (queued — code hygiene + recovery + ADR)
+
+- Flip `src/services/google-adapter.js:38` default
+  `prompt: 'consent'` → `prompt: 'select_account'`. Removes the trap
+  where a future code path bypassing the server override would silently
+  force consent. Today the server override wins, so this is pure
+  defence-in-depth.
+- Implement `invalid_grant` recovery in `src/database.js`
+  `refreshOAuthToken`: on Google returning `error === 'invalid_grant'`,
+  delete the stored refresh_token (move the row to a "needs re-auth"
+  state). Distinguish transient errors (5xx, network, `invalid_client`)
+  — those keep the refresh_token and are retryable.
+- Surface `REAUTH_REQUIRED` as a distinct error code on
+  `/api/v1/services/:name/proxy` and `/execute` so the dashboard can
+  render an actionable banner linking the user back to the
+  `?mode=login&forcePrompt=1` authorize URL (Pass-1 semantics, so the
+  new grant gets a proper consent screen — the one legitimate consent
+  surfacing post-Pass-1).
+- `Services.jsx` dashboard page: banner + CTA for
+  `status === 'reauth_required'`.
+- Update the `mode=connect` live-smoke + unit tests when flipping
+  adapter default.
+- New ADR-0017-oauth-prompt-policy.md documenting the policy:
+  **silent pass-through for returning users with valid grants; picker
+  for multi-account explicit login; consent only for new or revoked
+  grants (Google's own decision or our explicit `invalid_grant`
+  recovery)**.
 
 ## Why (1-paragraph context)
 

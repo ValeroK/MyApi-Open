@@ -161,6 +161,22 @@ Tests live in `src/tests/`. Jest is configured via `jest.config.js` with:
 
 Test files follow phase-based naming: `integration.test.js`, `phase1-workspaces.test.js`, `phase2-billing.test.js`, `phase3.audit-security.test.js`, `phase5-retention.test.js`, etc.
 
+**Live smoke tests** (run against a running server, not the in-memory app):
+- `src/tests/oauth-authorize-url-live-smoke.test.js` — verifies the OAuth
+  authorize URL the shipped binary produces (`prompt=select_account`, no
+  `max_age=0` for Google login; connect-mode defaults, etc.). Gated on
+  `SMOKE_URL` env var — skipped silently in normal `npm test` runs, only
+  runs when explicitly pointed at a live server. Catches failure modes
+  that unit tests can't: stale Docker image, bind-mount vs. COPY
+  mismatch, env-var misconfig.
+  ```powershell
+  # Windows PowerShell
+  $env:SMOKE_URL = "http://localhost:4500"; npm run smoke:oauth
+
+  # Unix
+  SMOKE_URL=http://localhost:4500 npm run smoke:oauth
+  ```
+
 ### Environment
 
 Copy `src/.env.example` to `src/.env`. Critical variables:

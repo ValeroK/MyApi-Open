@@ -1133,15 +1133,24 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
   (`oauth_state_tokens` + `oauth_pending_logins`) get pruned
   on a 10-min tick with structured operational logging.
 - **Next (operator-directed, queued for next work session):**
-  **`F3` — stop forcing `prompt=consent` on every login-mode
-  authorize.** `LogIn.jsx` hard-codes `forcePrompt=1` so Google
-  re-asks for consent every single login; this was belt-and-
-  suspenders defense from before T3.7 shipped the MyApi-side
-  confirm gesture and is now redundant + user-hostile. Plan:
-  keep `forcePrompt` on signup-mode + explicit re-consent flows
-  only; plain returning-user logins defer to the provider's own
-  grant cache. Red-first test + inline ADR, then ship. Full
-  brief: `.context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md`.
+  **`F3` Pass 2 — finish the OAuth prompt-policy cleanup.** Pass 1
+  landed on `main` (commit `959059c`, 2026-04-24): dropped
+  `max_age=0` from the Google login authorize URL, which was the
+  mechanical cause of "consent every login". Verified via expanded
+  unit coverage in `oauth-security-hardening.test.js` (landing-modal
+  snake_case path, connect-mode default, explicit `forcePrompt=0`),
+  a new `SMOKE_URL`-gated live smoke (`npm run smoke:oauth` →
+  `src/tests/oauth-authorize-url-live-smoke.test.js`) runnable
+  against any deployment, and browser-level verification with
+  Chrome DevTools MCP across all three login entry points. Pass 2
+  (queued): flip `google-adapter.js` default from `prompt:
+  'consent'` → `prompt: 'select_account'` (defence-in-depth;
+  server override wins today, but removes the trap), add
+  `invalid_grant` recovery in `refreshOAuthToken` so a revoked
+  grant self-surfaces a `REAUTH_REQUIRED` error for the dashboard
+  to render as an actionable banner, write `ADR-0017-oauth-prompt-
+  policy.md`. Full brief:
+  `.context/tasks/backlog/F3-oauth-consent-prompt-once-per-grant.md`.
 - **Other backlog (carried from M3 live smoke):**
   - **`F1`** — SPA routes freshly-authenticated users to `/`
     instead of `/dashboard/` after the confirm-gesture click

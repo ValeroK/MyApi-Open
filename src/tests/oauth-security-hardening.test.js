@@ -86,6 +86,47 @@ describe('OAuth security hardening', () => {
     expect(authUrl.searchParams.get('max_age')).toBeNull();
   });
 
+  test('google login via landing modal (snake_case force_prompt=1) still produces select_account (F3 regression guard)', async () => {
+    // `src/public/landing/landing.js` and the landing modal at `landing/index.html`
+    // historically use snake_case `force_prompt=1` in the query string, while
+    // the React app (`LogIn.jsx`, `SignUp.jsx`) uses camelCase `forcePrompt=1`.
+    // The server only parses camelCase — so the snake_case call lands on the
+    // default-for-login-mode branch (`explicitForcePrompt === null && mode === 'login'`
+    // ⇒ `forcePrompt = true`). That currently produces the right outcome, but
+    // it's load-bearing: if anyone ever changes the default, the landing page
+    // silently breaks and we'd be back to showing consent on every login. This
+    // test pins the behavior.
+    const res = await request(app)
+      .get('/api/v1/oauth/authorize/google?mode=login&force_prompt=1&json=1');
+
+    expect(res.status).toBe(200);
+    const authUrl = new URL(res.body.authUrl);
+    expect(authUrl.hostname).toBe('accounts.google.com');
+    expect(authUrl.searchParams.get('prompt')).toBe('select_account');
+    expect(authUrl.searchParams.get('max_age')).toBeNull();
+  });
+
+  test('google connect mode currently falls through to adapter default prompt=consent (F3 Pass 2 marker)', async () => {
+    // Connect mode (user clicks "Connect Google" from the Services page to add
+    // a service) today emits `prompt=consent` because `google-adapter.js`
+    // defaults `prompt: 'consent'` at the adapter layer and connect-mode
+    // doesn't override it. This test documents the current behavior so any
+    // behavior change is intentional and visible in review.
+    //
+    // F3 Pass 2 plans to flip the adapter default from 'consent' to
+    // 'select_account' as code-hygiene (defense-in-depth: the adapter should
+    // not be the most aggressive option by default). When that lands, this
+    // test should be updated to expect 'select_account' or null.
+    const res = await request(app)
+      .get('/api/v1/oauth/authorize/google?mode=connect&json=1');
+
+    expect(res.status).toBe(200);
+    const authUrl = new URL(res.body.authUrl);
+    expect(authUrl.hostname).toBe('accounts.google.com');
+    expect(authUrl.searchParams.get('prompt')).toBe('consent');
+    expect(authUrl.searchParams.get('max_age')).toBeNull();
+  });
+
   test('facebook login forcePrompt adds reauthenticate hint', async () => {
     const res = await request(app)
       .get('/api/v1/oauth/authorize/facebook?mode=login&forcePrompt=1&json=1');

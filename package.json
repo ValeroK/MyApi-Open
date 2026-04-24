@@ -36,6 +36,7 @@
     "docker:smoke:logs": "docker-compose -f docker-compose.smoke.yml logs -f myapi-smoke",
     "docker:smoke:shell": "docker exec -it myapi-smoke sh",
     "docker:smoke:init": "docker exec -it myapi-smoke node src/scripts/init-db.js",
+    "smoke:oauth": "jest --forceExit src/tests/oauth-authorize-url-live-smoke.test.js",
     "db:init": "node src/scripts/init-db.js",
     "db:migrate": "node src/scripts/migrate.js run",
     "db:migrate:status": "node src/scripts/migrate.js status",
