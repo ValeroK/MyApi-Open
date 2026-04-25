@@ -163,6 +163,13 @@ exercise it.
 
 ### Phase 1 — Consolidate backend to one route file
 
+**Status:** ✅ COMPLETE — split into P1a (`fb99b74`, 2026-04-24) and
+P1b (this commit). P1a ported every missing security control onto the
+live router (closed a latent 2FA bypass) and P1b deleted the shadow
+code under static tripwire pinning. See
+`.context/sessions/2026-04-24-f5-phase1a-port.md` and
+`.context/sessions/2026-04-24-f5-phase1b-shadow-deletion.md`.
+
 **Goal.** One password-auth implementation. No shadows.
 
 **Test first:**
@@ -211,6 +218,60 @@ exercise it.
 
 **Exit criteria.** Full suite green. Live docker smoke: register + login
 still works. Tripwires green.
+
+### Phase 1c — Post-shadow-deletion findings (logout audit + dead-code sweep)
+
+**Status:** ✅ COMPLETE (2026-04-25). See
+`.context/sessions/2026-04-25-f5-p1c-logout-audit.md`.
+
+**Why this exists separate from P1a/P1b.**  P1b's full verification
+matrix (rebuild + Jest + browser + DB forensics) surfaced two
+non-blocking findings that were too narrow to block the shadow-deletion
+commit but too compliance-relevant to defer to Phase 2:
+
+1. The live `/logout` handler clears the session and unregisters the
+   SOC2 concurrent-session entry but never emits a `user_logout` audit
+   row.  Auditors could see `user_login` events that never end —
+   session lifetimes were not reconstructable from the audit log
+   alone.
+2. `/register` writes `global.sessions[sessionToken]` and returns
+   `data.token` to the client, but **nothing in the codebase ever reads
+   `global.sessions`**.  The dashboard's real master Bearer token is
+   minted lazily by `/auth/me` into `access_tokens`.  The register-time
+   token was dead bytes that could be mistaken for a Bearer credential,
+   and the 15-minute reaper in `src/index.js` (`cleanupExpiredSessions`)
+   was sweeping a Map nobody read.
+
+**Delivered.**
+- `src/routes/auth.js` `/logout`: emit `createAuditLog({ action:
+  'user_logout', requesterId: userId, scope: 'session', resource:
+  '/users/<id>', ip, details: { sid } })` inside the
+  `if (userId && sid)` guard so anonymous logouts skip; deleted the
+  orphaned `global.sessions` sweep loop.  `[Auth/Logout] user_logout
+  audited` `logger.info` breadcrumb correlates app log ↔ audit trail by
+  sid.
+- `src/routes/auth.js` `/register`: deleted the `sessionToken`
+  generation, the `global.sessions[sessionToken] = …` write, and the
+  `token` field in the 201 response.  Added an `[Auth/Register] user
+  registered` breadcrumb.
+- `src/index.js`: deleted the `cleanupExpiredSessions` function (~22
+  lines) and its `setInterval(…, 15 * 60 * 1000)` registration.
+- `src/tests/f5-logout-audit-and-session-cleanup.test.js` — 7 tests:
+  audit emit (positive + anonymous-guard), `data.token` removal,
+  `global.sessions` no-mutation, three static tripwires.
+
+**Verification.**  Full Jest 589 pass / 22 skip / 0 fail (+7 new vs.
+P1b baseline 582).  Static greps clean.  Docker smoke + live SQLite
+forensics confirmed the three-row `user_register → user_login →
+user_logout` lifecycle for a fresh password user; anonymous logout
+produced 0 audit rows.  Browser e2e (Chrome devtools, fetch from
+`/dashboard/`) reproduced the same lifecycle end-to-end.
+
+**Breaking-change surface.**  `POST /api/v1/auth/register` no longer
+returns a top-level `data.token` field.  The field carried no auth
+power (it was a key into a write-only in-memory map).  No internal
+caller or test reads it; no API consumer was found via grep.  Risk
+classified low.
 
 ### Phase 2 — Harden hashing primitive
 

@@ -2215,7 +2215,9 @@ checkDbIntegrity();
 // For now we support BOTH:
 // - Dashboard (human): cookie session (preferred)
 // - API agents: Bearer tokens
-const authRoutes = require('./auth');
+// F5.1 P1b — `src/auth.js` (legacy `authRoutes`) was deleted.  Its
+// `/auth/has-users` endpoint had no production callers and every
+// other handler was already shadowed by `./routes/auth` below.
 const deviceRoutes = require('./routes/devices');
 const dashboardRoutes = require('./routes/dashboard');
 const createServicesRoutes = require('./routes/services');
@@ -2226,7 +2228,7 @@ const newAuthRoutes = require('./routes/auth');
 
 app.use('/api/v1/auth', newAuthRoutes);
 
-// AFP binary downloads — public, no auth (must be BEFORE the authRoutes catch-all below)
+// AFP binary downloads — public, no auth
 {
   // In Docker the src/ contents live at /app/ directly; connectors are at /app/afp-dist (copied in).
   // In dev the project root is one level up from __dirname (src/).
@@ -2290,7 +2292,6 @@ app.use('/api/v1/auth', newAuthRoutes);
   });
 }
 
-app.use('/api/v1', authRoutes);
 app.use('/api/v1/devices', authenticate, deviceRoutes);
 // Device approval is now applied globally in the authenticate middleware
 app.use('/api/v1/dashboard', authenticate, dashboardRoutes);
@@ -6824,261 +6825,17 @@ app.delete('/api/v1/vault/:tokenId/revoke', authenticate, (req, res) => {
 });
 
 // ============================
-// PUBLIC AUTH (Register + Login)
+// PUBLIC AUTH (Register + Login + Token-Login + Me)
+// ----------------------------------------------------
+// F5.1 P1b — All four inline shadow handlers were deleted.
+// Their feature-complete replacements live in `src/routes/auth.js`
+// and are mounted via `app.use('/api/v1/auth', newAuthRoutes)`
+// near the top of this file.  Deletion was preceded by F5.1 P1a
+// porting all missing security controls (2FA enforcement, audit
+// logging, rate limiting, SOC2 session registry, consent
+// timestamps) and F5.1 P1b porting the missing /logout SOC2
+// cleanup and /token-login audit log.
 // =============================
-app.post("/api/v1/auth/register", authRateLimit, requireBetaSlot, (req, res) => {
-  const { username, password, display_name, email, timezone, accepted_terms_at, accepted_privacy_policy_at } = req.body;
-  if (!username || !password) return res.status(400).json({ error: "username and password are required" });
-
-  if (!isStrongPassword(password)) {
-    return res.status(400).json({ error: "Password must be at least 8 characters and contain 3 of: uppercase, lowercase, number, symbol" });
-  }
-
-  try {
-    const now = new Date().toISOString();
-    const consentTimestamps = {
-      acceptedTermsAt: accepted_terms_at || now,
-      acceptedPrivacyPolicyAt: accepted_privacy_policy_at || now,
-    };
-    const user = createUser(username, display_name || username, email, timezone, password, 'free', null, consentTimestamps);
-    betaMode.invalidateBetaFullCache();
-    createAuditLog({ requesterId: user.id, action: "user_register", resource: `/users/${user.id}`, scope: "public", ip: req.ip });
-    res.status(201).json({ data: user });
-  } catch (e) {
-    if (e.message && e.message.includes("UNIQUE")) {
-      return res.status(409).json({ error: "Username already exists" });
-    }
-    res.status(500).json({ error: "Registration failed" });
-  }
-});
-
-// BUG-15: Add rate limiting to login endpoint to prevent brute force attacks
-app.post("/api/v1/auth/login", authRateLimit, async (req, res) => {
-  try {
-    const { username, email, password, totpCode } = req.body;
-
-    // Support both username and email login
-    let user = null;
-    if (username) {
-      user = getUserByUsername(username);
-    } else if (email) {
-      user = getUserByEmail(email);
-    }
-
-    if (!user) return res.status(401).json({ error: "Invalid email or password" });
-
-    const valid = await bcrypt.compare(password, user.password_hash || '').catch(() => false);
-    if (!valid) {
-      createAuditLog({
-        requesterId: 'unknown',
-        action: 'failed_login',
-        resource: `/auth/login`,
-        scope: 'session',
-        ip: req.ip,
-        details: { username: user.username, reason: 'invalid_credentials' }
-      });
-      alerting.trackFailedLogin(req.ip);
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
-
-    if (user.twoFactorEnabled) {
-      if (!totpCode) {
-        return res.status(401).json({ error: "2FA code required", requires2FA: true });
-      }
-      const verified = speakeasy.totp.verify({
-        secret: user.totpSecret,
-        encoding: 'base32',
-        token: String(totpCode).replace(/\s+/g, ''),
-        window: 2,
-      });
-      if (!verified) {
-        createAuditLog({
-          requesterId: user.id,
-          action: '2fa_failed_attempt',
-          resource: '/auth/login',
-          scope: 'session',
-          ip: req.ip,
-          details: { reason: 'invalid_code' }
-        });
-        alerting.trackFailedLogin(req.ip);
-        return res.status(401).json({ error: "Invalid 2FA code", requires2FA: true });
-      }
-      // Replay protection: reject if this exact code was already used recently
-      const totpKey = String(totpCode).replace(/\s+/g, '');
-      if (isTotpCodeUsed(user.id, totpKey)) {
-        return res.status(401).json({ error: '2FA code already used. Wait for the next code.', requires2FA: true });
-      }
-      markTotpCodeUsed(user.id, totpKey);
-    }
-
-    // Regenerate session and set user
-    req.session.regenerate((err) => {
-      if (err) {
-        console.error('[login] Session regenerate error:', err);
-        return res.status(500).json({ error: 'Session error' });
-      }
-
-      // Get or create workspace for user
-      const workspace = getOrEnsureUserWorkspace(user.id);
-      
-      // Set session user
-      req.session.user = {
-        id: user.id,
-        username: user.username,
-        displayName: user.displayName || user.username,
-        email: user.email,
-        avatarUrl: user.avatarUrl || null,
-        twoFactorEnabled: Boolean(user.twoFactorEnabled),
-        roles: user.roles || 'user',
-      };
-      
-      // Set current workspace
-      req.session.currentWorkspace = workspace.id;
-      
-      // Save session
-      req.session.save((saveErr) => {
-        if (saveErr) {
-          console.error('[login] Session save error:', saveErr);
-          return res.status(500).json({ error: 'Session error' });
-        }
-
-        // SOC2 CC6: Track session, evict oldest if user exceeds max concurrent sessions
-        registerUserSession(user.id, req.sessionID);
-
-        createAuditLog({
-          requesterId: user.id,
-          action: "user_login",
-          resource: `/users/${user.id}`,
-          scope: "session",
-          ip: req.ip
-        });
-
-        res.json({
-          success: true,
-          userId: user.id,
-          user: {
-            id: user.id,
-            username: user.username,
-            displayName: user.displayName,
-            email: user.email,
-            twoFactorEnabled: Boolean(user.twoFactorEnabled)
-          }
-        });
-      });
-    });
-  } catch (err) {
-    console.error('[login] Error:', err);
-    res.status(500).json({ error: 'Login error' });
-  }
-});
-
-// Token-based login (for API access tokens)
-app.post("/api/v1/auth/token-login", authRateLimit, async (req, res) => {
-  const { token } = req.body;
-  if (!token) return res.status(400).json({ error: "token is required" });
-
-  // Verify token against stored tokens
-  const tokens = getAccessTokens();
-  let tokenRecord = null;
-  for (const t of tokens) {
-    if (!t.revokedAt && t.hash && await bcrypt.compare(token, t.hash).catch(() => false)) {
-      tokenRecord = t;
-      break;
-    }
-  }
-
-  if (!tokenRecord || tokenRecord.revokedAt) {
-    return res.status(401).json({ error: "Invalid or revoked token" });
-  }
-
-  // Create session
-  const sessionToken = crypto.randomBytes(32).toString('hex');
-  if (!global.sessions) global.sessions = {};
-  global.sessions[sessionToken] = {
-    tokenId: tokenRecord.tokenId,
-    ownerId: tokenRecord.ownerId,
-    scope: tokenRecord.scope,
-    createdAt: Date.now()
-  };
-
-  createAuditLog({
-    requesterId: tokenRecord.tokenId,
-    action: "token_login",
-    resource: "/auth/token-login",
-    scope: tokenRecord.scope,
-    ip: req.ip
-  });
-
-  res.json({
-    data: {
-      sessionToken,
-      token: tokenRecord.tokenId,
-      scope: tokenRecord.scope,
-      message: "Token authentication successful"
-    }
-  });
-});
-
-app.get("/api/v1/auth/me", (req, res) => {
-  // Cookie-session auth (OAuth login path)
-  if (req.session && req.session.user) {
-    const sessionUser = req.session.user;
-    // Enrich with full user profile from DB so callers get a complete user object
-    const dbUser = sessionUser.id ? getUserById(String(sessionUser.id)) : null;
-    const merged = dbUser ? { ...dbUser, ...sessionUser } : sessionUser;
-    const normalizedUser = {
-      ...merged,
-      displayName: merged.displayName || merged.display_name || merged.username || null,
-      avatarUrl: merged.avatarUrl || merged.avatar_url || null,
-      email: merged.email || null,
-    };
-
-    // Keep backward compatibility (flat shape) while exposing canonical user payload.
-    return res.json({
-      success: true,
-      ...normalizedUser,
-      user: normalizedUser,
-      // SECURITY: Do NOT expose masterToken in plaintext
-      // The frontend uses the masterToken from localStorage (set during login/2FA flow)
-      bootstrap: req.session.masterTokenId
-        ? { tokenId: req.session.masterTokenId, hasToken: true }
-        : null,
-    });
-  }
-
-  // Legacy bearer session-token auth
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: "Not authenticated" });
-  const token = authHeader.replace("Bearer ", "");
-  if (global.sessions && global.sessions[token]) {
-    const session = global.sessions[token];
-    const SESSION_TTL = 8 * 60 * 60 * 1000;
-    if (!session.createdAt || Date.now() - session.createdAt > SESSION_TTL) {
-      delete global.sessions[token];
-      return res.status(401).json({ error: 'Session expired' });
-    }
-    const user = getUserById(session.userId);
-    if (user) {
-      const normalizedUser = {
-        ...user,
-        displayName: user.displayName || user.display_name || user.username || null,
-        avatarUrl: user.avatarUrl || user.avatar_url || null,
-        email: user.email || null,
-      };
-
-      return res.json({
-        success: true,
-        user: normalizedUser,
-        data: normalizedUser,
-        // SECURITY: Do NOT expose masterToken in plaintext
-        bootstrap: session.masterTokenId
-          ? { tokenId: session.masterTokenId, hasToken: true }
-          : null,
-      });
-    }
-  }
-  res.status(401).json({ error: "Invalid session" });
-});
 
 // GET /api/v1/auth/session-token - One-shot endpoint: returns master token from session, then clears it
 // Used by the frontend after OAuth login to retrieve the token without exposing it in cookies
@@ -7668,63 +7425,12 @@ app.post('/api/v1/auth/2fa/challenge', twoFactorRateLimit, (req, res) => {
   }
 });
 
-app.post("/api/v1/auth/logout", (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const token = authHeader.replace("Bearer ", "");
-    if (global.sessions) delete global.sessions[token];
-  }
-
-  // Always clear all auth cookies, regardless of session store outcome.
-  clearAuthCookies(req, res);
-
-  if (!req.session) {
-    return res.json({ ok: true });
-  }
-
-  const sid = req.sessionID;
-
-  // SOC2 CC6: Remove from concurrent session registry
-  if (req.session.user?.id) unregisterUserSession(req.session.user.id, sid);
-
-  // BUG-12: Ensure ALL session data is cleared before responding
-  // Clear all session properties that might contain sensitive data
-  delete req.session.pending_2fa_user;
-  delete req.session.user;
-  delete req.session.masterTokenRaw;
-  delete req.session.masterTokenId;
-  // M3 / T3.7: `oauth_login_pending` and `oauth_confirm` are no longer
-  // written anywhere — the `oauth_pending_logins` DB row is the sole
-  // source of truth for the post-callback gesture. Left out of the
-  // logout cleanup intentionally so the inventory gate stays green.
-  delete req.session.oauth_signup;
-  delete req.session.isFirstLogin;
-  delete req.session.currentWorkspace;
-
-  // Destroy session and wait for completion before responding
-  req.session.destroy((err) => {
-    // Also attempt to destroy from store if available
-    if (typeof req.sessionStore?.destroy === 'function' && sid) {
-      try {
-        req.sessionStore.destroy(sid, (storeErr) => {
-          if (storeErr) {
-            console.warn('[logout] session store destroy returned error:', storeErr.message);
-          }
-        });
-      } catch (e) {
-        console.warn('[logout] session store destroy threw error:', e.message);
-      }
-    }
-
-    if (err) {
-      console.error('[logout] session destroy failed:', err.message);
-      return res.status(500).json({ ok: false, error: 'Failed to logout cleanly' });
-    }
-
-    // Send response only after session is fully destroyed
-    res.json({ ok: true, message: 'Logged out successfully' });
-  });
-});
+// F5.1 P1b — `/api/v1/auth/logout` shadow handler was deleted.
+// The live route lives in `src/routes/auth.js` and includes:
+//   - `unregisterUserSession` (SOC2 CC6 concurrent-session cap)
+//   - `delete req.session.oauth_signup`
+//   - `delete req.session.isFirstLogin`
+// All ported from this block in P1b before deletion.
 
 // SOC2 CC6 — Revoke all active sessions for the current user
 app.post('/api/v1/auth/sessions/revoke-all', (req, res) => {
@@ -12794,28 +12500,11 @@ function validateRequiredSecrets() {
   console.log('✅ All required secrets validated');
 }
 
-// Cleanup function for global.sessions (P0 Security Fix: Session Memory Leak)
-function cleanupExpiredSessions() {
-  if (!global.sessions) return;
-
-  const now = Date.now();
-  const sessionTTL = 8 * 60 * 60 * 1000; // 8 hours (SOC2 CC6)
-  let cleanedCount = 0;
-
-  for (const [sessionToken, sessionData] of Object.entries(global.sessions)) {
-    if (sessionData && sessionData.createdAt) {
-      const age = now - sessionData.createdAt;
-      if (age > sessionTTL) {
-        delete global.sessions[sessionToken];
-        cleanedCount++;
-      }
-    }
-  }
-
-  if (cleanedCount > 0) {
-    console.log(`[Session Cleanup] Expired ${cleanedCount} old sessions (8-hour TTL)`);
-  }
-}
+// F5.1 P1c — `cleanupExpiredSessions` was removed alongside the
+// orphaned `global.sessions` writes.  The map was never read for
+// authentication; real session expiry is owned by the express-session
+// store and the master Bearer token lives in the `access_tokens`
+// table.
 
 // Sentry error handler must be registered after all routes
 if (Sentry) {
@@ -12936,11 +12625,9 @@ if (process.env.NODE_ENV !== 'test') {
       cleanupOldRateLimits(24); // Keep 24 hours of history
     }, 60 * 60 * 1000); // 1 hour
 
-    // P0 Security Fix: Cleanup expired sessions every 15 minutes (8-hour TTL)
-    setInterval(() => {
-      cleanupExpiredSessions();
-    }, 15 * 60 * 1000); // Every 15 minutes
-    console.log('✅ Session cleanup scheduled (8-hour TTL, 15-min check interval)');
+    // F5.1 P1c — the 15-minute reaper for `global.sessions` is
+    // gone (the map was write-only; nothing read it for auth).
+    // express-session manages real session expiry on its own.
 
     // SOC2 CC6/P: Execute retention cleanup on startup and daily (per workspace policies)
     const runRetentionCleanup = () => {

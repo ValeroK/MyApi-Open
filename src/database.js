@@ -791,6 +791,13 @@ function initDatabase() {
   safeMigration("ALTER TABLE users ADD COLUMN totp_secret TEXT");
   safeMigration("ALTER TABLE users ADD COLUMN two_factor_enabled INTEGER DEFAULT 0");
 
+  // F5.1 P1b — moved here from the deleted `src/auth.js` legacy file.
+  // The legacy module added these columns as a side-effect of `require()`,
+  // which broke once P1b removed the import.  Owning the migration here
+  // keeps password registration working on tree-of-truth schemas.
+  safeMigration("ALTER TABLE users ADD COLUMN roles TEXT DEFAULT 'user'");
+  safeMigration("ALTER TABLE users ADD COLUMN last_login TEXT");
+
   // Per-user extended identity storage (JSON blob for fields beyond the core users columns)
   safeMigration("ALTER TABLE users ADD COLUMN profile_metadata TEXT DEFAULT NULL");
 

@@ -30,6 +30,7 @@ const { invalidateBetaFullCache } = require('../lib/betaMode');
 const {
   authRateLimit,
   registerUserSession,
+  unregisterUserSession,
   isTotpCodeUsed,
   markTotpCodeUsed,
 } = require('../lib/authHardening');
@@ -157,6 +158,29 @@ router.post('/token-login', authRateLimit, requireCsrfForSession, async (req, re
     req.session.masterToken = token;
     req.session.authMethod = 'token';
     req.session.user = { id: validToken.ownerId };
+
+    // SOC2 CC7 — emit a `token_login` audit event so master-token logins
+    // produce the same compliance trail as password logins.  The legacy
+    // inline shadow in `src/index.js` used to own this; restoring it here
+    // before P1b deletes the shadow.  We use the token-id as the requester
+    // (mirrors the legacy contract — the token, not the human owner, is
+    // what authenticated this request) and stash the owner under details
+    // so cross-correlation queries still work.
+    try {
+      createAuditLog({
+        requesterId: validToken.tokenId || validToken.id || null,
+        action: 'token_login',
+        resource: '/auth/token-login',
+        scope: validToken.scope || 'session',
+        ip: req.ip,
+        details: { ownerId: validToken.ownerId || null },
+      });
+    } catch (auditErr) {
+      logger.warn('[Auth/TokenLogin] token_login audit emit error', {
+        err: auditErr?.message,
+      });
+    }
+
     req.session.save((err) => {
       if (err) return res.status(500).json({ error: 'Session error' });
       res.json({ success: true, message: 'Logged in with token' });
@@ -454,16 +478,29 @@ router.post(
       emailService.sendWelcomeEmail(email, display_name || username).catch(() => {});
     }
 
-    // Auto-login after registration
+    // Auto-login after registration — the session cookie carries
+    // authentication; clients should rely on it (or the master token
+    // returned by `/auth/me`'s bootstrap payload) rather than a token
+    // field on this response.  F5.1 P1c removed the legacy
+    // `data.token` field because nothing in the codebase ever read
+    // back the in-memory map it was paired with — the field was dead
+    // bytes that could be mistaken for a Bearer credential.
     req.session.user = { id, username, display_name: display_name || username, roles: 'user', needsOnboarding: true };
 
-    // Generate session token
-    const sessionToken = crypto.randomBytes(32).toString('hex');
-    if (!global.sessions) global.sessions = {};
-    global.sessions[sessionToken] = { userId: id, username, createdAt: Date.now() };
+    logger.info('[Auth/Register] user registered', { userId: id, username });
 
-    // FIX BUG-3: Return 201 for successful creation
-    return res.status(201).json({ data: { token: sessionToken, user: { id, username, displayName: display_name || username, email: email || '', timezone: timezone || 'UTC' }, needsOnboarding: true } });
+    return res.status(201).json({
+      data: {
+        user: {
+          id,
+          username,
+          displayName: display_name || username,
+          email: email || '',
+          timezone: timezone || 'UTC',
+        },
+        needsOnboarding: true,
+      },
+    });
   } catch (err) {
     logger.error('Registration error:', err);
     return res.status(500).json({ error: 'Registration failed' });
@@ -497,12 +534,13 @@ router.post('/logout', requireCsrfForSession, (req, res) => {
       }
     }
 
-    // **STEP 2: Remove user from global sessions store**
-    if (global.sessions) {
-      Object.keys(global.sessions).forEach((token) => {
-        if (global.sessions[token]?.userId === userId) delete global.sessions[token];
-      });
-    }
+    // **STEP 2: (deprecated)** The legacy `global.sessions` map was a
+    // write-only artefact of the original auth design — `/register` set
+    // it, `/logout` swept it, and a 15-minute reaper in `src/index.js`
+    // expired it, but nothing ever READ from it.  F5.1 P1c removed
+    // both the writes and the reaper.  Real session auth lives in the
+    // express-session store; the master Bearer token lives in the
+    // `access_tokens` table and is minted by `/auth/me`.
 
     // **STEP 3: Prevent browser caching**
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -532,7 +570,41 @@ router.post('/logout', requireCsrfForSession, (req, res) => {
     // **STEP 6: Invalidate session BEFORE destroying it**
     // Mark session as invalid so if it's recreated from cookie, it won't have user data
     const sid = req.sessionID;
-    
+
+    // SOC2 CC6 — drop this session from the per-user concurrent-session
+    // registry so the limit (max 3) tracks reality after logout.  Done
+    // synchronously here (before destroy) so the userId+sid are still in
+    // scope.
+    if (userId && sid) {
+      try {
+        unregisterUserSession(userId, sid);
+      } catch (regErr) {
+        logger.error('[Logout] unregisterUserSession failed:', regErr);
+      }
+
+      // SOC2 CC7 — emit a `user_logout` audit row so session lifetimes
+      // can be reconstructed from the audit trail alone.  Skipped for
+      // anonymous logouts (no actor → no audit), and emitted BEFORE
+      // session destroy so the userId/sid are still in scope.  We
+      // stash the sid under details so auditors can cross-correlate
+      // with the matching `user_login` row.
+      try {
+        createAuditLog({
+          requesterId: userId,
+          action: 'user_logout',
+          resource: `/users/${userId}`,
+          scope: 'session',
+          ip: req.ip,
+          details: { sid },
+        });
+        logger.info('[Auth/Logout] user_logout audited', { userId, sid });
+      } catch (auditErr) {
+        logger.warn('[Auth/Logout] user_logout audit emit error', {
+          err: auditErr?.message,
+        });
+      }
+    }
+
     // First, immediately clear user from session (synchronously)
     if (req.session) {
       delete req.session.user;
@@ -541,7 +613,13 @@ router.post('/logout', requireCsrfForSession, (req, res) => {
       delete req.session.masterTokenId;
       delete req.session.pending_2fa_user;
       delete req.session.currentWorkspace;
-      
+      // F5.1 P1b — clear OAuth-signup hand-off and first-login flags so a
+      // re-login on the same browser cookie cannot resurrect a stale signup
+      // funnel or onboarding banner.  Mirrors the legacy inline /logout
+      // handler that this route replaces.
+      delete req.session.oauth_signup;
+      delete req.session.isFirstLogin;
+
       // Save the cleared session first
       req.session.save((saveErr) => {
         if (saveErr) {
