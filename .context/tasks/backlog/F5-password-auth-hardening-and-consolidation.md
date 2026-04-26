@@ -7,17 +7,33 @@
   implementation, add password-reset/change flows, and surface password
   login/register in the dashboard UI alongside OAuth.
 - **Milestone.** Split into **F5.1 / F5.2 / F5.3** (see plan below).
-- **Plan reference.** This document (expanded 2026-04-24).
+- **Plan reference.** This document is the long-range roadmap.
+  The currently active sub-plan is
+  [`F5.2-working-password-auth-and-activity-log-cleanup.md`](./F5.2-working-password-auth-and-activity-log-cleanup.md).
 - **Workstream.** WS-backend + WS-frontend.
 
 ## Status
 
-- **State.** backlog → **plan-complete, awaiting design-decision approval**
+- **State.**
+    - **F5.1** ✅ COMPLETE — P1a (`fb99b74`) + P1b+P1c (`72a1b47`).
+      Backend consolidated to one router; shadows deleted; logout
+      audit gap closed; dead `global.sessions` machinery removed.
+    - **F5.2** 🟢 ACTIVE — see
+      [`F5.2-working-password-auth-and-activity-log-cleanup.md`](./F5.2-working-password-auth-and-activity-log-cleanup.md).
+      Covers password reset, change-password, full UI surface, and an
+      activity-log noise cleanup that was promoted out of F5.1's
+      verification findings.  This is what's currently in flight.
+    - **F5.3** ⏸ DEFERRED — security posture hardening: bcrypt cost
+      12 → 14 + upgrade-on-login (orig. Phase 2), HIBP k-anonymity +
+      common-password block (orig. Phase 3), per-email account
+      lockout (orig. Phase 4).  Deferred per user decision on
+      2026-04-26: stable working system first, security posture
+      second.
 - **Assignee.** unassigned
-- **Started.** —
-- **Target done.** F5.1 opportunistic after F4 ships; F5.2 when UX capacity
-  available; F5.3 future.
-- **Actually done.** —
+- **Started.** F5.1 P1a 2026-04-23.
+- **Target done.** F5.2 backend (P0+P1+P2) as one milestone, F5.2 UI
+  (P3.1–P3.4) as the second milestone.  F5.3 future.
+- **Actually done.** F5.1 — 2026-04-25 (`72a1b47`).
 
 ## Why (1-paragraph context)
 
@@ -275,6 +291,11 @@ classified low.
 
 ### Phase 2 — Harden hashing primitive
 
+> **⏸ DEFERRED to F5.3** (2026-04-26 — user decision: stable working
+> system first, security posture second).  Original detailed plan
+> retained below for reference and pickup later.
+
+
 **Goal.** bcrypt cost 12 → 14, with silent upgrade-on-login for existing
 users.
 
@@ -312,6 +333,9 @@ integration test. Cost bump live in docker smoke.
 
 ### Phase 3 — Password policy + HIBP
 
+> **⏸ DEFERRED to F5.3** (2026-04-26).  Original plan retained below.
+
+
 **Goal.** Stop users from registering known-compromised passwords without
 leaking the candidate to the API.
 
@@ -344,6 +368,12 @@ leaking the candidate to the API.
 still succeeds instantly when HIBP is stubbed to fail.
 
 ### Phase 4 — Account lockout (per-email + per-IP)
+
+> **⏸ DEFERRED to F5.3** (2026-04-26).  F5.2 P1 mitigates the
+> reset-flood vector with a per-email rate limit on
+> `/auth/password/reset/request` (3/hour); broader account lockout
+> stays in F5.3.  Original plan retained below.
+
 
 **Goal.** Brute-force defense above the per-IP `authRateLimit` we already
 have.
@@ -390,6 +420,13 @@ have.
 covers the full lock → reset-email-bypass → success cycle.
 
 ### Phase 5 — Password reset flow
+
+> **🟢 SUPERSEDED by F5.2 P1** (active).  See
+> [`F5.2-working-password-auth-and-activity-log-cleanup.md`](./F5.2-working-password-auth-and-activity-log-cleanup.md)
+> §"Phase 1 — Password reset flow" for the implementation plan that
+> ships now (token TTL 2h per D3, etc.).  Original plan retained
+> below for reference.
+
 
 **Goal.** User forgets password, recovers via email, no pre-existing
 session required.
@@ -455,6 +492,10 @@ the email link works end-to-end.
 
 ### Phase 6 — Change password (authenticated)
 
+> **🟢 SUPERSEDED by F5.2 P2** (active).  See F5.2 §"Phase 2 — Change
+> password + session revocation".  Original plan retained below.
+
+
 **Goal.** A logged-in user can change their password without going through
 the reset email dance.
 
@@ -490,6 +531,12 @@ jars) proves session A stays logged in and session B is 401 after the
 password change.
 
 ### Phase 7 — F4 integration (optional — GO/NO-GO at Phase 0)
+
+> **🟢 SUPERSEDED by F5.2 P3** (active).  See F5.2 §"Phase 3 —
+> Dashboard UI surface" — split into P3.1 (LogIn.jsx), P3.2
+> (SignUp.jsx), P3.3 (forgot/reset pages), P3.4 (change-password
+> panel).  Original plan retained below.
+
 
 **Goal.** Represent password auth as a row in `user_identity_links` so
 *"how does this user authenticate"* is a single SELECT, not a union of
