@@ -12,6 +12,12 @@ in the live dashboard.
 
 ## 0. Pre-flight (30 seconds)
 
+> **Got the dashboard from before this commit cached?** Run
+> `npm run dashboard:reload` once. It rebuilds the SPA *and* restarts
+> the smoke container so the new `Cache-Control: no-store` header on
+> the SPA shell takes effect. After that, plain F5 / Ctrl+F5 is enough
+> for every future rebuild.
+
 1. Open an **Incognito / Private window** (so cached cookies don't pollute the test).
 2. Open DevTools → **Network** tab. Leave it open across the whole flow.
 3. Pick a unique identity for this run, e.g.:

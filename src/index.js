@@ -1390,7 +1390,14 @@ function getDashboardHtml() {
   }
 }
 
-app.use('/dashboard/assets', express.static(path.join(dashboardDistPath, 'assets')));
+// Hashed bundles in /dashboard/assets/ are content-addressed and immutable for
+// the lifetime of the file (Vite changes the hash on every rebuild). Tell the
+// browser it can keep them forever — when the SPA shell ships a new index.html,
+// it'll just point at a new hash, no revalidation round-trip needed.
+app.use('/dashboard/assets', express.static(path.join(dashboardDistPath, 'assets'), {
+  immutable: true,
+  maxAge: '1y',
+}));
 app.use('/dashboard', (req, res, next) => {
   // Only serve non-HTML static files directly (images, favicons, etc)
   if (/\.(js|css|svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot)$/i.test(req.path)) {
@@ -1403,6 +1410,15 @@ app.use('/dashboard', (req, res, next) => {
   const patched = html
     .replace(/<script(\b[^>]*)>/gi, (_, attrs) => `<script${attrs} nonce="${nonce}">`)
     .replace(/<link(\b[^>]*rel=["']stylesheet["'][^>]*)>/gi, (_, attrs) => `<link${attrs} nonce="${nonce}">`);
+  // The SPA shell references hashed asset URLs, so it MUST be served fresh on
+  // every navigation — otherwise a cached `index.html` keeps pointing at a
+  // bundle hash that no longer exists after `npm run dashboard:rebuild`,
+  // leaving the user staring at an old UI (or a hard 404 on the asset).
+  // `no-store` defeats both disk + memory caches; `must-revalidate` forbids
+  // intermediaries from serving a stale copy.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(patched);
 });

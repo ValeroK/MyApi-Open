@@ -27,6 +27,7 @@
     "dashboard:install": "npm install --prefix src/public/dashboard-app",
     "dashboard:build": "npm run build --prefix src/public/dashboard-app",
     "dashboard:rebuild": "npm run dashboard:install && npm run dashboard:build",
+    "dashboard:reload": "npm run dashboard:rebuild && (docker restart myapi-smoke || echo \"smoke container not running, skipping restart\")",
     "build:docker": "docker-compose build",
     "docker:up": "docker-compose up -d",
     "docker:down": "docker-compose down",
