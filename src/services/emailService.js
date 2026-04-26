@@ -355,6 +355,74 @@ class EmailService {
   }
 
   /**
+   * Send a password-reset email with a one-time link.
+   * Fire-and-forget: caller should not await for blocking purposes.
+   * F5.2 P1 — link expires in 2 hours per the issuance contract.
+   */
+  async sendPasswordResetEmail(toEmail, resetLink) {
+    if (!toEmail || !this.fromAddress) return;
+    if (!resetLink || typeof resetLink !== 'string') {
+      throw new Error('resetLink is required');
+    }
+    const base = (process.env.PUBLIC_URL || process.env.BASE_URL || 'https://www.myapiai.com').replace(/\/$/, '');
+    const html = `<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reset your MyApi password</title></head>
+<body style="margin:0;padding:0;background:#020617;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#020617;padding:32px 12px;">
+  <tr><td align="center">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;">
+      <tr><td style="background:linear-gradient(135deg,#1e3a8a 0%,#7c3aed 100%);border-radius:16px 16px 0 0;padding:28px 32px;">
+        <p style="margin:0 0 6px 0;font-size:13px;font-weight:600;color:rgba(255,255,255,0.7);letter-spacing:1px;text-transform:uppercase;">MyApi Account</p>
+        <h1 style="margin:0;font-size:26px;font-weight:800;color:#fff;line-height:1.3;">Reset your password</h1>
+      </td></tr>
+      <tr><td style="background:#0f172a;border:1px solid #1e293b;border-top:none;border-radius:0 0 16px 16px;padding:28px 32px;">
+        <p style="margin:0 0 16px 0;font-size:15px;line-height:1.7;color:#cbd5e1;">
+          Someone (hopefully you) asked to reset the password for your MyApi account. Click the button below to choose a new password.
+        </p>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:6px 0 18px 0;">
+          <tr><td align="center">
+            <a href="${resetLink}" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;text-decoration:none;font-size:15px;font-weight:700;padding:14px 32px;border-radius:10px;letter-spacing:0.2px;">Reset my password</a>
+          </td></tr>
+        </table>
+        <p style="margin:0 0 12px 0;font-size:13px;color:#94a3b8;line-height:1.6;">
+          This link expires in <strong style="color:#cbd5e1;">2 hours</strong> and can only be used once. If you didn't ask to reset your password, you can safely ignore this email — your current password will keep working.
+        </p>
+        <p style="margin:18px 0 0 0;font-size:12px;color:#475569;line-height:1.6;text-align:center;">
+          <a href="${base}" style="color:#3b82f6;text-decoration:none;">myapiai.com</a>
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+    const data = {
+      email_address: toEmail.trim(),
+      subject: 'Reset your MyApi password',
+      body: `Reset your MyApi password using this link (valid for 2 hours): ${resetLink}\n\nIf you didn't request this, you can safely ignore this email.`,
+      html_body: html,
+    };
+    try {
+      if (this.provider === 'resend') {
+        await this.sendEmailViaResend(data);
+      } else {
+        if (!this.transporter) throw new Error('Email service not configured');
+        await this.transporter.sendMail({
+          from: `${this.fromName} <${this.fromAddress}>`,
+          to: data.email_address,
+          subject: data.subject,
+          text: data.body,
+          html: data.html_body,
+        });
+      }
+      console.log(`[Email] Password reset email sent to ${toEmail}`);
+    } catch (err) {
+      console.error(`[Email] Failed to send password reset email to ${toEmail}:`, err.message);
+    }
+  }
+
+  /**
    * Send goodbye email when a user deletes their account.
    * Must be called BEFORE the user record is deleted.
    * Fire-and-forget: failures are logged only.

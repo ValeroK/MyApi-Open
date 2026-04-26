@@ -31,6 +31,7 @@ const {
   authRateLimit,
   registerUserSession,
   unregisterUserSession,
+  revokeAllUserSessions,
   isTotpCodeUsed,
   markTotpCodeUsed,
 } = require('../lib/authHardening');
@@ -869,6 +870,330 @@ router.get('/me', async (req, res) => {
     logger.error('Get user error:', error);
     res.status(500).json({ error: 'Failed to get user' });
   }
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// F5.2 P1 — Password reset flow
+// ──────────────────────────────────────────────────────────────────────
+
+// Per-email rate limit for /password/reset/request: at most 3 successful
+// issuances per email address per rolling hour.  Per-IP throttling is
+// already enforced by `authRateLimit` on the route.  Keyed by
+// sha256(email).slice(0, 16) so we never log raw addresses in memory.
+const PASSWORD_RESET_PER_EMAIL_LIMIT = 3;
+const PASSWORD_RESET_PER_EMAIL_WINDOW_MS = 60 * 60 * 1000;
+const passwordResetEmailHits = new Map(); // emailKey → number[] timestamps
+
+function emailKey(email) {
+  return crypto
+    .createHash('sha256')
+    .update(String(email || '').toLowerCase())
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function checkPerEmailRateLimit(email) {
+  const key = emailKey(email);
+  const now = Date.now();
+  const cutoff = now - PASSWORD_RESET_PER_EMAIL_WINDOW_MS;
+  const hits = (passwordResetEmailHits.get(key) || []).filter((t) => t > cutoff);
+  if (hits.length >= PASSWORD_RESET_PER_EMAIL_LIMIT) {
+    passwordResetEmailHits.set(key, hits);
+    return { allowed: false, count: hits.length };
+  }
+  hits.push(now);
+  passwordResetEmailHits.set(key, hits);
+  return { allowed: true, count: hits.length };
+}
+
+const PASSWORD_RESET_TOKEN_TTL_MS = 2 * 60 * 60 * 1000; // 2h per F5.2 D3
+
+/**
+ * POST /api/v1/auth/password/reset/request
+ *
+ * Always responds 202 to avoid leaking whether the email maps to a
+ * real account.  If the email IS known, a 32-byte raw token is minted,
+ * its bcrypt hash is persisted alongside `expires_at = now + 2h`, and
+ * a reset link is emailed via `emailService.sendPasswordResetEmail`.
+ *
+ * Per-IP throttling: existing `authRateLimit` on the router (1000/min
+ * in test mode, lower in prod via env).  Per-email throttling: 3 hits
+ * per rolling hour.  When the per-email cap is hit we still return
+ * 429 to slow down attackers spraying one address — the timing
+ * difference is acceptable because the cap only triggers AFTER the
+ * email has been successfully issued 3 times, so it can't be used
+ * as an oracle for "does this email exist?" without the attacker
+ * already knowing.
+ */
+router.post('/password/reset/request', authRateLimit, async (req, res) => {
+  const { email } = req.body || {};
+  const ip = req.ip;
+
+  // Validate shape early.  Don't 400 on a missing email — that would
+  // also be an oracle.  Just treat it as "unknown email".
+  const safeEmail = typeof email === 'string' ? email.trim() : '';
+
+  // Per-email rate limit BEFORE the user lookup so attackers can't
+  // bypass it by spraying unknown addresses.
+  if (safeEmail) {
+    const { allowed } = checkPerEmailRateLimit(safeEmail);
+    if (!allowed) {
+      return res.status(429).json({ error: 'Too many reset requests for this email. Try again later.' });
+    }
+  }
+
+  let userKnown = false;
+  let userId = null;
+
+  try {
+    const user = safeEmail ? getUserByEmail(safeEmail) : null;
+    if (user && user.id) {
+      userKnown = true;
+      userId = user.id;
+    }
+  } catch (e) {
+    logger.error('[Auth/PasswordReset] user lookup error', { err: e?.message });
+  }
+
+  if (userKnown) {
+    try {
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = await bcrypt.hash(rawToken, 10);
+      const tokenId = `prt_${crypto.randomBytes(16).toString('hex')}`;
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + PASSWORD_RESET_TOKEN_TTL_MS);
+
+      db.prepare(
+        `INSERT INTO password_reset_tokens
+         (id, user_id, token_hash, expires_at, consumed_at, request_ip, created_at)
+         VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+      ).run(tokenId, userId, tokenHash, expiresAt.toISOString(), ip || null, now.toISOString());
+
+      const base = (process.env.PUBLIC_URL || process.env.BASE_URL || 'https://www.myapiai.com').replace(/\/$/, '');
+      const resetLink = `${base}/reset-password?token=${rawToken}`;
+
+      // Debug-only — surfaces the raw link in the smoke container
+      // (LOG_LEVEL=debug) so the F5.2 P1 e2e harness can pluck it
+      // from `docker logs` without a real SMTP transport.  In prod
+      // LOG_LEVEL=info silences this so we don't leak tokens.
+      logger.debug('[Auth/PasswordReset] dev link', { resetLink });
+
+      // Fire-and-forget; failures are logged inside the email service.
+      emailService.sendPasswordResetEmail(safeEmail, resetLink).catch((err) => {
+        logger.warn('[Auth/PasswordReset] email send failed', { err: err && err.message });
+      });
+
+      logger.info('[Auth/PasswordReset] request received', {
+        ip,
+        email_known: true,
+        userId,
+        tokenId,
+      });
+    } catch (err) {
+      logger.error('[Auth/PasswordReset] mint/insert error', { err: err?.message });
+    }
+  } else {
+    // Spend bcrypt work even on the unknown-email path so response
+    // time doesn't differentiate user-found from user-missing.  The
+    // spy-mocked email service path stays silent in tests.
+    try {
+      await bcrypt.hash('throwaway-equalize-timing', 10);
+    } catch (_) {
+      /* ignore */
+    }
+    logger.info('[Auth/PasswordReset] request received', { ip, email_known: false });
+  }
+
+  try {
+    createAuditLog({
+      requesterId: userId || 'unknown',
+      action: 'password_reset_requested',
+      resource: '/auth/password/reset/request',
+      scope: 'public',
+      ip,
+      details: { email_known: userKnown },
+    });
+  } catch (auditErr) {
+    logger.warn('[Auth/PasswordReset] audit emit error', { err: auditErr?.message });
+  }
+
+  return res.status(202).json({ message: 'If that email is registered, a reset link has been sent.' });
+});
+
+/**
+ * POST /api/v1/auth/password/reset/confirm
+ *
+ * Body: { token, newPassword }.  We never store raw tokens, so we
+ * iterate over unconsumed/unexpired rows and bcrypt-compare each.
+ * On match: hash the new password (bcrypt cost 12 — cost 14 deferred
+ * to F5.3), mark the token consumed, revoke ALL active sessions for
+ * the user, then establish a brand-new session so the UI can land
+ * already logged in.
+ */
+router.post('/password/reset/confirm', authRateLimit, async (req, res) => {
+  const { token, newPassword } = req.body || {};
+  const ip = req.ip;
+
+  if (typeof token !== 'string' || token.length < 32) {
+    return res.status(410).json({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+  }
+
+  // Strength check BEFORE token lookup so a successful match isn't
+  // wasted on a weak password (the token stays unconsumed and the
+  // user can retry without re-requesting).
+  const { isStrongPassword } = require('../utils/passwordUtils');
+  if (typeof newPassword !== 'string' || !isStrongPassword(newPassword)) {
+    return res.status(400).json({
+      error: 'Password must be at least 8 characters and contain 3 of: uppercase, lowercase, number, symbol',
+    });
+  }
+
+  // Candidate rows: unconsumed and unexpired.  Iterate and
+  // bcrypt-compare.  In practice this is small (most users have at
+  // most one or two pending reset tokens at a time).
+  let candidates = [];
+  try {
+    const nowIso = new Date().toISOString();
+    candidates = db
+      .prepare(
+        `SELECT id, user_id, token_hash, expires_at, consumed_at
+         FROM password_reset_tokens
+         WHERE consumed_at IS NULL AND expires_at > ?
+         ORDER BY created_at DESC
+         LIMIT 200`,
+      )
+      .all(nowIso);
+  } catch (e) {
+    logger.error('[Auth/PasswordReset] candidate query error', { err: e?.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  let matched = null;
+  for (const row of candidates) {
+    try {
+      const ok = await bcrypt.compare(token, row.token_hash);
+      if (ok) {
+        matched = row;
+        break;
+      }
+    } catch (_) {
+      /* keep iterating */
+    }
+  }
+
+  if (!matched) {
+    return res.status(410).json({ error: 'INVALID_OR_EXPIRED_TOKEN' });
+  }
+
+  let newHash;
+  try {
+    newHash = await bcrypt.hash(newPassword, 12);
+  } catch (e) {
+    logger.error('[Auth/PasswordReset] hash error', { err: e?.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  try {
+    // Two-statement sequential update.  Password write first so that
+    // if `consumed_at` fails the user can still log in with the new
+    // password (the token will still expire on its own TTL).  This
+    // keeps the failure mode strictly less bad than the alternative.
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, matched.user_id);
+    db.prepare('UPDATE password_reset_tokens SET consumed_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), matched.id);
+  } catch (e) {
+    logger.error('[Auth/PasswordReset] commit error', { err: e && e.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  // Revoke all prior sessions BEFORE establishing a new one, otherwise
+  // we'd kill the session we're about to mint.
+  try {
+    revokeAllUserSessions(matched.user_id);
+  } catch (e) {
+    logger.warn('[Auth/PasswordReset] revoke sessions failed', { err: e?.message });
+  }
+
+  // Mint a fresh session so the UI lands already authenticated.
+  try {
+    await regenerateSession(req);
+
+    let user = null;
+    try {
+      const { getUserById } = require('../database');
+      user = getUserById(matched.user_id);
+    } catch (_) {
+      /* fall back to minimal payload below */
+    }
+
+    let workspaceId = null;
+    try {
+      const ws = getOrEnsureUserWorkspace(matched.user_id);
+      workspaceId = ws?.id || null;
+    } catch (_) {
+      /* non-fatal */
+    }
+
+    let masterTokenRaw = null;
+    let masterTokenId = null;
+    try {
+      const existing = getExistingMasterToken(matched.user_id);
+      if (existing) {
+        masterTokenRaw = existing.rawToken;
+        masterTokenId = existing.tokenId;
+      }
+    } catch (_) {
+      /* non-fatal */
+    }
+
+    if (req.session) {
+      req.session.user = {
+        id: matched.user_id,
+        email: user?.email || null,
+        username: user?.username || null,
+        displayName: user?.displayName || null,
+        twoFactorEnabled: Boolean(user?.twoFactorEnabled),
+      };
+      req.session.masterTokenRaw = masterTokenRaw;
+      req.session.masterTokenId = masterTokenId;
+      if (workspaceId) req.session.currentWorkspace = workspaceId;
+    }
+
+    await new Promise((resolve) => {
+      if (!req.session?.save) return resolve();
+      req.session.save(() => resolve());
+    });
+
+    try {
+      registerUserSession(matched.user_id, req.sessionID);
+    } catch (regErr) {
+      logger.warn('[Auth/PasswordReset] registerUserSession failed', { err: regErr?.message });
+    }
+  } catch (sessErr) {
+    logger.warn('[Auth/PasswordReset] session establish error', { err: sessErr?.message });
+    // Non-fatal: the password change still committed.  The user can
+    // log in fresh on the next page load.
+  }
+
+  try {
+    createAuditLog({
+      requesterId: matched.user_id,
+      action: 'password_reset_completed',
+      resource: `/users/${matched.user_id}`,
+      scope: 'session',
+      ip,
+      details: { sid: req.sessionID || null, tokenRowId: matched.id },
+    });
+  } catch (auditErr) {
+    logger.warn('[Auth/PasswordReset] completed audit emit error', { err: auditErr?.message });
+  }
+
+  logger.info('[Auth/PasswordReset] confirmed', { userId: matched.user_id });
+
+  return res.json({
+    success: true,
+    message: 'Password updated. You are now signed in.',
+  });
 });
 
 module.exports = router;

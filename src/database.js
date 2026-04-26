@@ -798,6 +798,30 @@ function initDatabase() {
   safeMigration("ALTER TABLE users ADD COLUMN roles TEXT DEFAULT 'user'");
   safeMigration("ALTER TABLE users ADD COLUMN last_login TEXT");
 
+  // F5.2 P1 — password reset tokens.  Stores the BCRYPT HASH of the
+  // raw token (never the raw value) plus an explicit `expires_at`
+  // (ISO timestamp, +2h from creation per D3) and `consumed_at` so a
+  // single-use semantics is enforceable in SQL alone.  ON DELETE
+  // CASCADE so deleting a user purges their unused reset rows.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id           TEXT PRIMARY KEY,
+        user_id      TEXT NOT NULL,
+        token_hash   TEXT NOT NULL,
+        expires_at   TEXT NOT NULL,
+        consumed_at  TEXT,
+        request_ip   TEXT,
+        created_at   TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens(user_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)`);
+  } catch (e) {
+    console.warn('[Database] password_reset_tokens migration error:', e.message);
+  }
+
   // Per-user extended identity storage (JSON blob for fields beyond the core users columns)
   safeMigration("ALTER TABLE users ADD COLUMN profile_metadata TEXT DEFAULT NULL");
 
