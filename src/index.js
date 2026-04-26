@@ -4871,7 +4871,8 @@ app.get("/api/v1/identity", authenticate, (req, res) => {
   const identity = resolveIdentityForUser(userId);
   const effectiveScope = isMaster(req) ? "full" : "basic";
   const filtered = filterByScope(identity, effectiveScope);
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_identity", resource: "/identity", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug to drop dashboard-load noise.
+  logger.debug('[AuditDebug] read_identity', { requesterId: req.tokenMeta.tokenId, action: "read_identity", resource: "/identity", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: filtered, meta: { scope: effectiveScope } });
 });
 
@@ -4880,7 +4881,8 @@ app.get("/api/v1/identity/professional", authenticate, (req, res) => {
   const userId = getRequestOwnerId(req);
   const identity = resolveIdentityForUser(userId);
   const filtered = filterByScope(identity, "professional");
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_identity_professional", resource: "/identity/professional", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] read_identity_professional', { requesterId: req.tokenMeta.tokenId, action: "read_identity_professional", resource: "/identity/professional", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: filtered, meta: { scope: "professional" } });
 });
 
@@ -4889,7 +4891,8 @@ app.get("/api/v1/identity/availability", authenticate, (req, res) => {
   const userId = getRequestOwnerId(req);
   const identity = resolveIdentityForUser(userId);
   const filtered = filterByScope(identity, "availability");
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_availability", resource: "/identity/availability", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] read_availability', { requesterId: req.tokenMeta.tokenId, action: "read_availability", resource: "/identity/availability", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: filtered, meta: { scope: "availability" } });
 });
 
@@ -4897,7 +4900,8 @@ app.get("/api/v1/identity/availability", authenticate, (req, res) => {
 app.get("/api/v1/preferences", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Insufficient scope" });
   const userId = getRequestOwnerId(req);
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "read_preferences", resource: "/preferences", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] read_preferences', { requesterId: req.tokenMeta.tokenId, action: "read_preferences", resource: "/preferences", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: vault.preferences[userId] || {} });
 });
 
@@ -5017,7 +5021,8 @@ app.get("/api/v1/vault/tokens", authenticate, (req, res) => {
   // Workspace scoping on vault tokens is a storage label, not an access barrier for the owner.
   const tokens = getVaultTokens(ownerId, null);
   
-  createAuditLog({
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_vault_tokens', {
     requesterId: req.tokenMeta.tokenId,
     action: "list_vault_tokens",
     resource: "/vault/tokens",
@@ -5390,7 +5395,8 @@ app.get("/api/v1/scopes", authenticate, (req, res) => {
 
   const scopes = getAllScopes();
 
-  createAuditLog({
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_scopes', {
     requesterId: req.tokenMeta.tokenId,
     action: "list_scopes",
     resource: "/scopes",
@@ -5650,7 +5656,8 @@ app.get("/api/v1/tokens", authenticate, (req, res) => {
     };
   });
 
-  createAuditLog({
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_tokens', {
     requesterId: req.tokenMeta.tokenId,
     action: "list_tokens",
     resource: "/tokens",
@@ -5688,7 +5695,10 @@ app.post("/api/v1/tokens/validate", authRateLimit, async (req, res) => {
     return res.status(401).json({ error: "Invalid token" });
   }
 
-  createAuditLog({
+  // F5.2 P0: REMOVED from createAuditLog (per-request noise — single
+  // biggest source of audit-log volume on dashboard load).  Operators
+  // who want the trace can set LOG_LEVEL=debug.
+  logger.debug('[AuditDebug] token_validated', {
     requesterId: matched.tokenId,
     action: "token_validated",
     resource: "/tokens/validate",
@@ -6315,7 +6325,8 @@ app.post('/api/v1/billing/portal', authenticate, async (req, res) => {
 // --- CONNECTORS ---
 app.get("/api/v1/connectors", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Insufficient scope" });
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "list_connectors", resource: "/connectors", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_connectors', { requesterId: req.tokenMeta.tokenId, action: "list_connectors", resource: "/connectors", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: getConnectors() });
 });
 
@@ -6556,7 +6567,9 @@ app.get("/api/v1/gateway/context", authenticate, (req, res) => {
       },
     };
 
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug (success
+    // path only; the error-side emit below stays in audit_log).
+    logger.debug('[AuditDebug] gateway_context_fetch', {
       requesterId: req.tokenMeta.tokenId,
       action: "gateway_context_fetch",
       resource: "/gateway/context",
@@ -7497,7 +7510,8 @@ app.post("/api/v1/users", authenticate, (req, res) => {
 app.get("/api/v1/users", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can list users" });
   if (!requirePowerUser(req, res)) return;
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "list_users", resource: "/users", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_users', { requesterId: req.tokenMeta.tokenId, action: "list_users", resource: "/users", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: getUsers() });
 });
 
@@ -7730,7 +7744,8 @@ app.get("/api/v1/handshakes", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Only master token can view handshakes" });
   const status = req.query.status || null;
   const handshakes = getHandshakes(status);
-  createAuditLog({ requesterId: req.tokenMeta.tokenId, action: "list_handshakes", resource: "/handshakes", scope: req.tokenMeta.scope, ip: req.ip });
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_handshakes', { requesterId: req.tokenMeta.tokenId, action: "list_handshakes", resource: "/handshakes", scope: req.tokenMeta.scope, ip: req.ip });
   res.json({ data: handshakes });
 });
 
@@ -7863,7 +7878,8 @@ app.get("/api/v1/personas", authenticate, (req, res) => {
     personas = personas.filter(p => allowedPersonaIds.includes(p.id) || allowedPersonaIds.map(Number).includes(Number(p.id)));
   }
   
-  createAuditLog({
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] list_personas', {
     requesterId: req.tokenMeta.tokenId,
     action: "list_personas",
     resource: "/personas",
@@ -7911,7 +7927,8 @@ app.get("/api/v1/personas/:id", authenticate, (req, res) => {
   const persona = getPersonaById(personaId, ownerId);
   if (!persona) return res.status(404).json({ error: "Persona not found" });
 
-  createAuditLog({
+  // F5.2 P0: demoted from createAuditLog → logger.debug.
+  logger.debug('[AuditDebug] get_persona', {
     requesterId: req.tokenMeta.tokenId,
     action: "get_persona",
     resource: `/personas/${persona.id}`,
@@ -9083,7 +9100,8 @@ app.get("/api/v1/oauth/status", async (req, res) => {
 
   // Log if authenticated
   if (req.tokenMeta?.tokenId || req.session?.user?.id) {
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug.
+    logger.debug('[AuditDebug] get_oauth_status', {
       requesterId: req.tokenMeta?.tokenId || `session:${req.session.user.id}`,
       action: "get_oauth_status",
       resource: "/oauth/status",
@@ -10512,7 +10530,8 @@ app.get('/api/v1/brain/conversations', authenticate, (req, res) => {
   try {
     const conversations = getConversations(req.tokenMeta.tokenId);
 
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug.
+    logger.debug('[AuditDebug] brain_conversations_list', {
       requesterId: req.tokenMeta.tokenId,
       action: 'brain_conversations_list',
       resource: '/api/v1/brain/conversations',
@@ -10540,7 +10559,8 @@ app.get('/api/v1/brain/conversations/:id', authenticate, (req, res) => {
 
     const messages = getConversationHistory(id, 100, false); // Don't include private by default
 
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug.
+    logger.debug('[AuditDebug] brain_conversation_view', {
       requesterId: req.tokenMeta.tokenId,
       action: 'brain_conversation_view',
       resource: `/api/v1/brain/conversations/${id}`,
@@ -10795,7 +10815,8 @@ app.get('/api/v1/brain/knowledge-base', authenticate, (req, res) => {
       documents = documents.filter((d) => isResourceAllowed(req, 'knowledge_docs', d.id));
     }
 
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug.
+    logger.debug('[AuditDebug] kb_documents_list', {
       requesterId: req.tokenMeta.tokenId,
       action: 'kb_documents_list',
       resource: '/api/v1/brain/knowledge-base',
@@ -10832,7 +10853,8 @@ app.get('/api/v1/brain/knowledge-base/:id', authenticate, (req, res) => {
       if (!attached) return res.status(403).json({ error: 'Document not accessible with this token' });
     }
 
-    createAuditLog({
+    // F5.2 P0: demoted from createAuditLog → logger.debug.
+    logger.debug('[AuditDebug] kb_document_viewed', {
       requesterId: req.tokenMeta.tokenId,
       action: 'kb_document_viewed',
       resource: `/api/v1/brain/knowledge-base/${id}`,
