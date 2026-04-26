@@ -1196,4 +1196,229 @@ router.post('/password/reset/confirm', authRateLimit, async (req, res) => {
   });
 });
 
+// ──────────────────────────────────────────────────────────────────────
+// F5.2 P2 — Change password (authenticated rotation)
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the authenticated caller for `/password/change` without
+ * relying on the global `authenticate()` middleware (which is mounted
+ * elsewhere with stricter contracts).  Returns:
+ *   { userId, via: 'session' | 'bearer', sid: string|null }
+ * or `null` if no valid auth was presented.
+ *
+ * This matches the dual-auth pattern used by `/auth/me` so a CLI agent
+ * holding the master Bearer token can rotate the password too — when
+ * Bearer-authed there is no current session to preserve, so EVERY
+ * existing session gets revoked.
+ */
+async function resolveChangePasswordCaller(req) {
+  if (req.session?.user?.id) {
+    return {
+      userId: String(req.session.user.id),
+      via: 'session',
+      sid: req.sessionID || null,
+    };
+  }
+
+  const authHeader = req.headers.authorization || '';
+  const parts = authHeader.split(' ');
+  if (parts.length === 2 && parts[0] === 'Bearer') {
+    const rawToken = parts[1];
+    const tokens = getAccessTokens() || [];
+    for (const tokenRecord of tokens) {
+      if (tokenRecord.revokedAt) continue;
+      if (tokenRecord.expiresAt && new Date(tokenRecord.expiresAt) <= new Date()) continue;
+      if (!tokenRecord.hash) continue;
+      const ok = await bcrypt.compare(rawToken, tokenRecord.hash).catch(() => false);
+      if (ok) {
+        return {
+          userId: String(tokenRecord.ownerId),
+          via: 'bearer',
+          sid: null,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * POST /api/v1/auth/password/change
+ *
+ * Body: { currentPassword, newPassword }.
+ *
+ * Contract (per F5.2 P2 plan):
+ *   - 401 INVALID_CREDENTIALS if `currentPassword` doesn't match.
+ *   - 400 PASSWORD_REUSED if `newPassword === currentPassword`.
+ *   - 400 if `newPassword` fails `isStrongPassword`.
+ *   - 200 on success.  Session-authed callers keep THEIR session;
+ *     every other session for the user is dropped.  Bearer-authed
+ *     callers have ALL sessions dropped (there's no caller-side
+ *     session to preserve).
+ *   - Sends a "your password was changed" notification email.
+ *   - Emits `password_changed` audit row with `details.sessions_revoked`
+ *     and `details.via` so SOC2 reviewers can correlate the rotation
+ *     with active-session activity.
+ *
+ * Owner-row guard: the boot-time `owner` user is the FK anchor for the
+ * platform's master token (ADR-0015) and the AI-agent / CLI auth chain.
+ * We refuse to change its password through this endpoint regardless of
+ * who is calling — operators rotate it via the seed/secret pipeline.
+ */
+router.post('/password/change', authRateLimit, requireCsrfForSession, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+    return res.status(400).json({ error: 'currentPassword and newPassword required' });
+  }
+
+  const caller = await resolveChangePasswordCaller(req);
+  if (!caller) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Out-of-scope guard: the platform owner row is reserved (ADR-0015).
+  if (caller.userId === 'owner') {
+    return res.status(403).json({
+      error: 'OWNER_ROW_PROTECTED',
+      message: 'The platform owner password is rotated via the operator pipeline, not the dashboard.',
+    });
+  }
+
+  // Cheap pre-check before bcrypt comparisons — same string is a
+  // policy violation regardless of whether it matches the DB hash.
+  if (currentPassword === newPassword) {
+    return res.status(400).json({ error: 'PASSWORD_REUSED' });
+  }
+
+  const { isStrongPassword } = require('../utils/passwordUtils');
+  if (!isStrongPassword(newPassword)) {
+    return res.status(400).json({
+      error: 'Password must be at least 8 characters and contain 3 of: uppercase, lowercase, number, symbol',
+    });
+  }
+
+  let user = null;
+  try {
+    user = db
+      .prepare('SELECT id, email, username, display_name, password_hash FROM users WHERE id = ?')
+      .get(caller.userId);
+  } catch (e) {
+    logger.error('[Auth/PasswordChange] user lookup error', { err: e?.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  if (!user || !user.password_hash) {
+    // No password hash means this account was provisioned via OAuth and
+    // has never set a local password.  Direct the user to the reset
+    // flow so they go through the email-verified path.
+    return res.status(400).json({
+      error: 'PASSWORD_NOT_SET',
+      message: 'This account has no password yet. Use "Forgot password" to set one.',
+    });
+  }
+
+  const currentMatches = await bcrypt
+    .compare(currentPassword, user.password_hash)
+    .catch(() => false);
+  if (!currentMatches) {
+    try {
+      createAuditLog({
+        requesterId: caller.userId,
+        action: 'failed_login',
+        resource: '/auth/password/change',
+        scope: 'session',
+        ip: req.ip,
+        details: { reason: 'invalid_current_password', via: caller.via },
+      });
+    } catch (auditErr) {
+      logger.warn('[Auth/PasswordChange] failed_login audit emit error', { err: auditErr?.message });
+    }
+    return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+  }
+
+  // Defense in depth — `newPassword !== currentPassword` was a string
+  // compare; some users may also try variants of the SAME password
+  // that bcrypt-compare against the existing hash (extremely unlikely
+  // but cheap to check).
+  const newSameAsOld = await bcrypt.compare(newPassword, user.password_hash).catch(() => false);
+  if (newSameAsOld) {
+    return res.status(400).json({ error: 'PASSWORD_REUSED' });
+  }
+
+  let newHash;
+  try {
+    newHash = await bcrypt.hash(newPassword, 12);
+  } catch (e) {
+    logger.error('[Auth/PasswordChange] hash error', { err: e?.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  try {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, caller.userId);
+  } catch (e) {
+    logger.error('[Auth/PasswordChange] commit error', { err: e?.message });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  // Session revocation: keep THIS session alive for the cookie path so
+  // the user's current tab doesn't blink out; for Bearer callers there
+  // is no current session to preserve.
+  let sessionsRevoked = 0;
+  try {
+    const opts = caller.via === 'session' && caller.sid ? { except: caller.sid } : {};
+    sessionsRevoked = revokeAllUserSessions(caller.userId, opts) || 0;
+  } catch (e) {
+    logger.warn('[Auth/PasswordChange] revoke sessions failed', { err: e?.message });
+  }
+
+  // Notification email (D2 in the plan) — fire-and-forget; failures
+  // never block the 200 because the password update already committed.
+  if (user.email) {
+    emailService
+      .sendPasswordChangedNotification(user.email, user.display_name || user.username, {
+        when: new Date().toISOString(),
+        ip: req.ip || 'unknown',
+        sessionsRevoked,
+      })
+      .catch((err) => {
+        logger.warn('[Auth/PasswordChange] notification email failed', { err: err && err.message });
+      });
+  }
+
+  try {
+    createAuditLog({
+      requesterId: caller.userId,
+      action: 'password_changed',
+      resource: `/users/${caller.userId}`,
+      scope: 'session',
+      ip: req.ip,
+      details: {
+        via: caller.via,
+        sessions_revoked: sessionsRevoked,
+        sid: caller.sid || null,
+      },
+    });
+  } catch (auditErr) {
+    logger.warn('[Auth/PasswordChange] audit emit error', { err: auditErr?.message });
+  }
+
+  logger.info('[Auth/PasswordChange] success', {
+    userId: caller.userId,
+    via: caller.via,
+    sessionsRevoked,
+  });
+
+  return res.json({
+    success: true,
+    message:
+      sessionsRevoked > 0
+        ? `Password updated. ${sessionsRevoked} other session${sessionsRevoked === 1 ? '' : 's'} signed out.`
+        : 'Password updated.',
+    sessionsRevoked,
+  });
+});
+
 module.exports = router;

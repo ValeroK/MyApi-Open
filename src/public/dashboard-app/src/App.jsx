@@ -32,6 +32,8 @@ import Memory from './pages/Memory';
 import OAuthAuthorize from './pages/OAuthAuthorize';
 import LogIn from './pages/LogIn';
 import SignUp from './pages/SignUp';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 import Onboarding from './pages/Onboarding';
 import Activate from './pages/Activate';
 import Layout from './components/Layout';
@@ -189,8 +191,12 @@ function App() {
     const isAuthorizePath = window.location.pathname.includes('/authorize');
     const isLoginPath = window.location.pathname.endsWith('/login');
     const isSignupPath = window.location.pathname.endsWith('/signup');
+    // F5.2 P3.3 — password recovery pages must render without auth so a
+    // logged-out user clicking the email link doesn't bounce to /
+    const isForgotPath = window.location.pathname.endsWith('/forgot-password');
+    const isResetPath = window.location.pathname.endsWith('/reset-password');
     const isDocsPath = window.location.pathname.includes('/platform-docs') || window.location.pathname.includes('/api-docs');
-    if (!urlParams.has('oauth_status') && !isAuthorizePath && !isLoginPath && !isSignupPath && !isDocsPath) {
+    if (!urlParams.has('oauth_status') && !isAuthorizePath && !isLoginPath && !isSignupPath && !isForgotPath && !isResetPath && !isDocsPath) {
       window.location.replace('/');
       return null;
     }
@@ -213,6 +219,9 @@ function App() {
               <Route path="/authorize" element={<OAuthAuthorize />} />
               <Route path="/login" element={<LogIn />} />
               <Route path="/signup" element={<SignUp />} />
+              {/* F5.2 P3.3 — password reset flow pages (unauth) */}
+              <Route path="/forgot-password" element={<ForgotPassword />} />
+              <Route path="/reset-password" element={<ResetPassword />} />
               <Route path="/platform-docs" element={<PlatformDocs />} />
               <Route path="/api-docs" element={<ApiDocs />} />
               <Route path="/" element={<LogIn />} />
@@ -236,6 +245,11 @@ function App() {
               <Route path="/activate" element={<Activate />} />
               {/* Post-signup onboarding wizard — standalone, no sidebar */}
               <Route path="/onboarding" element={<Onboarding />} />
+              {/* F5.2 P3.3 — password reset pages also reachable when an
+                  authenticated user follows the email link. ResetPassword
+                  itself revokes all sessions on success. */}
+              <Route path="/forgot-password" element={<ForgotPassword />} />
+              <Route path="/reset-password" element={<ResetPassword />} />
               <Route
                 path="/*"
                 element={

@@ -520,6 +520,12 @@ function SecuritySection() {
     }
   };
 
+  // F5.2 P3.4 — wire the change-password form to the real
+  // /api/v1/auth/password/change endpoint. The server revokes all
+  // *other* user sessions (cookie callers) and emails a security
+  // notification; we surface the revoked-session count in the success
+  // banner so the user knows their other browsers/devices were
+  // signed out.
   const handleChangePassword = async (e) => {
     e.preventDefault();
     clearPasswordError();
@@ -536,13 +542,54 @@ function SecuritySection() {
       setPasswordError('Passwords do not match');
       return;
     }
+    if (passwordDraft.newPassword === passwordDraft.current) {
+      setPasswordError('New password must be different from your current password');
+      return;
+    }
 
     setPasswordSaving(true);
-    // Simulate API call — hook up to real endpoint when available
-    await new Promise((r) => setTimeout(r, 800));
-    setPasswordSaving(false);
-    clearPasswordDraft();
-    setPasswordSuccess('Password changed successfully');
+    try {
+      const authHeaders = masterToken ? { Authorization: `Bearer ${masterToken}` } : {};
+      const res = await fetch('/api/v1/auth/password/change', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        credentials: 'include',
+        body: JSON.stringify({
+          currentPassword: passwordDraft.current,
+          newPassword: passwordDraft.newPassword,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+
+      if (res.status === 401) {
+        setPasswordError(payload?.error || 'Current password is incorrect');
+        return;
+      }
+      if (res.status === 429) {
+        setPasswordError('Too many attempts. Please wait a moment and try again.');
+        return;
+      }
+      if (res.status === 403) {
+        setPasswordError(payload?.error || 'This account cannot change its password through the dashboard.');
+        return;
+      }
+      if (!res.ok) {
+        setPasswordError(payload?.error || 'Failed to change password.');
+        return;
+      }
+
+      const revoked = Number(payload?.sessionsRevoked || 0);
+      const sessionsLine =
+        revoked > 0
+          ? ` ${revoked} other session${revoked === 1 ? '' : 's'} signed out — check your inbox for a confirmation.`
+          : ' Check your inbox for a confirmation.';
+      clearPasswordDraft();
+      setPasswordSuccess(`Password changed successfully.${sessionsLine}`);
+    } catch (err) {
+      setPasswordError(err?.message || 'Failed to change password.');
+    } finally {
+      setPasswordSaving(false);
+    }
   };
 
   const handleApproveDevice = async (approvalId) => {
@@ -724,10 +771,12 @@ function SecuritySection() {
           {passwordSuccess && (
             <SuccessBanner message={passwordSuccess} onClose={clearPasswordSuccess} />
           )}
-          <form onSubmit={handleChangePassword} className="space-y-3 mt-4">
+          <form onSubmit={handleChangePassword} className="space-y-3 mt-4" data-testid="change-password-form">
             <div>
-              <label className="block text-sm font-medium ink-2 mb-1">Current Password</label>
+              <label className="block text-sm font-medium ink-2 mb-1" htmlFor="cp-current">Current Password</label>
               <input
+                id="cp-current"
+                data-testid="cp-current"
                 type="password"
                 value={passwordDraft.current}
                 onChange={(e) => updatePasswordDraft('current', e.target.value)}
@@ -738,19 +787,23 @@ function SecuritySection() {
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm font-medium ink-2 mb-1">New Password</label>
+                <label className="block text-sm font-medium ink-2 mb-1" htmlFor="cp-new">New Password</label>
                 <input
+                  id="cp-new"
+                  data-testid="cp-new"
                   type="password"
                   value={passwordDraft.newPassword}
                   onChange={(e) => updatePasswordDraft('newPassword', e.target.value)}
-                  placeholder="Min. 8 characters"
+                  placeholder="8+ chars, mix cases / numbers / symbols"
                   autoComplete="new-password"
                   className="ui-input w-full"
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium ink-2 mb-1">Confirm Password</label>
+                <label className="block text-sm font-medium ink-2 mb-1" htmlFor="cp-confirm">Confirm Password</label>
                 <input
+                  id="cp-confirm"
+                  data-testid="cp-confirm"
                   type="password"
                   value={passwordDraft.confirm}
                   onChange={(e) => updatePasswordDraft('confirm', e.target.value)}
@@ -760,8 +813,13 @@ function SecuritySection() {
                 />
               </div>
             </div>
+            <p className="ink-4 text-xs">
+              Use at least 8 characters, with a mix of upper- and lower-case letters, numbers, or symbols. Changing your password
+              will sign you out from other browsers and devices.
+            </p>
             <button
               type="submit"
+              data-testid="cp-submit"
               disabled={passwordSaving}
               className="ui-button-primary px-5 py-2 text-sm disabled:opacity-50"
             >

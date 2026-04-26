@@ -132,18 +132,47 @@ function unregisterUserSession(userId, sessionId) {
   if (idx !== -1) sessions.splice(idx, 1);
 }
 
-function revokeAllUserSessions(userId) {
+/**
+ * Drop every active session for `userId`.  Optional second argument
+ * `{ except }` lets the caller preserve ONE specific session id —
+ * F5.2 P2 (`/auth/password/change`) uses this so the user who just
+ * rotated their password is NOT immediately logged out of the tab
+ * they pressed Save in, while every OTHER device they were signed
+ * into is killed.
+ *
+ * Returns the number of sessions that were actually evicted (excludes
+ * the preserved one).  P2's audit row carries this as
+ * `details.sessions_revoked` so a SOC2 reviewer can see "the user
+ * rotated and kicked N other devices" at a glance.
+ */
+function revokeAllUserSessions(userId, options = {}) {
+  const exceptSid = options && typeof options === 'object' ? options.except : null;
   const sessions = userSessionRegistry.get(userId) || [];
-  for (const { sessionId } of sessions) {
+  let evicted = 0;
+  const kept = [];
+
+  for (const entry of sessions) {
+    if (exceptSid && entry.sessionId === exceptSid) {
+      kept.push(entry);
+      continue;
+    }
     if (_sessionStore && typeof _sessionStore.destroy === 'function') {
       try {
-        _sessionStore.destroy(sessionId, () => {});
+        _sessionStore.destroy(entry.sessionId, () => {});
       } catch (_) {
         /* best-effort eviction */
       }
     }
+    evicted += 1;
   }
-  userSessionRegistry.delete(userId);
+
+  if (kept.length > 0) {
+    userSessionRegistry.set(userId, kept);
+  } else {
+    userSessionRegistry.delete(userId);
+  }
+
+  return evicted;
 }
 
 // ────────────────────────────────────────────────────────────────────

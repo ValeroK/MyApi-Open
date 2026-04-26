@@ -46,6 +46,19 @@ function Login() {
   // Continue/Cancel) → 'accepting' | 'rejecting' (terminal action in
   // flight). `preview` is populated on 'ready'; `error` on any failure.
   const [pendingConfirm, setPendingConfirm] = useState(null);
+
+  // F5.2 P3.1 — local password sign-in form state.  Lives alongside
+  // the OAuth path; both can be used interchangeably and the server
+  // wires them through the same `req.session.user` shape.
+  const [pwEmail, setPwEmail] = useState('');
+  const [pwPassword, setPwPassword] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState('');
+  const [pwTotpRequired, setPwTotpRequired] = useState(false);
+  const [pwTotpCode, setPwTotpCode] = useState('');
+  // F5.2 P3.3 — surfaced after a successful /reset-password redirect.
+  const [pwResetSuccess, setPwResetSuccess] = useState(false);
+
   const { setMasterToken, setUser, isAuthenticated } = useAuthStore();
 
   useEffect(() => {
@@ -61,6 +74,16 @@ function Login() {
       setIsSignup(true);
       setSignupStep(1);
       window.history.replaceState({}, document.title, '/dashboard/');
+    }
+
+    // F5.2 P3.3 — ResetPassword redirects here with ?reset=success.
+    // Surface a one-shot success banner above the password form, then
+    // strip the param so a refresh doesn't keep re-asserting it.
+    if (params.get('reset') === 'success') {
+      setPwResetSuccess(true);
+      const url = new URL(window.location.href);
+      url.searchParams.delete('reset');
+      window.history.replaceState({}, document.title, url.pathname + (url.search || ''));
     }
   }, []);
 
@@ -190,6 +213,74 @@ function Login() {
       await startOAuthFlow(serviceId, { mode, returnTo: '/dashboard/' });
     } catch (err) {
       setError(`Could not start sign-in: ${err.message || 'unknown error'}`);
+    }
+  };
+
+  // F5.2 P3.1 — password sign-in.  Sends `email` (or username) and
+  // `password` to /auth/login, handles the 2FA branch by exposing a
+  // TOTP input on the same form, and falls through to the same
+  // `redirectAfterLogin` sink the OAuth path uses so the post-auth
+  // route guard stays in one place.
+  const handlePasswordLogin = async (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    setError('');
+    setPwError('');
+    if (!pwEmail.trim() || !pwPassword) {
+      setPwError('Email and password are required.');
+      return;
+    }
+    setPwBusy(true);
+    try {
+      const body = { email: pwEmail.trim(), password: pwPassword };
+      if (pwTotpRequired && pwTotpCode.trim()) {
+        body.totpCode = pwTotpCode.trim();
+      }
+      const res = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.status === 401 && data?.requires2FA) {
+        setPwTotpRequired(true);
+        setPwError('Enter your authenticator code to finish signing in.');
+        return;
+      }
+
+      if (res.status === 429) {
+        setPwError('Too many sign-in attempts. Please wait a moment and try again.');
+        return;
+      }
+
+      if (!res.ok) {
+        setPwError(data?.error || 'Email or password incorrect.');
+        // Wipe the password field on failure so a stale value doesn't
+        // get auto-resubmitted on the next attempt.
+        setPwPassword('');
+        return;
+      }
+
+      // Success.  Hydrate the auth store from the response, then funnel
+      // through the same redirect sink as the OAuth path.
+      if (data?.masterToken) setMasterToken(data.masterToken);
+      if (data?.user) setUser(data.user);
+      try {
+        const meRes = await fetch('/api/v1/auth/me', { credentials: 'include' });
+        if (meRes.ok) {
+          const me = await meRes.json();
+          if (me?.bootstrap?.masterToken) setMasterToken(me.bootstrap.masterToken);
+          if (me?.user) setUser(me.user);
+        }
+      } catch (_) {
+        /* best-effort — auth store hydrated above is enough to redirect */
+      }
+      redirectAfterLogin();
+    } catch (err) {
+      setPwError(err?.message || 'Sign-in failed. Please try again.');
+    } finally {
+      setPwBusy(false);
     }
   };
 
@@ -567,13 +658,117 @@ function Login() {
                       <button
                         key={service.id}
                         onClick={() => handleOAuthClick(service.id)}
-                        disabled={loading}
+                        disabled={loading || pwBusy}
                         className="flex min-h-[48px] w-full items-center justify-center gap-3 rounded-xl border border-slate-700 bg-slate-800/70 px-4 py-3 text-sm font-medium text-white transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <span>{OAuthIcons[service.id] || null}</span>
                         <span>Continue with {service.name}</span>
                       </button>
                     ))}
+
+                    {/* F5.2 P3.1 — password sign-in. OAuth above stays primary;
+                        this is the "or sign in with email" path. */}
+                    <div className="relative my-2 flex items-center justify-center">
+                      <div className="absolute inset-x-0 top-1/2 h-px bg-slate-700" aria-hidden="true" />
+                      <span className="relative bg-slate-900/85 px-3 text-[11px] font-medium uppercase tracking-widest text-slate-500">
+                        or sign in with email
+                      </span>
+                    </div>
+
+                    <form onSubmit={handlePasswordLogin} className="space-y-3" data-testid="password-login-form">
+                      {pwResetSuccess && !pwError && (
+                        <div
+                          role="status"
+                          data-testid="password-reset-success-banner"
+                          className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-300"
+                        >
+                          Password updated. Sign in with your new password.
+                        </div>
+                      )}
+                      {pwError && (
+                        <div
+                          role="alert"
+                          data-testid="password-login-error"
+                          className="rounded-xl border border-red-500/35 bg-red-500/10 px-4 py-2.5 text-sm text-red-300"
+                        >
+                          {pwError}
+                        </div>
+                      )}
+                      <div>
+                        <label htmlFor="pwEmail" className="mb-2 block text-sm font-medium text-slate-300">
+                          Email
+                        </label>
+                        <input
+                          id="pwEmail"
+                          name="email"
+                          type="email"
+                          autoComplete="email"
+                          required
+                          disabled={pwBusy}
+                          value={pwEmail}
+                          onChange={(e) => setPwEmail(e.target.value)}
+                          className="min-h-[48px] w-full rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 disabled:opacity-60"
+                          placeholder="you@example.com"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="pwPassword" className="mb-2 block text-sm font-medium text-slate-300">
+                          Password
+                        </label>
+                        <input
+                          id="pwPassword"
+                          name="password"
+                          type="password"
+                          autoComplete="current-password"
+                          required
+                          disabled={pwBusy}
+                          value={pwPassword}
+                          onChange={(e) => setPwPassword(e.target.value)}
+                          className="min-h-[48px] w-full rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 disabled:opacity-60"
+                          placeholder="Your password"
+                        />
+                      </div>
+
+                      {pwTotpRequired && (
+                        <div>
+                          <label htmlFor="pwTotpCode" className="mb-2 block text-sm font-medium text-slate-300">
+                            Authenticator code
+                          </label>
+                          <input
+                            id="pwTotpCode"
+                            name="totpCode"
+                            type="text"
+                            inputMode="numeric"
+                            pattern="[0-9]{6,}"
+                            autoComplete="one-time-code"
+                            required
+                            disabled={pwBusy}
+                            value={pwTotpCode}
+                            onChange={(e) => setPwTotpCode(e.target.value)}
+                            className="min-h-[48px] w-full rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 disabled:opacity-60"
+                            placeholder="6-digit code"
+                          />
+                        </div>
+                      )}
+
+                      <button
+                        type="submit"
+                        disabled={pwBusy || !pwEmail.trim() || !pwPassword || (pwTotpRequired && !pwTotpCode.trim())}
+                        data-testid="password-login-submit"
+                        className="min-h-[48px] w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {pwBusy ? 'Signing in…' : pwTotpRequired ? 'Verify & sign in' : 'Sign in with password'}
+                      </button>
+
+                      <div className="text-right">
+                        <a
+                          href="/dashboard/forgot-password"
+                          className="text-xs font-medium text-blue-400 hover:text-blue-300 transition-colors"
+                        >
+                          Forgot password?
+                        </a>
+                      </div>
+                    </form>
                   </div>
                 )}
 

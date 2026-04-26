@@ -423,6 +423,95 @@ class EmailService {
   }
 
   /**
+   * F5.2 P2 — security notification fired after a successful
+   * `POST /auth/password/change`.  Tells the account owner exactly
+   * which device/IP/time the password rotated, so an attacker who
+   * silently changes the password leaves a noticeable trail.
+   *
+   * Fire-and-forget: failures log but never block the 200 from the
+   * change-password endpoint.
+   */
+  async sendPasswordChangedNotification(toEmail, displayName, context = {}) {
+    if (!toEmail || !this.fromAddress) return;
+    const name = displayName || 'there';
+    const base = (process.env.PUBLIC_URL || process.env.BASE_URL || 'https://www.myapiai.com').replace(/\/$/, '');
+    const when = context.when || new Date().toISOString();
+    const ip = context.ip || 'unknown';
+    const sessionsRevoked = Number.isFinite(context.sessionsRevoked) ? context.sessionsRevoked : 0;
+    const sessionsLine = sessionsRevoked > 0
+      ? `As a precaution, ${sessionsRevoked} other active session${sessionsRevoked === 1 ? '' : 's'} ${sessionsRevoked === 1 ? 'was' : 'were'} signed out.`
+      : 'No other devices were signed in at the time.';
+
+    const html = `<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Your MyApi password was changed</title></head>
+<body style="margin:0;padding:0;background:#020617;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#020617;padding:32px 12px;">
+  <tr><td align="center">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px;">
+      <tr><td style="background:linear-gradient(135deg,#1e3a8a 0%,#7c3aed 100%);border-radius:16px 16px 0 0;padding:28px 32px;">
+        <p style="margin:0 0 6px 0;font-size:13px;font-weight:600;color:rgba(255,255,255,0.7);letter-spacing:1px;text-transform:uppercase;">Security Notice</p>
+        <h1 style="margin:0;font-size:26px;font-weight:800;color:#fff;line-height:1.3;">Your password was changed</h1>
+      </td></tr>
+      <tr><td style="background:#0f172a;border:1px solid #1e293b;border-top:none;border-radius:0 0 16px 16px;padding:28px 32px;">
+        <p style="margin:0 0 16px 0;font-size:15px;line-height:1.7;color:#cbd5e1;">
+          Hi ${name}, the password on your MyApi account was just updated.
+        </p>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#1e293b;border:1px solid #334155;border-radius:10px;margin:0 0 18px 0;">
+          <tr><td style="padding:14px 18px;">
+            <p style="margin:0 0 6px 0;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.6px;">When</p>
+            <p style="margin:0 0 12px 0;font-size:13px;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">${when}</p>
+            <p style="margin:0 0 6px 0;font-size:12px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.6px;">From</p>
+            <p style="margin:0;font-size:13px;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">${ip}</p>
+          </td></tr>
+        </table>
+        <p style="margin:0 0 16px 0;font-size:14px;line-height:1.6;color:#cbd5e1;">
+          ${sessionsLine}
+        </p>
+        <p style="margin:0 0 12px 0;font-size:13px;color:#fca5a5;line-height:1.6;">
+          <strong>Didn't make this change?</strong> Reset your password immediately and review your active devices.
+        </p>
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="margin:18px 0 4px 0;">
+          <tr><td align="center">
+            <a href="${base}/dashboard/settings" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;text-decoration:none;font-size:14px;font-weight:700;padding:12px 28px;border-radius:10px;letter-spacing:0.2px;">Open account settings</a>
+          </td></tr>
+        </table>
+        <p style="margin:18px 0 0 0;font-size:12px;color:#475569;line-height:1.6;text-align:center;">
+          <a href="${base}" style="color:#3b82f6;text-decoration:none;">myapiai.com</a>
+        </p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+    const data = {
+      email_address: toEmail.trim(),
+      subject: 'Your MyApi password was changed',
+      body: `Hi ${name}, the password on your MyApi account was just changed at ${when} from ${ip}. ${sessionsLine} If this wasn't you, reset your password right away at ${base}/dashboard/settings.`,
+      html_body: html,
+    };
+    try {
+      if (this.provider === 'resend') {
+        await this.sendEmailViaResend(data);
+      } else {
+        if (!this.transporter) throw new Error('Email service not configured');
+        await this.transporter.sendMail({
+          from: `${this.fromName} <${this.fromAddress}>`,
+          to: data.email_address,
+          subject: data.subject,
+          text: data.body,
+          html: data.html_body,
+        });
+      }
+      console.log(`[Email] Password-changed notification sent to ${toEmail}`);
+    } catch (err) {
+      console.error(`[Email] Failed to send password-changed notification to ${toEmail}:`, err.message);
+    }
+  }
+
+  /**
    * Send goodbye email when a user deletes their account.
    * Must be called BEFORE the user record is deleted.
    * Fire-and-forget: failures are logged only.

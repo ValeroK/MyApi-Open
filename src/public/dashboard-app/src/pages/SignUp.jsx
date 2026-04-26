@@ -4,6 +4,7 @@ import { handleOAuthCallback, AVAILABLE_SERVICES, startOAuthFlow } from '../util
 import WaitlistForm from '../components/WaitlistForm';
 import { clearAuthArtifacts } from '../utils/authRuntime';
 import { fetchPublicConfig } from '../utils/publicConfig';
+import { classifyPassword } from '../utils/passwordStrength';
 
 // B4 (2026-04-24 F4 hardening): hand off to LogIn.jsx with an
 // ALLOW-LIST of known callback keys, not the whole query string. A
@@ -71,7 +72,7 @@ function LogoMark() {
 
 function SignUp() {
   const [error, setError] = useState('');
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, setMasterToken, setUser } = useAuthStore();
   const [betaFull, setBetaFull] = useState(false);
   const [prefillEmail, setPrefillEmail] = useState('');
   // While an OAuth callback is being handed off to `/dashboard/` (the
@@ -79,6 +80,30 @@ function SignUp() {
   // user never sees the sign-up buttons flash between the callback
   // landing and the browser navigation firing.
   const [handingOff, setHandingOff] = useState(false);
+
+  // F5.2 P3.2 — local password sign-up form state.
+  const [pwUsername, setPwUsername] = useState('');
+  const [pwDisplayName, setPwDisplayName] = useState('');
+  const [pwEmail, setPwEmail] = useState('');
+  const [pwPassword, setPwPassword] = useState('');
+  const [pwConfirm, setPwConfirm] = useState('');
+  const [pwTermsAccepted, setPwTermsAccepted] = useState(false);
+  const [pwPrivacyAccepted, setPwPrivacyAccepted] = useState(false);
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwError, setPwError] = useState('');
+
+  const pwStrength = classifyPassword(pwPassword);
+  const pwMatch = pwPassword && pwConfirm && pwPassword === pwConfirm;
+  const pwSubmitDisabled =
+    pwBusy ||
+    !pwUsername.trim() ||
+    !pwEmail.trim() ||
+    !pwPassword ||
+    !pwConfirm ||
+    !pwMatch ||
+    pwStrength.score < 2 ||
+    !pwTermsAccepted ||
+    !pwPrivacyAccepted;
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -180,6 +205,87 @@ function SignUp() {
     }
   };
 
+  // F5.2 P3.2 — local password sign-up.  POSTs to /auth/register; on
+  // 201 the server has already established `req.session.user` so we
+  // hydrate the auth store from /auth/me and land the user on the
+  // dashboard (auto-login by design — same UX the OAuth flow provides
+  // after a successful provider hand-off).
+  const handlePasswordSignup = async (e) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    setPwError('');
+
+    if (!pwMatch) {
+      setPwError("Passwords don't match.");
+      return;
+    }
+    if (pwStrength.score < 2) {
+      setPwError('Pick a stronger password (8+ chars, mix of letter cases, numbers, or symbols).');
+      return;
+    }
+    if (!pwTermsAccepted || !pwPrivacyAccepted) {
+      setPwError('You must accept the Terms and Privacy Policy to create an account.');
+      return;
+    }
+
+    setPwBusy(true);
+    try {
+      const nowIso = new Date().toISOString();
+      const tz = (() => {
+        try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
+        catch (_) { return 'UTC'; }
+      })();
+
+      const res = await fetch('/api/v1/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          username: pwUsername.trim(),
+          email: pwEmail.trim(),
+          display_name: pwDisplayName.trim() || pwUsername.trim(),
+          password: pwPassword,
+          timezone: tz,
+          accepted_terms_at: nowIso,
+          accepted_privacy_policy_at: nowIso,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.status === 409) {
+        setPwError('An account with this username or email already exists. Try signing in instead.');
+        return;
+      }
+      if (res.status === 429) {
+        setPwError('Too many attempts. Please wait a moment and try again.');
+        return;
+      }
+      if (!res.ok) {
+        setPwError(data?.error || 'Sign-up failed. Please review your details.');
+        return;
+      }
+
+      // /register auto-logs the user in via the session cookie.
+      // Hydrate the auth store from /auth/me so workspace + plan land
+      // before the redirect.
+      try {
+        const me = await fetch('/api/v1/auth/me', { credentials: 'include' });
+        if (me.ok) {
+          const payload = await me.json();
+          if (payload?.bootstrap?.masterToken) setMasterToken(payload.bootstrap.masterToken);
+          if (payload?.user) setUser(payload.user);
+        }
+      } catch (_) {
+        /* best-effort — the session cookie alone is enough to land on /dashboard/ */
+      }
+      try { localStorage.removeItem('myapi_onboarding_dismissed'); } catch (_) { /* unavailable */ }
+      window.location.href = '/dashboard/';
+    } catch (err) {
+      setPwError(err?.message || 'Sign-up failed. Please try again.');
+    } finally {
+      setPwBusy(false);
+    }
+  };
+
   const oauthServices = [AVAILABLE_SERVICES[0], AVAILABLE_SERVICES[1], AVAILABLE_SERVICES[2]].filter(Boolean);
 
   return (
@@ -263,6 +369,198 @@ function SignUp() {
                       </button>
                     ))}
                   </div>
+
+                  {/* F5.2 P3.2 — local password sign-up. */}
+                  <div className="my-5 flex items-center gap-3">
+                    <span className="h-px flex-1" style={{ background: 'var(--line)' }} aria-hidden="true" />
+                    <span className="text-[11px] font-medium uppercase tracking-widest" style={{ color: 'var(--ink-4)' }}>
+                      or sign up with email
+                    </span>
+                    <span className="h-px flex-1" style={{ background: 'var(--line)' }} aria-hidden="true" />
+                  </div>
+
+                  <form
+                    onSubmit={handlePasswordSignup}
+                    className="space-y-3"
+                    data-testid="password-signup-form"
+                  >
+                    {pwError && (
+                      <div
+                        role="alert"
+                        data-testid="password-signup-error"
+                        className="px-3 py-2 text-[13px] rounded-md"
+                        style={{ border: '1px solid var(--red)', background: 'var(--red-bg)', color: 'var(--red)' }}
+                      >
+                        {pwError}
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label htmlFor="su-username" className="mb-1 block text-[12px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                          Username
+                        </label>
+                        <input
+                          id="su-username"
+                          name="username"
+                          type="text"
+                          autoComplete="username"
+                          required
+                          disabled={pwBusy}
+                          value={pwUsername}
+                          onChange={(e) => setPwUsername(e.target.value)}
+                          className="w-full px-3 py-2 text-[13.5px] rounded-md outline-none"
+                          style={{ border: '1px solid var(--line)', background: 'var(--bg-raised)', color: 'var(--ink)' }}
+                          placeholder="3–50 chars"
+                        />
+                      </div>
+                      <div>
+                        <label htmlFor="su-displayname" className="mb-1 block text-[12px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                          Display name
+                        </label>
+                        <input
+                          id="su-displayname"
+                          name="displayName"
+                          type="text"
+                          autoComplete="name"
+                          disabled={pwBusy}
+                          value={pwDisplayName}
+                          onChange={(e) => setPwDisplayName(e.target.value)}
+                          className="w-full px-3 py-2 text-[13.5px] rounded-md outline-none"
+                          style={{ border: '1px solid var(--line)', background: 'var(--bg-raised)', color: 'var(--ink)' }}
+                          placeholder="optional"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label htmlFor="su-email" className="mb-1 block text-[12px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                        Email
+                      </label>
+                      <input
+                        id="su-email"
+                        name="email"
+                        type="email"
+                        autoComplete="email"
+                        required
+                        disabled={pwBusy}
+                        value={pwEmail}
+                        onChange={(e) => setPwEmail(e.target.value)}
+                        className="w-full px-3 py-2 text-[13.5px] rounded-md outline-none"
+                        style={{ border: '1px solid var(--line)', background: 'var(--bg-raised)', color: 'var(--ink)' }}
+                        placeholder="you@example.com"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="su-password" className="mb-1 block text-[12px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                        Password
+                      </label>
+                      <input
+                        id="su-password"
+                        name="password"
+                        type="password"
+                        autoComplete="new-password"
+                        required
+                        disabled={pwBusy}
+                        value={pwPassword}
+                        onChange={(e) => setPwPassword(e.target.value)}
+                        className="w-full px-3 py-2 text-[13.5px] rounded-md outline-none"
+                        style={{ border: '1px solid var(--line)', background: 'var(--bg-raised)', color: 'var(--ink)' }}
+                        placeholder="8+ chars, mix cases / numbers / symbols"
+                      />
+                      {pwPassword && (
+                        <p
+                          data-testid="password-strength"
+                          data-strength-tone={pwStrength.tone}
+                          className="mt-1 text-[12px]"
+                          style={{
+                            color:
+                              pwStrength.tone === 'green'
+                                ? 'var(--green, #4ade80)'
+                                : pwStrength.tone === 'amber'
+                                ? '#fbbf24'
+                                : pwStrength.tone === 'red'
+                                ? 'var(--red, #f87171)'
+                                : 'var(--ink-3)',
+                          }}
+                        >
+                          Password strength: {pwStrength.label}
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <label htmlFor="su-confirm" className="mb-1 block text-[12px] font-medium" style={{ color: 'var(--ink-2)' }}>
+                        Confirm password
+                      </label>
+                      <input
+                        id="su-confirm"
+                        name="confirmPassword"
+                        type="password"
+                        autoComplete="new-password"
+                        required
+                        disabled={pwBusy}
+                        value={pwConfirm}
+                        onChange={(e) => setPwConfirm(e.target.value)}
+                        className="w-full px-3 py-2 text-[13.5px] rounded-md outline-none"
+                        style={{ border: '1px solid var(--line)', background: 'var(--bg-raised)', color: 'var(--ink)' }}
+                        placeholder="Re-enter password"
+                      />
+                      {pwConfirm && !pwMatch && (
+                        <p className="mt-1 text-[12px]" style={{ color: 'var(--red, #f87171)' }}>
+                          Passwords don't match
+                        </p>
+                      )}
+                    </div>
+
+                    <label className="flex items-start gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={pwTermsAccepted}
+                        onChange={(e) => setPwTermsAccepted(e.target.checked)}
+                        disabled={pwBusy}
+                        className="mt-0.5"
+                      />
+                      <span className="text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
+                        I accept the{' '}
+                        <a href="/legal/terms.html" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', textDecoration: 'underline' }}>
+                          Terms of Use
+                        </a>
+                      </span>
+                    </label>
+                    <label className="flex items-start gap-2 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={pwPrivacyAccepted}
+                        onChange={(e) => setPwPrivacyAccepted(e.target.checked)}
+                        disabled={pwBusy}
+                        className="mt-0.5"
+                      />
+                      <span className="text-[12.5px]" style={{ color: 'var(--ink-2)' }}>
+                        I accept the{' '}
+                        <a href="/legal/privacy.html" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', textDecoration: 'underline' }}>
+                          Privacy Policy
+                        </a>
+                      </span>
+                    </label>
+
+                    <button
+                      type="submit"
+                      disabled={pwSubmitDisabled}
+                      data-testid="password-signup-submit"
+                      className="w-full py-2.5 text-[13.5px] font-semibold rounded-md transition-colors"
+                      style={{
+                        border: '1px solid var(--accent)',
+                        background: 'var(--accent)',
+                        color: '#fff',
+                        cursor: pwSubmitDisabled ? 'not-allowed' : 'pointer',
+                        opacity: pwSubmitDisabled ? 0.55 : 1,
+                      }}
+                    >
+                      {pwBusy ? 'Creating account…' : 'Create account'}
+                    </button>
+                  </form>
 
                   <div className="mt-6 pt-5" style={{ borderTop: '1px solid var(--line)' }}>
                     <p className="text-center text-[12.5px]" style={{ color: 'var(--ink-3)' }}>
