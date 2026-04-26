@@ -8,6 +8,7 @@
   },
   "scripts": {
     "test": "jest --detectOpenHandles --forceExit",
+    "test:debug": "node scripts/jest-debug.js",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:integration": "jest --detectOpenHandles --forceExit src/tests/integration.test.js src/tests/security-regression.test.js src/tests/scope-isolation.test.js src/tests/token-update.test.js src/tests/phase3.audit-security.test.js src/tests/phase2-billing.test.js src/tests/beta-mode.test.js",
