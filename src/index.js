@@ -1060,37 +1060,41 @@ app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), a
 
 app.use(express.json({ limit: "100kb" }));
 
-// Global rate limiter middleware (applies to all requests except exempt paths)
-const globalRateLimitMap = {};
+// Rate-limit store factory (M4-T4.5 / T4.6).
+const { createRateLimitStore } = require('./infra/rate-limit');
 
-// P1 Security Fix: Cleanup old rate limit entries (in-memory maps grow unbounded)
-const rateLimitCleanupInterval = setInterval(() => {
-  const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+// Single source of truth for paths exempt from rate limiting. Pre-T4.6
+// this list lived in TWO drifted copies — one inline in the global
+// middleware below, one used by the bespoke per-namespace factory.
+// T4.6 collapses them to this UNION; the GET-only special case for
+// /api/v1/privacy/cookies is encoded in `isRateLimitExempt()` below.
+const RATE_LIMIT_EXEMPT_PATHS = [
+  '/api/v1/auth/me',
+  '/api/v1/auth/debug',
+  '/api/v1/auth/logout',
+  '/api/v1/dashboard/metrics',
+  '/api/v1/oauth/status',
+  '/api/v1/ws',
+  '/health',
+  '/ping',
+  '/dashboard/',
+];
 
-  // Clean globalRateLimitMap
-  for (const [key, timestamps] of Object.entries(globalRateLimitMap || {})) {
-    const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-    if (recentTimestamps.length === 0) {
-      delete globalRateLimitMap[key];
-    } else {
-      globalRateLimitMap[key] = recentTimestamps;
-    }
+function isRateLimitExempt(req) {
+  if (RATE_LIMIT_EXEMPT_PATHS.some((p) => req.path === p || req.path.startsWith(p))) {
+    return true;
   }
-
-  // Clean rateLimitMap if it exists
-  if (typeof rateLimitMap !== 'undefined') {
-    for (const [key, timestamps] of Object.entries(rateLimitMap || {})) {
-      const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-      if (recentTimestamps.length === 0) {
-        delete rateLimitMap[key];
-      } else {
-        rateLimitMap[key] = recentTimestamps;
-      }
-    }
+  if (req.path === '/api/v1/privacy/cookies' && req.method === 'GET') {
+    return true;
   }
-}, 60 * 60 * 1000); // Run every hour
-rateLimitCleanupInterval.unref?.();
+  return false;
+}
+
+// Module-level handle assigned in the M4 store-init block below
+// (after sessionDb is allocated). Middleware that closes over this
+// variable only fires on request, by which time the assignment has
+// completed — `app.listen()` runs at the very end of the module.
+let rateLimitStore = null;
 
 // Email processor: Send pending emails every 5 minutes
 const emailProcessorInterval = setInterval(async () => {
@@ -1105,58 +1109,41 @@ const emailProcessorInterval = setInterval(async () => {
 }, 5 * 60 * 1000); // Run every 5 minutes
 emailProcessorInterval.unref?.();
 
+// M4-T4.6: store-backed global rate-limit middleware.
+// Pre-T4.6 this used a bespoke `globalRateLimitMap` (sliding-log
+// timestamps per IP) plus an hourly `rateLimitCleanupInterval`.
+// Post-T4.6 the same per-IP and per-bearer ceilings are enforced
+// via the M4 `RateLimitStore` (fixed-window, atomic on SQLite,
+// driver GC handled internally — no orphan timer in src/index.js).
+// HTTP envelopes (status 429, Retry-After header, body shapes) are
+// preserved bit-for-bit so the dashboard's retry banner is unaffected.
 app.use((req, res, next) => {
-  // CRITICAL: Exempt all auth/dashboard bootstrap paths from rate limiting
-  const isExempt = req.path === '/api/v1/auth/me' ||
-                   req.path === '/api/v1/auth/debug' ||
-                   req.path === '/api/v1/auth/logout' ||
-                   req.path === '/api/v1/dashboard/metrics' ||
-                   (req.path === '/api/v1/privacy/cookies' && req.method === 'GET') ||
-                   req.path.startsWith('/api/v1/ws') ||
-                   req.path === '/health' ||
-                   req.path === '/ping' ||
-                   req.path.startsWith('/dashboard/');
+  if (isRateLimitExempt(req)) return next();
 
-  // Bearer token (API/agent) requests: apply a separate, higher rate limit
-  // Device approval middleware provides additional rate limiting for API tokens
-  const hasBearer = req.headers.authorization?.startsWith('Bearer ') || req.query.token || req.query.api_key;
-
-  if (isExempt) {
-    return next();
-  }
-
-  const now = Date.now();
+  const hasBearer =
+    req.headers.authorization?.startsWith('Bearer ') ||
+    req.query.token ||
+    req.query.api_key;
 
   if (hasBearer) {
-    // Apply a separate rate limit for API token requests (higher ceiling)
-    const bearerKey = `bearer:${req.ip}`;
-    const bearerWindowMs = 60000;
-    const bearerMaxRequests = process.env.NODE_ENV === 'test' ? 5000 : 600; // 600 req/min for API tokens
-    if (!globalRateLimitMap[bearerKey]) globalRateLimitMap[bearerKey] = [];
-    globalRateLimitMap[bearerKey] = globalRateLimitMap[bearerKey].filter(t => now - t < bearerWindowMs);
-    if (globalRateLimitMap[bearerKey].length >= bearerMaxRequests) {
+    const bearerMax = process.env.NODE_ENV === 'test' ? 5000 : 600; // 600 req/min for API tokens
+    const result = rateLimitStore.consume(`bearer:${req.ip}`, bearerMax, 60_000);
+    if (!result.allowed) {
+      res.set('Retry-After', String(result.retryAfterSec));
       return res.status(429).json({ error: 'API rate limit exceeded', retryAfter: 60 });
     }
-    globalRateLimitMap[bearerKey].push(now);
     return next();
   }
 
-  const key = `global:${req.ip}`;
-  const windowMs = 60000; // 1 minute
-  const maxRequests = process.env.NODE_ENV === 'test' ? 1000 : 120; // 120 req/min default
-
-  if (!globalRateLimitMap[key]) globalRateLimitMap[key] = [];
-  globalRateLimitMap[key] = globalRateLimitMap[key].filter(t => now - t < windowMs);
-
-  if (globalRateLimitMap[key].length >= maxRequests) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((windowMs - (now - globalRateLimitMap[key][0])) / 1000));
+  const globalMax = process.env.NODE_ENV === 'test' ? 1000 : 120; // 120 req/min default
+  const result = rateLimitStore.consume(`global:${req.ip}`, globalMax, 60_000);
+  if (!result.allowed) {
+    res.set('Retry-After', String(result.retryAfterSec));
     return res.status(429).json({
       error: 'Rate limit exceeded',
-      retryAfter: retryAfterSeconds
+      retryAfter: result.retryAfterSec,
     });
   }
-
-  globalRateLimitMap[key].push(now);
   next();
 });
 
@@ -1178,6 +1165,18 @@ const { store: sessionStore, driver: sessionDriver } = createSessionStore({
   env: process.env,
   db: sessionDb,
 });
+
+// M4-T4.6: rate-limit store. Shares the SQLite handle with the
+// session store (one `myapi.db` file → two tables: sessions
+// `better-sqlite3-session-store` + `rate_limit_counters`). The
+// driver follows the same selection rule as the session factory
+// (test → memory; REDIS_URL → throw loud not-implemented;
+// DATABASE_URL → memory; else → sqlite) so a deployment that
+// picks SQLite for one picks SQLite for the other.
+({ store: rateLimitStore } = createRateLimitStore({
+  env: process.env,
+  db: sessionDb,
+}));
 
 // SOC2 CC6 — concurrent session cap, TOTP replay protection, and the
 // shared auth rate-limit live in `src/lib/authHardening.js`. Pre-T4.4
@@ -2144,38 +2143,35 @@ app.put('/api/v1/privacy/settings', authenticate, rateLimit(60000, 20, 'privacy-
 const vault = { identityDocs: {}, preferences: {} };
 
 // --- Rate Limiter ---
-const rateLimitMap = {};
-// Paths exempt from rate limiting (bootstrap/auth critical paths)
-const RATE_LIMIT_EXEMPT_PATHS = [
-  '/api/v1/auth/me',
-  '/api/v1/auth/debug',
-  '/api/v1/auth/logout',
-  '/api/v1/dashboard/metrics',
-  '/api/v1/oauth/status',
-  '/api/v1/ws',
-  '/dashboard/',
-  '/dashboard/myapi-logo.svg',
-];
-
-function rateLimit(windowMs = 60000, maxRequests = (process.env.NODE_ENV === 'test' ? 1000 : 60), namespace = 'default') {
+// Per-namespace rate-limit middleware factory. Pre-T4.6 this was
+// backed by a bespoke `rateLimitMap` of timestamp arrays plus the
+// `RATE_LIMIT_EXEMPT_PATHS` list above; both have moved to the
+// M4 store + `isRateLimitExempt(req)` helper at the top of this
+// file. The HTTP envelope is preserved bit-for-bit:
+//   - 429 status
+//   - Retry-After header (positive integer seconds)
+//   - body { error: 'Rate limit exceeded', retryAfterSeconds: N }
+//     (note `retryAfterSeconds`, not the global limiter's
+//     `retryAfter` — a long-standing inconsistency we preserve
+//     because the dashboard parses each envelope at its own site.)
+//   - on success: X-RateLimit-Limit + X-RateLimit-Remaining headers
+function rateLimit(
+  windowMs = 60_000,
+  maxRequests = process.env.NODE_ENV === 'test' ? 1000 : 60,
+  namespace = 'default',
+) {
   return (req, res, next) => {
-    // Skip rate limiting for bootstrap/auth endpoints
-    if (RATE_LIMIT_EXEMPT_PATHS.some(p => req.path === p || req.path.startsWith(p))) {
-      return next();
+    if (isRateLimitExempt(req)) return next();
+    const result = rateLimitStore.consume(`${namespace}:${req.ip}`, maxRequests, windowMs);
+    if (!result.allowed) {
+      res.set('Retry-After', String(result.retryAfterSec));
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        retryAfterSeconds: result.retryAfterSec,
+      });
     }
-
-    const key = `${namespace}:${req.ip}`;
-    const now = Date.now();
-    if (!rateLimitMap[key]) rateLimitMap[key] = [];
-    rateLimitMap[key] = rateLimitMap[key].filter(t => now - t < windowMs);
-    if (rateLimitMap[key].length >= maxRequests) {
-      const retryAfterSeconds = Math.max(1, Math.ceil((windowMs - (now - rateLimitMap[key][0])) / 1000));
-      res.set('Retry-After', String(retryAfterSeconds));
-      return res.status(429).json({ error: 'Rate limit exceeded', retryAfterSeconds });
-    }
-    rateLimitMap[key].push(now);
     res.set('X-RateLimit-Limit', String(maxRequests));
-    res.set('X-RateLimit-Remaining', String(maxRequests - rateLimitMap[key].length));
+    res.set('X-RateLimit-Remaining', String(result.remaining));
     next();
   };
 }
@@ -3383,6 +3379,14 @@ function buildHealthResponse() {
 app.get("/health", (req, res) => {
   const health = buildHealthResponse();
   res.status(health.statusCode).json({ status: health.status, uptime: process.uptime(), database: health.database });
+});
+
+// Liveness probe — cheaper than /health (no DB touch). Used by load
+// balancers, uptime monitors, and the rate-limit exempt list. Pre-T4.6
+// this path was in `RATE_LIMIT_EXEMPT_PATHS` but had no handler — the
+// dead exempt entry was surfaced during M4 e2e and is now wired up.
+app.get("/ping", (req, res) => {
+  res.status(200).json({ ok: true });
 });
 
 function parseAndValidateHttpUrl(value) {

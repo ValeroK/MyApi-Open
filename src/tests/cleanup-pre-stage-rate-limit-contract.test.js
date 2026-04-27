@@ -74,6 +74,15 @@ function indexOfLineMatching(lines, regex) {
   return -1;
 }
 
+// Strip JS comments (line + block) so the `M4-T4.6 deletions` ratchet
+// below ignores the explanatory comments that REFERENCE the deleted
+// symbol names. We keep the comments because they help future readers
+// understand WHY those symbols are gone — but we must not let them
+// trip the negative assertion.
+function stripComments(src) {
+  return src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
+}
+
 function readBlockBetween(lines, startRegex, endRegex, maxLines = 80) {
   const start = indexOfLineMatching(lines, startRegex);
   if (start === -1) return null;
@@ -129,32 +138,39 @@ describe('[Cleanup pre-stage / G4.1] rate-limit contract', () => {
     expect(block.body).toMatchSnapshot('rateLimit() factory source');
   });
 
-  test('snapshot: rateLimitCleanupInterval registration', () => {
-    const block = readBlockBetween(
-      lines,
-      /^const rateLimitCleanupInterval = setInterval/,
-      /^}, 60000\);/,
-      60,
-    );
-    expect(block).toBeTruthy();
-    expect(block.body).toMatchSnapshot('rateLimitCleanupInterval source');
+  test('M4-T4.6 deletions: legacy in-memory rate-limit symbols are gone', () => {
+    // After M4-T4.6 the bespoke in-memory implementation is fully
+    // replaced by the M4 RateLimitStore in src/infra/rate-limit/.
+    // This test is a RATCHET — re-introducing any of these symbols
+    // means we are duplicating state and re-creating the unbounded-
+    // map leak (and orphan timer) that T4.6 eliminated. Comments are
+    // stripped so the explanatory comments that mention these names
+    // by way of "this is what we deleted" do not trip the assertion.
+    const code = stripComments(source);
+    expect(code).not.toMatch(/\bglobalRateLimitMap\b/);
+    expect(code).not.toMatch(/\brateLimitMap\b/);
+    expect(code).not.toMatch(/\brateLimitCleanupInterval\b/);
+    // The hourly cleanup setInterval at the top of src/index.js is
+    // also gone (the driver runs its own GC). G0.3's orphan-timer
+    // ratchet covers any reintroduction of an unmanaged interval.
   });
 
-  test('snapshot: globalRateLimitMap registration & top-level enforcer', () => {
-    // The global limiter is composed of:
-    //   - `const globalRateLimitMap = {};`
-    //   - the `app.use((req, res, next) => { ... global:${req.ip} ... })`
-    //     middleware that reads / writes it.
-    // We anchor on the comment-or-declaration above the map and
-    // walk forward to the matching `});` of the `app.use`. To stay
-    // robust against the comment style above the line, we anchor
-    // on the literal `globalRateLimitMap = {}` line.
-    const startIdx = indexOfLineMatching(lines, /^const globalRateLimitMap\s*=\s*\{\}/);
+  test('snapshot: store-backed global rate-limit middleware (post-T4.6)', () => {
+    // Replaces the pre-T4.6 globalRateLimitMap snapshot. We anchor
+    // on a stable comment marker placed by T4.6 so the snapshot
+    // captures the new app.use((req, res, next) => …) middleware
+    // shape. Any change to the global limiter's logic (exempt rule,
+    // bearer detection, envelope shape) MUST update this snapshot.
+    const startIdx = indexOfLineMatching(
+      lines,
+      /^\/\/\s*M4-T4\.6:\s*store-backed global rate-limit/,
+    );
     expect(startIdx).toBeGreaterThanOrEqual(0);
-    // The middleware lives within ~30 lines below. Capture them.
-    const window = lines.slice(startIdx, startIdx + 30).join('\n');
+    // The middleware (with its leading explanatory comment) lives
+    // within ~45 lines below the marker. Capture them.
+    const window = lines.slice(startIdx, startIdx + 45).join('\n');
     expect({ startLine: startIdx + 1, body: window }).toMatchSnapshot(
-      'globalRateLimitMap + app.use enforcer',
+      'store-backed global limiter source',
     );
   });
 

@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (M4-T4.5 — `RateLimitStore` interface + memory + sqlite drivers + 23-test driver-agnostic contract suite landed under `src/infra/rate-limit/`; sliding-log → fixed-window trade-off documented in code; SQLite driver creates its own `rate_limit_counters` table on construction — no migration commit needed)
+> - Last updated: **2026-04-27** (M4-T4.6 — `src/index.js` is fully behind the M4 rate-limit factory; bespoke `globalRateLimitMap` + `rateLimitMap` + hourly `rateLimitCleanupInterval` + drifted exempt-path lists all deleted; G4.1 has a permanent negative-assertion ratchet preventing their reintroduction; orphan-timer count 6 → 5; folded follow-on: `/ping` liveness handler added (was a dead exempt entry surfaced during e2e); M4 critical path COMPLETE for OSS-only deployments. Live-DB e2e verification done: 119/130 flood requests allowed → 11 throttled with `Retry-After: 6` header, body `{ error: 'Rate limit exceeded', retryAfter: 6 }`, atomic UPSERT into `rate_limit_counters` confirmed at the SQLite layer)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **54 / 54 suites, 726 pass / 22 skip, exit 0** (~11 s locally with `--forceExit`; +23 tests from M4-T4.5 RateLimitStore contract suite added on 2026-04-27, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added the same day, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **54 / 54 suites, 726 pass / 22 skip, 27 / 27 snapshots, exit 0** (~11 s locally with `--forceExit`; M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite added the same day, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added the same day, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,70 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **M4-T4.5 landed: `RateLimitStore`
+- **2026-04-27 (latest)** — **M4-T4.6 landed: `src/index.js`
+  fully behind both M4 store factories; bespoke rate-limit
+  in-memory maps + hourly GC interval + drifted exempt-path
+  lists all DELETED.** This is the M4 critical-path completion
+  for OSS-only deployments — T4.3 (Redis), T4.7 (testcontainers
+  Redis), T4.8 (CIDR trust-proxy), T4.9 (FK ADR-0015 Option B)
+  remain as deferred / follow-up items but the gateway no longer
+  carries any bespoke state for sessions or rate-limits. Concrete
+  deletions: `const globalRateLimitMap`, `const rateLimitMap`,
+  `const rateLimitCleanupInterval = setInterval(...)` (28 lines
+  including its sweep body — the driver runs its own GC), the
+  inline list of exempt paths in the global middleware, and the
+  drifted `RATE_LIMIT_EXEMPT_PATHS = [...]` declaration that lived
+  ~1100 lines below. Concrete additions: a single
+  `RATE_LIMIT_EXEMPT_PATHS` + `isRateLimitExempt(req)` helper at
+  the top of `src/index.js`, a module-level `let rateLimitStore =
+  null` that's assigned in the M4 store-init block (after
+  `createSessionStore`, sharing the same `sessionDb` handle),
+  and store-backed rewrites of the global middleware and the
+  per-namespace `rateLimit()` factory. **Orphan-timer count:
+  6 → 5** (G0.3 ratchet acknowledged via snapshot update). HTTP
+  envelopes preserved bit-for-bit at every call site — the three
+  distinct shapes (bearer literal `retryAfter: 60`, IP-global
+  `retryAfter: <calc>`, per-namespace `retryAfterSeconds: <calc>`)
+  all pass through the new store with zero observable change.
+  G4.1 test surgery: deleted 2 dead snapshots, added 2 new ones
+  (`store-backed global limiter source` positive snapshot +
+  `M4-T4.6 deletions: legacy in-memory rate-limit symbols are
+  gone` negative-assertion ratchet using a `stripComments` helper
+  so the explanatory comments that REFERENCE the deleted names
+  don't trip the assertion). Net diff in `src/index.js`: **−4
+  lines** (92 ins / 96 del) but the structural diff is much
+  larger — see commit body. Snapshot count: 28 → 27 (−2 deleted,
+  +1 new). Test baseline: **54 / 54 suites, 726 / 748 passing
+  / 22 skipped, exit 0** in ~11 s. **Folded follow-on (same
+  commit):** `/ping` route handler added — was a dead entry
+  in the consolidated `RATE_LIMIT_EXEMPT_PATHS` list, surfaced
+  during e2e (curl returned 404). Now `GET /ping → 200
+  {"ok":true}`. Three downstream snapshots auto-shifted:
+  G0.1 router shape (+1 entry), G0.1 mount table (+1 entry),
+  G0.3 timer-inventory line drift (+8 lines, content stable),
+  G0.4 middleware-chain index drift (`srcIdx 268→269`). Live
+  e2e re-verification post-commit: 119/130 flood requests
+  allowed → 11 throttled with `Retry-After: 6`, body
+  `{ error: 'Rate limit exceeded', retryAfter: 6 }`, atomic
+  UPSERT into `rate_limit_counters` confirmed at the SQLite
+  layer (key=`global:<ip>`, count increments per consume).
+  Three findings noted for follow-up: (a) `SESSION_DB_PATH`
+  in `.env.smoke` overrides the `__dirname/db.sqlite` default
+  to `/app/data/sessions.sqlite` — code-vs-runtime drift worth
+  a comment; (b) `req.ip` resolves to the docker bridge
+  gateway because `app.set('trust proxy', ...)` isn't pinned
+  — already on the roadmap as **T4.8**; (c) `DELETE
+  /api/v1/users/:id` and `DELETE /api/v1/account` both refuse
+  if `email === POWER_USER_EMAIL` — structural deadlock for
+  power-user-email duplicates, blocked the F5 migration
+  recovery (resolved one-off via cascade-mirroring SQL — see
+  M4 follow-up notes). Next: review the deferred M4 sub-tasks
+  (T4.3 / T4.7 / T4.8 / T4.9) and decide which unblock vs
+  which can roll into a later milestone — **T4.8 is the
+  natural next step** because the e2e directly exposed why
+  it matters.
+
+- **2026-04-27** — **M4-T4.5 landed: `RateLimitStore`
   interface + memory + sqlite drivers under `src/infra/rate-limit/`
   + 23-test driver-agnostic contract suite.** No change to
   `src/index.js` yet (that's T4.6). The contract:

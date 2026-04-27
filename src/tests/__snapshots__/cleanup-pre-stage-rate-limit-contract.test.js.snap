@@ -14,7 +14,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "skip: () => process.env.NODE_ENV === 'test', // Skip in test mode",
       "});",
     ],
-    "line": 2196,
+    "line": 2192,
   },
   {
     "binding": "dashboardSpaRateLimit",
@@ -28,7 +28,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
       "});",
     ],
-    "line": 2206,
+    "line": 2202,
   },
 ]
 `;
@@ -64,131 +64,82 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: RATE_LIMIT_EXE
   '/api/v1/dashboard/metrics',
   '/api/v1/oauth/status',
   '/api/v1/ws',
+  '/health',
+  '/ping',
   '/dashboard/',
-  '/dashboard/myapi-logo.svg',
 ];"
 `;
 
 exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: bespoke rateLimit() factory body: rateLimit() factory source 1`] = `
-"function rateLimit(windowMs = 60000, maxRequests = (process.env.NODE_ENV === 'test' ? 1000 : 60), namespace = 'default') {
+"function rateLimit(
+  windowMs = 60_000,
+  maxRequests = process.env.NODE_ENV === 'test' ? 1000 : 60,
+  namespace = 'default',
+) {
   return (req, res, next) => {
-    // Skip rate limiting for bootstrap/auth endpoints
-    if (RATE_LIMIT_EXEMPT_PATHS.some(p => req.path === p || req.path.startsWith(p))) {
-      return next();
+    if (isRateLimitExempt(req)) return next();
+    const result = rateLimitStore.consume(\`\${namespace}:\${req.ip}\`, maxRequests, windowMs);
+    if (!result.allowed) {
+      res.set('Retry-After', String(result.retryAfterSec));
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        retryAfterSeconds: result.retryAfterSec,
+      });
     }
-
-    const key = \`\${namespace}:\${req.ip}\`;
-    const now = Date.now();
-    if (!rateLimitMap[key]) rateLimitMap[key] = [];
-    rateLimitMap[key] = rateLimitMap[key].filter(t => now - t < windowMs);
-    if (rateLimitMap[key].length >= maxRequests) {
-      const retryAfterSeconds = Math.max(1, Math.ceil((windowMs - (now - rateLimitMap[key][0])) / 1000));
-      res.set('Retry-After', String(retryAfterSeconds));
-      return res.status(429).json({ error: 'Rate limit exceeded', retryAfterSeconds });
-    }
-    rateLimitMap[key].push(now);
     res.set('X-RateLimit-Limit', String(maxRequests));
-    res.set('X-RateLimit-Remaining', String(maxRequests - rateLimitMap[key].length));
+    res.set('X-RateLimit-Remaining', String(result.remaining));
     next();
   };
 }"
 `;
 
-exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: globalRateLimitMap registration & top-level enforcer: globalRateLimitMap + app.use enforcer 1`] = `
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: store-backed global rate-limit middleware (post-T4.6): store-backed global limiter source 1`] = `
 {
-  "body": "const globalRateLimitMap = {};
-
-// P1 Security Fix: Cleanup old rate limit entries (in-memory maps grow unbounded)
-const rateLimitCleanupInterval = setInterval(() => {
-  const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-
-  // Clean globalRateLimitMap
-  for (const [key, timestamps] of Object.entries(globalRateLimitMap || {})) {
-    const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-    if (recentTimestamps.length === 0) {
-      delete globalRateLimitMap[key];
-    } else {
-      globalRateLimitMap[key] = recentTimestamps;
-    }
-  }
-
-  // Clean rateLimitMap if it exists
-  if (typeof rateLimitMap !== 'undefined') {
-    for (const [key, timestamps] of Object.entries(rateLimitMap || {})) {
-      const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-      if (recentTimestamps.length === 0) {
-        delete rateLimitMap[key];
-      } else {
-        rateLimitMap[key] = recentTimestamps;
-      }
-    }
-  }
-}, 60 * 60 * 1000); // Run every hour
-rateLimitCleanupInterval.unref?.();",
-  "startLine": 1064,
-}
-`;
-
-exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: rateLimitCleanupInterval registration: rateLimitCleanupInterval source 1`] = `
-"const rateLimitCleanupInterval = setInterval(() => {
-  const now = Date.now();
-  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
-
-  // Clean globalRateLimitMap
-  for (const [key, timestamps] of Object.entries(globalRateLimitMap || {})) {
-    const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-    if (recentTimestamps.length === 0) {
-      delete globalRateLimitMap[key];
-    } else {
-      globalRateLimitMap[key] = recentTimestamps;
-    }
-  }
-
-  // Clean rateLimitMap if it exists
-  if (typeof rateLimitMap !== 'undefined') {
-    for (const [key, timestamps] of Object.entries(rateLimitMap || {})) {
-      const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
-      if (recentTimestamps.length === 0) {
-        delete rateLimitMap[key];
-      } else {
-        rateLimitMap[key] = recentTimestamps;
-      }
-    }
-  }
-}, 60 * 60 * 1000); // Run every hour
-rateLimitCleanupInterval.unref?.();
-
-// Email processor: Send pending emails every 5 minutes
-const emailProcessorInterval = setInterval(async () => {
-  try {
-    const result = await emailService.processPendingEmails(50);
-    if (result.sent > 0 || result.failed > 0) {
-      console.log(\`[Email] Processed batch: \${result.sent} sent, \${result.failed} failed\`);
-    }
-  } catch (err) {
-    console.error('[Email] Error processing pending emails:', err.message);
-  }
-}, 5 * 60 * 1000); // Run every 5 minutes
-emailProcessorInterval.unref?.();
-
+  "body": "// M4-T4.6: store-backed global rate-limit middleware.
+// Pre-T4.6 this used a bespoke \`globalRateLimitMap\` (sliding-log
+// timestamps per IP) plus an hourly \`rateLimitCleanupInterval\`.
+// Post-T4.6 the same per-IP and per-bearer ceilings are enforced
+// via the M4 \`RateLimitStore\` (fixed-window, atomic on SQLite,
+// driver GC handled internally — no orphan timer in src/index.js).
+// HTTP envelopes (status 429, Retry-After header, body shapes) are
+// preserved bit-for-bit so the dashboard's retry banner is unaffected.
 app.use((req, res, next) => {
-  // CRITICAL: Exempt all auth/dashboard bootstrap paths from rate limiting
-  const isExempt = req.path === '/api/v1/auth/me' ||
-                   req.path === '/api/v1/auth/debug' ||
-                   req.path === '/api/v1/auth/logout' ||
-                   req.path === '/api/v1/dashboard/metrics' ||
-                   (req.path === '/api/v1/privacy/cookies' && req.method === 'GET') ||
-                   req.path.startsWith('/api/v1/ws') ||
-                   req.path === '/health' ||
-                   req.path === '/ping' ||
-                   req.path.startsWith('/dashboard/');
+  if (isRateLimitExempt(req)) return next();
 
-  // Bearer token (API/agent) requests: apply a separate, higher rate limit
-  // Device approval middleware provides additional rate limiting for API tokens
-  const hasBearer = req.headers.authorization?.startsWith('Bearer ') || req.query.token || req.query.api_key;
+  const hasBearer =
+    req.headers.authorization?.startsWith('Bearer ') ||
+    req.query.token ||
+    req.query.api_key;
 
-  if (isExempt) {
+  if (hasBearer) {
+    const bearerMax = process.env.NODE_ENV === 'test' ? 5000 : 600; // 600 req/min for API tokens
+    const result = rateLimitStore.consume(\`bearer:\${req.ip}\`, bearerMax, 60_000);
+    if (!result.allowed) {
+      res.set('Retry-After', String(result.retryAfterSec));
+      return res.status(429).json({ error: 'API rate limit exceeded', retryAfter: 60 });
+    }
     return next();
-  }"
+  }
+
+  const globalMax = process.env.NODE_ENV === 'test' ? 1000 : 120; // 120 req/min default
+  const result = rateLimitStore.consume(\`global:\${req.ip}\`, globalMax, 60_000);
+  if (!result.allowed) {
+    res.set('Retry-After', String(result.retryAfterSec));
+    return res.status(429).json({
+      error: 'Rate limit exceeded',
+      retryAfter: result.retryAfterSec,
+    });
+  }
+  next();
+});
+
+const secureCookie = process.env.SESSION_COOKIE_SECURE
+  ? String(process.env.SESSION_COOKIE_SECURE).toLowerCase() === 'true'
+  : isProd;
+
+// Allocate the SQLite handle for the session driver iff we are NOT
+// in test mode and NOT on the legacy Mongo path. The factory below
+// branches on the same env vars and returns a memory driver in",
+  "startLine": 1112,
+}
 `;
