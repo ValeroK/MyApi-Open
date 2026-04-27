@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (Cleanup pre-stage gates G0.1–G0.6 + M4 pre-stage gates G4.1–G4.2 landed — see ADR-0019)
+> - Last updated: **2026-04-27** (M4-T4.1 + T4.2 — `SessionStore` interface, memory + sqlite drivers, factory + 20-test contract suite landed; upstream timer-leak in `better-sqlite3-session-store` neutralized in our wrapper)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **53 / 53 suites, 683 pass / 22 skip, exit 0** (~55 s locally with `--forceExit`; +15 tests from the M4 pre-stage gates G4.1–G4.2 added on 2026-04-27, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **53 / 53 suites, 703 pass / 22 skip, exit 0** (~11 s locally with `--forceExit`; +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added on 2026-04-27, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,33 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **M4 pre-stage gates G4.1–G4.2 landed
+- **2026-04-27 (latest)** — **M4-T4.1 + T4.2 landed: `SessionStore`
+  interface + memory + sqlite drivers + factory under `src/infra/session/`,
+  with a 20-test driver-agnostic contract suite
+  (`src/tests/cleanup-m4-session-store-contract.test.js`).** No
+  change to `src/index.js` yet — that's T4.3, behind every Stage-0
+  + G4.x gate. The factory's selection rule (NODE_ENV=test →
+  memory; REDIS_URL set → throw "T4.6 not yet implemented" loud
+  fail; DATABASE_URL set → memory parity with legacy Mongo path;
+  default → sqlite) preserves today's behavior bit-for-bit so
+  T4.3 will be a pure refactor. Real finding fixed in flight:
+  `better-sqlite3-session-store@0.1.0` calls `setInterval(...)`
+  in its constructor and discards the returned handle (see
+  `node_modules/better-sqlite3-session-store/src/index.js:43`),
+  meaning every Store instance leaks a timer for the process
+  lifetime — exactly one of the four orphan timers G0.3 flagged.
+  Our `SqliteSessionStore` wrapper neutralizes this by
+  intercepting `global.setInterval` for the synchronous
+  construction window, capturing the handle, calling `.unref()`,
+  and exposing `.close()` on the returned store. The full Jest
+  sweep (53 suites) now runs in **~11 s** (down from ~55 s) and
+  the test process no longer prints any open-handle warnings
+  for the new contract suite. Test baseline jumped from
+  **683 → 703 passing / 22 skipped / 53 suites, exit 0**. Next:
+  T4.3 (swap inline sessionStore wiring in `src/index.js` for
+  `createSessionStore({ env, db })`).
+
+- **2026-04-27** — **M4 pre-stage gates G4.1–G4.2 landed
   ahead of any source change to the session / rate-limit code
   (ADR-0019 §"Per-milestone follow-ups").** Two new test files
   (`src/tests/cleanup-pre-stage-rate-limit-contract.test.js` and
