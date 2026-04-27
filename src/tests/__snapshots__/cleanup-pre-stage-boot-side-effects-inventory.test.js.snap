@@ -1,0 +1,99 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory every registered timer either calls .unref?.() or is justified in the source: orphan timers (no .unref / no captured handle / no justification) 1`] = `
+[
+  {
+    "kind": "interval",
+    "line": 136,
+    "snippet": "setInterval(() => {",
+  },
+  {
+    "kind": "interval",
+    "line": 12419,
+    "snippet": "setInterval(() => {",
+  },
+  {
+    "kind": "interval",
+    "line": 12678,
+    "snippet": "setInterval(() => {",
+  },
+  {
+    "kind": "interval",
+    "line": 12705,
+    "snippet": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
+  },
+]
+`;
+
+exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory snapshot: every setInterval/setTimeout registration in src/index.js: timer registrations 1`] = `
+[
+  {
+    "contextComment": "Clear cache every 10 minutes to prevent stale data",
+    "indent": 0,
+    "kind": "interval",
+    "line": 136,
+    "sourceSlice": "setInterval(() => {",
+  },
+  {
+    "contextComment": "P1 Security Fix: Cleanup old rate limit entries (in-memory maps grow unbounded)",
+    "indent": 0,
+    "kind": "interval",
+    "line": 1064,
+    "sourceSlice": "const rateLimitCleanupInterval = setInterval(() => {",
+  },
+  {
+    "contextComment": "Email processor: Send pending emails every 5 minutes",
+    "indent": 0,
+    "kind": "interval",
+    "line": 1093,
+    "sourceSlice": "const emailProcessorInterval = setInterval(async () => {",
+  },
+  {
+    "contextComment": "AFP heartbeat — ping every 30s, terminate and mark offline if no pong within 10s",
+    "indent": 2,
+    "kind": "interval",
+    "line": 12419,
+    "sourceSlice": "setInterval(() => {",
+  },
+  {
+    "contextComment": "own schedule above.",
+    "indent": 4,
+    "kind": "interval",
+    "line": 12678,
+    "sourceSlice": "setInterval(() => {",
+  },
+  {
+    "contextComment": null,
+    "indent": 4,
+    "kind": "interval",
+    "line": 12705,
+    "sourceSlice": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
+  },
+]
+`;
+
+exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory snapshot: top-level (column-0) timers fire at module-load, not bootstrap: module-load timers 1`] = `
+[
+  {
+    "contextComment": "Clear cache every 10 minutes to prevent stale data",
+    "indent": 0,
+    "kind": "interval",
+    "line": 136,
+    "sourceSlice": "setInterval(() => {",
+  },
+  {
+    "contextComment": "P1 Security Fix: Cleanup old rate limit entries (in-memory maps grow unbounded)",
+    "indent": 0,
+    "kind": "interval",
+    "line": 1064,
+    "sourceSlice": "const rateLimitCleanupInterval = setInterval(() => {",
+  },
+  {
+    "contextComment": "Email processor: Send pending emails every 5 minutes",
+    "indent": 0,
+    "kind": "interval",
+    "line": 1093,
+    "sourceSlice": "const emailProcessorInterval = setInterval(async () => {",
+  },
+]
+`;

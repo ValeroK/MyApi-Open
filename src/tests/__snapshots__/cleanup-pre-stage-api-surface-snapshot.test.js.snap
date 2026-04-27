@@ -1,0 +1,630 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup Stage 0 / G0.1] API surface snapshot snapshot: in-memory router shape (top-level layers + sub-router routes): in-memory router shape 1`] = `
+"[0] <middleware: requestContextMiddleware>
+[1] <middleware: <anonymous>>
+[2] <middleware: helmetMiddleware>
+[3] <middleware: <anonymous>>
+[4] <middleware: <anonymous>>
+[5] <middleware: corsMiddleware>
+[6] POST /api/v1/billing/webhook
+[7] <middleware: jsonParser>
+[8] <middleware: <anonymous>>
+[9] <middleware: session>
+[10] <middleware: <anonymous>>
+[11] GET /privacy
+[12] GET /terms
+[13] GET /chatgpt-privacy
+[14] GET /
+[15] GET /login
+[16] <middleware: <anonymous>>
+[17] <middleware: <anonymous>>
+[18] <middleware: serveStatic>
+[19] <middleware: <anonymous>>
+[20] <middleware: serveStatic>
+[21] <middleware: serveStatic>
+[22] GET /terms
+[23] GET /privacy
+[24] GET /accept-invite/:id
+[25] <router with 4 layers>
+  [25.0] POST /onboard/step1
+  [25.1] POST /onboard/step2
+  [25.2] POST /onboard/step3
+  [25.3] GET /onboard/steps
+[26] GET /api/v1/
+[27] GET /api/v1/quick-start
+[28] POST /api/v1/ask
+[29] GET /.well-known/openapi.json
+[30] GET /.well-known/ai-plugin.json
+[31] GET /api/v1/users/me
+[32] PUT /api/v1/users/me
+[33] POST /api/v1/users/me/avatar
+[34] GET /api/v1/api_exposure
+[35] POST /api/v1/api_exposure
+[36] GET /api/v1/privacy/cookies
+[37] PUT /api/v1/privacy/cookies
+[38] POST /api/v1/security/csp-report
+[39] GET /api/v1/privacy/settings
+[40] PUT /api/v1/privacy/settings
+[41] <router with 10 layers>
+  [41.0] GET /csrf-token
+  [41.1] GET /email-config-status
+  [41.2] POST /token-login
+  [41.3] POST /login
+  [41.4] POST /register
+  [41.5] POST /logout
+  [41.6] GET /me
+  [41.7] POST /password/reset/request
+  [41.8] POST /password/reset/confirm
+  [41.9] POST /password/change
+[42] GET /api/v1/afp/download/:platform
+[43] GET /api/v1/afp/download-info
+[44] GET /api/v1/afp/download-oauth/:platform
+[45] GET /api/v1/afp/download-oauth-info
+[46] <middleware: authenticate>
+[47] <router with 9 layers>
+  [47.0] POST /fingerprint
+  [47.1] GET /approved
+  [47.2] GET /:device_id
+  [47.3] POST /:device_id/rename
+  [47.4] POST /:device_id/revoke
+  [47.5] GET /approvals/pending
+  [47.6] POST /approve/:approval_id
+  [47.7] POST /deny/:approval_id
+  [47.8] GET /activity/log
+[48] <middleware: authenticate>
+[49] <router with 2 layers>
+  [49.0] GET /metrics
+  [49.1] GET /stats
+[50] <router with 17 layers>
+  [50.0] GET /
+  [50.1] GET /categories
+  [50.2] GET /:serviceName
+  [50.3] GET /:serviceId/methods
+  [50.4] GET /available
+  [50.5] GET /preferences
+  [50.6] GET /preferences/:serviceName
+  [50.7] POST /preferences/:serviceName
+  [50.8] PUT /preferences/:serviceName
+  [50.9] DELETE /preferences/:serviceName
+  [50.10] GET /google/gmail/messages
+  [50.11] GET /google/gmail/messages/:messageId
+  [50.12] POST /google/gmail/send
+  [50.13] DELETE /google/gmail/messages/:messageId
+  [50.14] GET /google/drive/files
+  [50.15] POST /google/drive/upload
+  [50.16] DELETE /google/drive/files/:fileId
+[51] GET /api/v1/skills/public/list
+[52] <middleware: authenticate>
+[53] <router with 16 layers>
+  [53.0] GET /
+  [53.1] GET /suggestions
+  [53.2] GET /_by_slug/:slug
+  [53.3] GET /_batch
+  [53.4] GET /:id
+  [53.5] GET /:id/content
+  [53.6] POST /
+  [53.7] POST /:id/versions
+  [53.8] GET /:id/versions
+  [53.9] GET /:id/forks
+  [53.10] POST /:id/fork
+  [53.11] GET /:id/skill.md
+  [53.12] PUT /:id/skill.md
+  [53.13] GET /licenses
+  [53.14] POST /:id/verify-ownership
+  [53.15] POST /:id/verify-ownership/:claimId
+[54] <middleware: authenticate>
+[55] <router with 11 layers>
+  [55.0] GET /
+  [55.1] GET /unread-count
+  [55.2] GET /unread
+  [55.3] POST /:id/read
+  [55.4] POST /read-all
+  [55.5] DELETE /:id
+  [55.6] DELETE /
+  [55.7] GET /settings
+  [55.8] PUT /settings
+  [55.9] GET /preferences
+  [55.10] POST /preferences
+[56] <middleware: authenticate>
+[57] <router with 2 layers>
+  [57.0] GET /
+  [57.1] GET /summary
+[58] <middleware: authenticate>
+[59] <router with 5 layers>
+  [59.0] POST /process
+  [59.1] GET /test
+  [59.2] GET /status
+  [59.3] POST /send-test
+  [59.4] GET /jobs
+[60] <middleware: authenticate>
+[61] <router with 11 layers>
+  [61.0] POST /
+  [61.1] GET /
+  [61.2] GET /:id
+  [61.3] PUT /:id
+  [61.4] DELETE /:id
+  [61.5] GET /:id/members
+  [61.6] POST /:id/members
+  [61.7] PUT /:id/members/:userId
+  [61.8] DELETE /:id/members/:userId
+  [61.9] GET /:id/invitations
+  [61.10] POST /:id/invitations
+[62] <middleware: authenticate>
+[63] <router with 4 layers>
+  [63.0] GET /:id
+  [63.1] POST /:id/accept
+  [63.2] DELETE /:id
+  [63.3] GET /
+[64] <router with 4 layers>
+  [64.0] POST /
+  [64.1] GET /
+  [64.2] POST /:id/invite
+  [64.3] POST /notify-launch
+[65] GET /api/v1/manage/audit/agents
+[66] <middleware: authenticate>
+[67] <middleware: <anonymous>>
+[68] <router with 1 layers>
+  [68.0] GET /
+[69] <middleware: authenticate>
+[70] <router with 1 layers>
+  [70.0] POST /
+[71] <middleware: authenticate>
+[72] <router with 7 layers>
+  [72.0] GET /tokens/:id
+  [72.1] GET /tokens/:id/instructions
+  [72.2] POST /tokens/:id/instructions
+  [72.3] PUT /tokens/:id/instructions
+  [72.4] DELETE /tokens/:id/instructions
+  [72.5] GET /services/:serviceName/instructions
+  [72.6] POST /tokens/:id/learn-from-api
+[73] <middleware: authenticate>
+[74] <router with 13 layers>
+  [74.0] GET /devices
+  [74.1] POST /devices/register
+  [74.2] DELETE /devices/:deviceId
+  [74.3] GET /:deviceId/ls
+  [74.4] GET /:deviceId/read
+  [74.5] GET /:deviceId/stat
+  [74.6] POST /:deviceId/write
+  [74.7] DELETE /:deviceId/rm
+  [74.8] POST /:deviceId/mkdir
+  [74.9] POST /:deviceId/exec
+  [74.10] GET /download/:platform
+  [74.11] GET /download/installer/:platform
+  [74.12] GET /download-info
+[75] <middleware: authenticate>
+[76] <router with 4 layers>
+  [76.0] POST /generate
+  [76.1] GET /models
+  [76.2] POST /upscale
+  [76.3] POST /test
+[77] <router with 8 layers>
+  [77.0] GET /authorize
+  [77.1] POST /authorize
+  [77.2] GET /deny
+  [77.3] POST /token
+  [77.4] GET /token
+  [77.5] GET /credentials
+  [77.6] POST /authorize-token
+  [77.7] GET /openapi.yaml
+[78] <middleware: authenticate>
+[79] <router with 7 layers>
+  [79.0] POST /device/authorize
+  [79.1] POST /device/token
+  [79.2] GET /device/pending
+  [79.3] POST /device/approve/:id
+  [79.4] POST /device/deny/:id
+  [79.5] POST /asc/register
+  [79.6] GET /asc/info
+[80] GET /api/v1/agent-auth/install.js
+[81] GET /api/v1/agent-guide
+[82] <router with 2 layers>
+  [82.0] GET /gmail/messages
+  [82.1] GET /gmail/messages/:id
+[83] GET /api/v1/config/public
+[84] GET /api/v1/billing/plans
+[85] <middleware: authenticate>
+[86] <middleware: extractWorkspaceContext>
+[87] <middleware: enforceMultiTenancy>
+[88] <middleware: <anonymous>>
+[89] POST /api/v1/workspace-switch/:workspaceId
+[90] <middleware: authenticate>
+[91] <router with 5 layers>
+  [91.0] <middleware: <anonymous>>
+  [91.1] GET /audit/logs
+  [91.2] GET /audit/summary
+  [91.3] GET /security/sessions
+  [91.4] POST /security/sessions/revoke
+[92] GET /health
+[93] GET /api/v1/capabilities
+[94] GET /api/v1/tokens/me/capabilities
+[95] GET /openapi.yaml
+[96] GET /swagger.json
+[97] GET /swagger.yaml
+[98] GET /api/openapi.json
+[99] GET /api/openapi.yaml
+[100] GET /api/swagger.json
+[101] GET /api/v1/openapi.json
+[102] GET /api/v1/openapi.yaml
+[103] GET /api/docs/openapi.json
+[104] GET /api/docs/swagger.json
+[105] GET /.well-known/openapi
+[106] GET /docs
+[107] GET /api-docs
+[108] GET /swagger
+[109] GET /swagger-ui
+[110] GET /api/swagger
+[111] GET /api/docs
+[112] GET /api/api-docs
+[113] GET /v1
+[114] GET /api
+[115] GET /v1/docs
+[116] GET /api/v1/docs
+[117] GET /developer
+[118] GET /llms.txt
+[119] GET /robots.txt
+[120] GET /sitemap.xml
+[121] GET /api/v1/health
+[122] GET /openapi.json
+[123] GET /api-docs-ui
+[124] GET /.well-known/ai-plugin.json
+[125] GET /api/v1/identity
+[126] GET /api/v1/identity/professional
+[127] GET /api/v1/identity/availability
+[128] GET /api/v1/preferences
+[129] PUT /api/v1/preferences
+[130] POST /api/v1/vault/tokens
+[131] POST /api/v1/vault/discover-api
+[132] GET /api/v1/vault/tokens
+[133] GET /api/v1/vault/tokens/:id/reveal
+[134] DELETE /api/v1/vault/tokens/:id
+[135] POST /api/v1/tokens
+[136] GET /api/v1/tokens/:id
+[137] PUT /api/v1/tokens/:id
+[138] GET /api/v1/scopes
+[139] POST /api/v1/tokens/master/regenerate
+[140] POST /api/v1/tokens/:id/regenerate
+[141] POST /api/v1/tokens/master/bootstrap
+[142] DELETE /api/v1/tokens/:id
+[143] GET /api/v1/tokens
+[144] POST /api/v1/tokens/validate
+[145] POST /api/v1/billing/downgrade-preview
+[146] POST /api/v1/billing/downgrade-confirm
+[147] POST /api/v1/billing/checkout
+[148] GET /api/v1/billing/current
+[149] GET /api/v1/billing/invoices
+[150] GET /api/v1/billing/usage
+[151] POST /api/v1/billing/portal
+[152] GET /api/v1/connectors
+[153] POST /api/v1/connectors
+[154] GET /api/v1/gateway/context
+[155] GET /api/v1/audit
+[156] POST /api/v1/tokens/:id/make-shareable
+[157] POST /api/v1/tokens/:id/unpublish
+[158] GET /api/v1/vault/my-tokens
+[159] DELETE /api/v1/vault/:tokenId/revoke
+[160] GET /api/v1/auth/session-token
+[161] GET /api/v1/auth/oauth-signup/pending
+[162] DELETE /api/v1/account
+[163] POST /api/v1/auth/oauth-signup/complete
+[164] GET /api/v1/auth/debug
+[165] POST /api/v1/auth/2fa/setup
+[166] POST /api/v1/auth/2fa/verify
+[167] POST /api/v1/auth/2fa/disable
+[168] GET /api/v1/auth/2fa/status
+[169] POST /api/v1/auth/2fa/challenge
+[170] POST /api/v1/auth/sessions/revoke-all
+[171] POST /api/v1/users
+[172] GET /api/v1/users
+[173] PUT /api/v1/users/:id/plan
+[174] PUT /api/v1/users/:id/subscription
+[175] DELETE /api/v1/users/:id
+[176] POST /api/v1/users/cleanup-test-users
+[177] <middleware: authenticate>
+[178] <router with 5 layers>
+  [178.0] GET /
+  [178.1] GET /:id
+  [178.2] POST /
+  [178.3] PUT /:id
+  [178.4] DELETE /:id
+[179] POST /api/v1/handshakes
+[180] GET /api/v1/handshakes/:id/status
+[181] GET /api/v1/handshakes
+[182] POST /api/v1/handshakes/:id/approve
+[183] POST /api/v1/handshakes/:id/deny
+[184] POST /api/v1/handshakes/:id/revoke
+[185] GET /api/v1/handshakes/:id/status
+[186] POST /api/v1/personas
+[187] GET /api/v1/personas
+[188] GET /api/v1/personas/:id
+[189] PUT /api/v1/personas/:id
+[190] DELETE /api/v1/personas/:id
+[191] GET /api/v1/personas/:id/documents
+[192] POST /api/v1/personas/:id/documents
+[193] DELETE /api/v1/personas/:id/documents/:docId
+[194] GET /api/v1/personas/:id/skills
+[195] POST /api/v1/personas/:id/skills
+[196] DELETE /api/v1/personas/:id/skills/:skillId
+[197] GET /api/v1/oauth/authorize/twitter/x
+[198] GET /api/v1/oauth/authorize/:service
+[199] GET /api/v1/oauth,/oauth
+[200] GET /api/v1/oauth/callback/:service,/oauth/callback/:service,/api/oauth/callback/:service
+[201] GET /api/v1/oauth/status
+[202] GET /api/v1/oauth/confirm/preview
+[203] POST /api/v1/oauth/confirm
+[204] POST /api/v1/oauth/confirm/reject
+[205] POST /api/v1/oauth/disconnect/:service
+[206] GET /api/v1/oauth/test/:service
+[207] POST /api/v1/keys/rotate
+[208] GET /api/v1/keys/status
+[209] POST /api/v1/admin/security/rotate-key
+[210] GET /api/v1/services/categories
+[211] GET /api/v1/services
+[212] GET /api/v1/services/:name
+[213] GET /api/v1/services/:serviceId/methods
+[214] GET /api/v1/services/:serviceName/test
+[215] POST /api/v1/services/:serviceName/execute
+[216] POST /api/v1/services/:serviceName/proxy
+[217] POST /api/v1/brain/chat
+[218] GET /api/v1/brain/conversations
+[219] GET /api/v1/brain/conversations/:id
+[220] POST /api/v1/brain/knowledge-base
+[221] PUT /api/v1/brain/knowledge-base/:id
+[222] POST /api/v1/brain/knowledge-base/upsert
+[223] POST /api/v1/brain/knowledge-base/upload
+[224] GET /api/v1/brain/knowledge-base
+[225] GET /api/v1/brain/knowledge-base/:id
+[226] GET /api/v1/brain/knowledge-base/:id/attachments
+[227] DELETE /api/v1/brain/knowledge-base/:id
+[228] GET /api/v1/memory
+[229] POST /api/v1/memory
+[230] PATCH /api/v1/memory/:id
+[231] DELETE /api/v1/memory
+[232] DELETE /api/v1/memory/:id
+[233] GET /api/v1/brain/context
+[234] GET /api/v1/dashboard/stats
+[235] GET /api/v1/skills
+[236] GET /api/v1/skills/:id
+[237] POST /api/v1/skills
+[238] POST /api/v1/skills/scan-repo
+[239] POST /api/v1/skills/from-repo
+[240] PUT /api/v1/skills/:id
+[241] GET /api/v1/skills/:id/attachments
+[242] DELETE /api/v1/skills/:id
+[243] PUT /api/v1/skills/:id/activate
+[244] GET /api/v1/skills/:id/documents
+[245] POST /api/v1/skills/:id/documents
+[246] DELETE /api/v1/skills/:id/documents/:docId
+[247] GET /api/v1/marketplace
+[248] GET /api/v1/marketplace/:id
+[249] POST /api/v1/marketplace
+[250] PUT /api/v1/marketplace/:id
+[251] DELETE /api/v1/marketplace/:id
+[252] POST /api/v1/marketplace/:id/rate
+[253] POST /api/v1/marketplace/:id/install
+[254] GET /api/v1/marketplace-my
+[255] GET /api/v1/enterprise/sso/config
+[256] PUT /api/v1/enterprise/sso/config
+[257] GET /api/v1/enterprise/rbac/roles
+[258] POST /api/v1/enterprise/rbac/roles
+[259] GET /api/v1/privacy/retention-policy
+[260] POST /api/v1/privacy/retention-policy
+[261] GET /api/v1/admin/compliance/audit-trail
+[262] POST /api/v1/admin/privacy/retention/run
+[263] <middleware: <anonymous>>
+[264] <middleware: <anonymous>>
+[265] <middleware: <anonymous>>
+[266] <middleware: <anonymous>>
+[267] <middleware: <anonymous>>
+[268] <middleware: <anonymous>>"
+`;
+
+exports[`[Cleanup Stage 0 / G0.1] API surface snapshot snapshot: static mount table from src/index.js: static mount table 1`] = `
+{
+  "directRoutes": [
+    "DELETE /api/v1/account",
+    "DELETE /api/v1/brain/knowledge-base/:id",
+    "DELETE /api/v1/marketplace/:id",
+    "DELETE /api/v1/memory",
+    "DELETE /api/v1/memory/:id",
+    "DELETE /api/v1/personas/:id",
+    "DELETE /api/v1/personas/:id/documents/:docId",
+    "DELETE /api/v1/personas/:id/skills/:skillId",
+    "DELETE /api/v1/skills/:id",
+    "DELETE /api/v1/skills/:id/documents/:docId",
+    "DELETE /api/v1/tokens/:id",
+    "DELETE /api/v1/users/:id",
+    "DELETE /api/v1/vault/:tokenId/revoke",
+    "DELETE /api/v1/vault/tokens/:id",
+    "GET /",
+    "GET /.well-known/ai-plugin.json",
+    "GET /.well-known/openapi.json",
+    "GET /accept-invite/:id",
+    "GET /api-docs-ui",
+    "GET /api/v1/",
+    "GET /api/v1/admin/compliance/audit-trail",
+    "GET /api/v1/afp/download-info",
+    "GET /api/v1/afp/download-oauth-info",
+    "GET /api/v1/afp/download-oauth/:platform",
+    "GET /api/v1/afp/download/:platform",
+    "GET /api/v1/agent-auth/install.js",
+    "GET /api/v1/agent-guide",
+    "GET /api/v1/api_exposure",
+    "GET /api/v1/audit",
+    "GET /api/v1/auth/2fa/status",
+    "GET /api/v1/auth/debug",
+    "GET /api/v1/auth/oauth-signup/pending",
+    "GET /api/v1/auth/session-token",
+    "GET /api/v1/billing/current",
+    "GET /api/v1/billing/invoices",
+    "GET /api/v1/billing/plans",
+    "GET /api/v1/billing/usage",
+    "GET /api/v1/brain/context",
+    "GET /api/v1/brain/conversations",
+    "GET /api/v1/brain/conversations/:id",
+    "GET /api/v1/brain/knowledge-base",
+    "GET /api/v1/brain/knowledge-base/:id",
+    "GET /api/v1/brain/knowledge-base/:id/attachments",
+    "GET /api/v1/capabilities",
+    "GET /api/v1/config/public",
+    "GET /api/v1/connectors",
+    "GET /api/v1/dashboard/stats",
+    "GET /api/v1/enterprise/rbac/roles",
+    "GET /api/v1/enterprise/sso/config",
+    "GET /api/v1/gateway/context",
+    "GET /api/v1/handshakes",
+    "GET /api/v1/handshakes/:id/status",
+    "GET /api/v1/health",
+    "GET /api/v1/identity",
+    "GET /api/v1/identity/availability",
+    "GET /api/v1/identity/professional",
+    "GET /api/v1/keys/status",
+    "GET /api/v1/manage/audit/agents",
+    "GET /api/v1/marketplace",
+    "GET /api/v1/marketplace-my",
+    "GET /api/v1/marketplace/:id",
+    "GET /api/v1/memory",
+    "GET /api/v1/oauth/authorize/:service",
+    "GET /api/v1/oauth/authorize/twitter/x",
+    "GET /api/v1/oauth/confirm/preview",
+    "GET /api/v1/oauth/status",
+    "GET /api/v1/oauth/test/:service",
+    "GET /api/v1/personas",
+    "GET /api/v1/personas/:id",
+    "GET /api/v1/personas/:id/documents",
+    "GET /api/v1/personas/:id/skills",
+    "GET /api/v1/preferences",
+    "GET /api/v1/privacy/cookies",
+    "GET /api/v1/privacy/retention-policy",
+    "GET /api/v1/privacy/settings",
+    "GET /api/v1/quick-start",
+    "GET /api/v1/scopes",
+    "GET /api/v1/services",
+    "GET /api/v1/services/:name",
+    "GET /api/v1/services/:serviceId/methods",
+    "GET /api/v1/services/:serviceName/test",
+    "GET /api/v1/services/categories",
+    "GET /api/v1/skills",
+    "GET /api/v1/skills/:id",
+    "GET /api/v1/skills/:id/attachments",
+    "GET /api/v1/skills/:id/documents",
+    "GET /api/v1/skills/public/list",
+    "GET /api/v1/tokens",
+    "GET /api/v1/tokens/:id",
+    "GET /api/v1/tokens/me/capabilities",
+    "GET /api/v1/users",
+    "GET /api/v1/users/me",
+    "GET /api/v1/vault/my-tokens",
+    "GET /api/v1/vault/tokens",
+    "GET /api/v1/vault/tokens/:id/reveal",
+    "GET /chatgpt-privacy",
+    "GET /health",
+    "GET /llms.txt",
+    "GET /login",
+    "GET /openapi.json",
+    "GET /privacy",
+    "GET /robots.txt",
+    "GET /sitemap.xml",
+    "GET /terms",
+    "PATCH /api/v1/memory/:id",
+    "POST /api/v1/admin/privacy/retention/run",
+    "POST /api/v1/admin/security/rotate-key",
+    "POST /api/v1/api_exposure",
+    "POST /api/v1/ask",
+    "POST /api/v1/auth/2fa/challenge",
+    "POST /api/v1/auth/2fa/disable",
+    "POST /api/v1/auth/2fa/setup",
+    "POST /api/v1/auth/2fa/verify",
+    "POST /api/v1/auth/oauth-signup/complete",
+    "POST /api/v1/auth/sessions/revoke-all",
+    "POST /api/v1/billing/checkout",
+    "POST /api/v1/billing/downgrade-confirm",
+    "POST /api/v1/billing/downgrade-preview",
+    "POST /api/v1/billing/portal",
+    "POST /api/v1/billing/webhook",
+    "POST /api/v1/brain/chat",
+    "POST /api/v1/brain/knowledge-base",
+    "POST /api/v1/brain/knowledge-base/upload",
+    "POST /api/v1/brain/knowledge-base/upsert",
+    "POST /api/v1/connectors",
+    "POST /api/v1/enterprise/rbac/roles",
+    "POST /api/v1/handshakes",
+    "POST /api/v1/handshakes/:id/approve",
+    "POST /api/v1/handshakes/:id/deny",
+    "POST /api/v1/handshakes/:id/revoke",
+    "POST /api/v1/keys/rotate",
+    "POST /api/v1/marketplace",
+    "POST /api/v1/marketplace/:id/install",
+    "POST /api/v1/marketplace/:id/rate",
+    "POST /api/v1/memory",
+    "POST /api/v1/oauth/confirm",
+    "POST /api/v1/oauth/confirm/reject",
+    "POST /api/v1/oauth/disconnect/:service",
+    "POST /api/v1/personas",
+    "POST /api/v1/personas/:id/documents",
+    "POST /api/v1/personas/:id/skills",
+    "POST /api/v1/privacy/retention-policy",
+    "POST /api/v1/security/csp-report",
+    "POST /api/v1/services/:serviceName/execute",
+    "POST /api/v1/services/:serviceName/proxy",
+    "POST /api/v1/skills",
+    "POST /api/v1/skills/:id/documents",
+    "POST /api/v1/skills/from-repo",
+    "POST /api/v1/skills/scan-repo",
+    "POST /api/v1/tokens",
+    "POST /api/v1/tokens/:id/make-shareable",
+    "POST /api/v1/tokens/:id/regenerate",
+    "POST /api/v1/tokens/:id/unpublish",
+    "POST /api/v1/tokens/master/bootstrap",
+    "POST /api/v1/tokens/master/regenerate",
+    "POST /api/v1/tokens/validate",
+    "POST /api/v1/users",
+    "POST /api/v1/users/cleanup-test-users",
+    "POST /api/v1/users/me/avatar",
+    "POST /api/v1/vault/discover-api",
+    "POST /api/v1/vault/tokens",
+    "POST /api/v1/workspace-switch/:workspaceId",
+    "PUT /api/v1/brain/knowledge-base/:id",
+    "PUT /api/v1/enterprise/sso/config",
+    "PUT /api/v1/marketplace/:id",
+    "PUT /api/v1/personas/:id",
+    "PUT /api/v1/preferences",
+    "PUT /api/v1/privacy/cookies",
+    "PUT /api/v1/privacy/settings",
+    "PUT /api/v1/skills/:id",
+    "PUT /api/v1/skills/:id/activate",
+    "PUT /api/v1/tokens/:id",
+    "PUT /api/v1/users/:id/plan",
+    "PUT /api/v1/users/:id/subscription",
+    "PUT /api/v1/users/me",
+  ],
+  "mountPoints": [
+    "/api/",
+    "/api/v1",
+    "/api/v1/activity",
+    "/api/v1/afp",
+    "/api/v1/agentic",
+    "/api/v1/auth",
+    "/api/v1/dashboard",
+    "/api/v1/devices",
+    "/api/v1/email",
+    "/api/v1/export",
+    "/api/v1/fal",
+    "/api/v1/google",
+    "/api/v1/import",
+    "/api/v1/invitations",
+    "/api/v1/notifications",
+    "/api/v1/oauth-server",
+    "/api/v1/services",
+    "/api/v1/skills",
+    "/api/v1/tickets",
+    "/api/v1/vault",
+    "/api/v1/waitlist",
+    "/api/v1/workspaces",
+    "/connectors",
+    "/dashboard",
+    "/dashboard/assets",
+  ],
+}
+`;

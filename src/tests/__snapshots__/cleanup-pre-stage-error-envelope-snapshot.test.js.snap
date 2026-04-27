@@ -1,0 +1,92 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: 400 PASSWORD_REUSED — change to same password: 400 PASSWORD_REUSED 1`] = `
+{
+  "codeValue": null,
+  "contentTypeIsJson": true,
+  "errorValue": "PASSWORD_REUSED",
+  "hasCode": false,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 400,
+  "topLevelKeys": [
+    "error",
+  ],
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: 400 — register without required fields: 400 register missing fields 1`] = `
+{
+  "codeValue": null,
+  "contentTypeIsJson": true,
+  "errorValue": "username and password required",
+  "hasCode": false,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 400,
+  "topLevelKeys": [
+    "error",
+  ],
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: 401 — /me without a session: GET /me unauthenticated 1`] = `
+{
+  "codeValue": null,
+  "contentTypeIsJson": true,
+  "errorValue": "Unauthorized",
+  "hasCode": false,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 401,
+  "topLevelKeys": [
+    "error",
+  ],
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: 401 — login with bad credentials: login bad credentials 1`] = `
+{
+  "codeValue": null,
+  "contentTypeIsJson": true,
+  "errorValue": "Invalid email or password",
+  "hasCode": false,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 401,
+  "topLevelKeys": [
+    "error",
+  ],
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: 409 EMAIL_EXISTS — register duplicate email: 409 EMAIL_EXISTS on register 1`] = `
+{
+  "codeValue": "EMAIL_EXISTS",
+  "contentTypeIsJson": true,
+  "errorValue": "An account with this email already exists. Please sign in instead.",
+  "hasCode": true,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 409,
+  "topLevelKeys": [
+    "code",
+    "error",
+  ],
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.5] error envelope snapshot snapshot: unknown /api/v1 route — pins whatever the gate-then-404 contract is: unknown /api/v1 route 1`] = `
+{
+  "codeValue": null,
+  "contentTypeIsJson": true,
+  "errorValue": "Missing session, Authorization: Bearer token, or ?token= query parameter",
+  "hasCode": false,
+  "hasError": true,
+  "hasMessage": false,
+  "status": 401,
+  "topLevelKeys": [
+    "error",
+  ],
+}
+`;

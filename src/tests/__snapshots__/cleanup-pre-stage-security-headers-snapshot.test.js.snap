@@ -1,0 +1,96 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup Stage 0 / G0.6] security headers snapshot per response family snapshot: family — JSON 4xx error (login bad creds): JSON 4xx error 1`] = `
+{
+  "cache-control": "no-store, no-cache, must-revalidate, private",
+  "content-security-policy": "default-src 'self';script-src 'self' https://unpkg.com https://static.cloudflareinsights.com https://cdn.tailwindcss.com 'nonce-<scrubbed>';style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com;img-src 'self' data: https: blob:;font-src 'self' https://fonts.gstatic.com data:;connect-src 'self' https: wss:;frame-src 'self' https://www.youtube.com https://www.youtube-nocook…<truncated>",
+  "contentType": "application/json",
+  "cross-origin-embedder-policy": null,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "expires": null,
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "pragma": "<set>",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "status": 401,
+  "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+  "x-content-type-options": "<set>",
+  "x-frame-options": "<set>",
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.6] security headers snapshot per response family snapshot: family — JSON 4xx unauth (GET /me without session): JSON unauth /me 1`] = `
+{
+  "cache-control": "no-store, no-cache, must-revalidate, private",
+  "content-security-policy": "default-src 'self';script-src 'self' https://unpkg.com https://static.cloudflareinsights.com https://cdn.tailwindcss.com 'nonce-<scrubbed>';style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com;img-src 'self' data: https: blob:;font-src 'self' https://fonts.gstatic.com data:;connect-src 'self' https: wss:;frame-src 'self' https://www.youtube.com https://www.youtube-nocook…<truncated>",
+  "contentType": "application/json",
+  "cross-origin-embedder-policy": null,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "expires": null,
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "pragma": "<set>",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "status": 401,
+  "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+  "x-content-type-options": "<set>",
+  "x-frame-options": "<set>",
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.6] security headers snapshot per response family snapshot: family — JSON authenticated success (logout): JSON authenticated logout 1`] = `
+{
+  "cache-control": "no-cache, no-store, must-revalidate",
+  "content-security-policy": "default-src 'self';script-src 'self' https://unpkg.com https://static.cloudflareinsights.com https://cdn.tailwindcss.com 'nonce-<scrubbed>';style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com;img-src 'self' data: https: blob:;font-src 'self' https://fonts.gstatic.com data:;connect-src 'self' https: wss:;frame-src 'self' https://www.youtube.com https://www.youtube-nocook…<truncated>",
+  "contentType": "application/json",
+  "cross-origin-embedder-policy": null,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "expires": "<set>",
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "pragma": "<set>",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "status": 200,
+  "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+  "x-content-type-options": "<set>",
+  "x-frame-options": "<set>",
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.6] security headers snapshot per response family snapshot: family — public JSON API (email-config-status): public JSON GET 1`] = `
+{
+  "cache-control": "no-store",
+  "content-security-policy": "default-src 'self';script-src 'self' https://unpkg.com https://static.cloudflareinsights.com https://cdn.tailwindcss.com 'nonce-<scrubbed>';style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com;img-src 'self' data: https: blob:;font-src 'self' https://fonts.gstatic.com data:;connect-src 'self' https: wss:;frame-src 'self' https://www.youtube.com https://www.youtube-nocook…<truncated>",
+  "contentType": "application/json",
+  "cross-origin-embedder-policy": null,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "expires": null,
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "pragma": "<set>",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "status": 200,
+  "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+  "x-content-type-options": "<set>",
+  "x-frame-options": "<set>",
+}
+`;
+
+exports[`[Cleanup Stage 0 / G0.6] security headers snapshot per response family snapshot: family — root / (HTML or marketing page): root / 1`] = `
+{
+  "cache-control": "public, max-age=300, must-revalidate",
+  "content-security-policy": "default-src 'self';script-src 'self' https://unpkg.com https://static.cloudflareinsights.com https://cdn.tailwindcss.com 'nonce-<scrubbed>';style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com;img-src 'self' data: https: blob:;font-src 'self' https://fonts.gstatic.com data:;connect-src 'self' https: wss:;frame-src 'self' https://www.youtube.com https://www.youtube-nocook…<truncated>",
+  "contentType": "text/html",
+  "cross-origin-embedder-policy": null,
+  "cross-origin-opener-policy": "same-origin",
+  "cross-origin-resource-policy": "same-origin",
+  "expires": null,
+  "permissions-policy": "camera=(), microphone=(), geolocation=()",
+  "pragma": null,
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "status": 200,
+  "strict-transport-security": "max-age=31536000; includeSubDomains; preload",
+  "x-content-type-options": "<set>",
+  "x-frame-options": "<set>",
+}
+`;

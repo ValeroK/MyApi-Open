@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-25** (F4 — OAuth identity vs service separation landed)
+> - Last updated: **2026-04-27** (Cleanup Stage-0 baseline gates G0.1–G0.6 landed — see ADR-0019)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **38 / 38 suites, 539 pass / 14 skip, exit 0** (~6 s locally with `--forceExit`; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **51 / 51 suites, 668 pass / 22 skip, exit 0** (~55 s locally with `--forceExit`; +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added on 2026-04-27 — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,36 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-25 (latest)** — **F4 landed: OAuth identity role separated
+- **2026-04-27 (latest)** — **Cleanup Stage-0 baseline gates landed
+  (ADR-0019).** Six new test files (`src/tests/cleanup-pre-stage-*`)
+  pin the cross-cutting properties every upcoming cleanup milestone
+  (M4 dual-driver session/rate-limit, M6 monolith extraction, M7
+  TypeScript migration, M8 MongoDB/legacy/dead-code deletion, M9
+  frontend & output hygiene) is at risk of silently regressing:
+  the route-mounting graph (G0.1), top-level middleware chain +
+  app-level settings (G0.2), every `setInterval`/`setTimeout`
+  registration in `src/index.js` plus orphan-timer ratchet (G0.3),
+  the password-auth lifecycle as a state machine — register → /me
+  → change-password → logout → re-login → /me → logout on a
+  single supertest agent (G0.4), the JSON error envelope at six
+  representative status codes (G0.5), and the security-header
+  policy per response family with CSP nonce scrubbed for snapshot
+  stability (G0.6). Real findings already surfaced by writing the
+  gates: unknown `/api/v1` paths return 401 (not 404) because a
+  session-requiring middleware sits in front of the catch-all;
+  the error envelope is inconsistent (most are `{error}` only,
+  only `409 EMAIL_EXISTS` is `{error, code}` — M9 target); four
+  orphan `setInterval` timers in `src/index.js` lack `.unref()`
+  and lack captured handles, forcing every Jest run through
+  `--forceExit` (M4/M6 target); `x-powered-by: Express` is still
+  on every response (M9 helmet target). Test baseline jumped from
+  **638 passing → 668 passing / 22 skipped / 51 suites, exit 0**.
+  ADR-0019 records the rationale, the per-gate property pinned,
+  and the snapshot-update procedure that downstream milestone
+  commits MUST follow. Next: start M4 (dual-driver
+  session/rate-limit) under the protection of these gates.
+
+- **2026-04-25** — **F4 landed: OAuth identity role separated
   from service role across Google, GitHub, and Facebook.** Single atomic
   commit. Motivation: F3 Pass 1 + Pass 2 tried to eliminate Google's
   per-login consent screen by dropping `max_age=0` and flipping the

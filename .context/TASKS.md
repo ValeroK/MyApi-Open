@@ -65,7 +65,8 @@ See `.cursor/rules/test-first.mdc` for the full workflow.
 | M1 | Delete dangerous endpoints / hardcoded secrets | 7 | 7 | 🟢 Code landed — T1.6 closed (scan clean, findings were test tokens per owner); T1.7 ledger pending (rolled into M14) |
 | M2 | Consolidate crypto (re-scoped to deletion per ADR-0013) | 8 | 8 | ✅ Done 2026-04-21 — T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10; T2.2/T2.3/T2.6 cancelled per ADR-0013 |
 | M3 | OAuth state + PKCE + callback hardening | 10 | 10 | ✅ **Complete 2026-04-24** — T3.0–T3.9 landed + wrap-up commit (provider_subject threading, legacy-export retirement, docs rebaseline, live Google OAuth smoke, F1/F2/F3 non-M3 follow-ups filed). C3 + C6 closed end-to-end; H1 remains closed. Session log: `sessions/2026-04-24-m3-smoke.md`. |
-| M4 | Session + rate-limit dual-driver store | 9 | 0 | Not started (T4.9 data-integrity carry-over from ADR-0015) |
+| Stage 0 | Cleanup pre-stage baseline gates (G0.1–G0.6) | 6 | 6 | ✅ **Complete 2026-04-27** — see ADR-0019. Pins API surface, middleware chain, boot-side-effects, auth lifecycle, error envelope, security headers per response family. Test baseline jumped 638 → 668 / 22 skip / 51 suites, exit 0. |
+| M4 | Session + rate-limit dual-driver store | 9 | 0 | Not started (T4.9 data-integrity carry-over from ADR-0015). **Pre-stage gates required:** G0.1, G0.2, G0.3, G0.4, G0.6 must be green before any task in M4 changes. |
 | M5 | SSRF surface unification via SafeHTTPClient | 7 | 0 | Not started |
 | M6 | Monolith extraction (split `src/index.js`) | 10 | 0 | Not started |
 | M7 | TypeScript migration for domain + infra | 7 | 0 | Not started |
@@ -76,7 +77,33 @@ See `.cursor/rules/test-first.mdc` for the full workflow.
 | M12 | Testing uplift | 10 | 0 | Not started |
 | M13 | CI/CD & supply chain | 8 | 0 | Not started |
 | M14 | Docs & runbooks | 7 | 0 | Not started |
-| **Total** |  | **120** | **16** |  |
+| **Total** |  | **126** | **22** |  |
+
+---
+
+## Stage 0 — Cleanup pre-stage baseline gates ✅ Complete (2026-04-27)
+
+**Goal.** Pin the cross-cutting properties that every cleanup milestone
+(M4, M6, M7, M8, M9) is at risk of silently regressing, BEFORE starting
+any of those milestones. See ADR-0019 for full rationale.
+
+**Exit criteria.**
+- Six G0.x test files exist under `src/tests/cleanup-pre-stage-*.test.js`.
+- Each gate is green twice in a row (snapshot-stable).
+- Full `npm test` is green.
+- ADR-0019 records the per-gate property and the snapshot-update
+  procedure.
+
+**Depends on.** Nothing — these gates are baselines.
+
+| # | Task | Effort | Depends on | Notes |
+|---|------|--------|------------|-------|
+| G0.1 | `[x]` API-surface snapshot — pin every mounted route + every `app.use` mount in `src/index.js` (runtime + static, cross-checked) | M | — | Done 2026-04-27. Real finding: static lex used `stripLineComments` not block-comment stripping after a regex literal in `src/index.js` confused the naive parser into eating the `app.use('/api/v1/skills', ...)` mount. |
+| G0.2 | `[x]` Middleware-chain snapshot — pin ordered top-level middleware (name, arity, kind, slash) + app-level settings (`trust proxy`, `etag`, `x-powered-by`) | S | — | Done 2026-04-27. Real finding: `x-powered-by: true` — helmet is NOT removing it. M9 target. |
+| G0.3 | `[x]` Boot-side-effects inventory — pin every `setInterval`/`setTimeout` registration in `src/index.js` with line, indent, kind, comment-context | S | — | Done 2026-04-27. Real finding: 4 of the 6 timers lack `.unref()` AND lack a captured handle, forcing every Jest run through `--forceExit`. M4/M6 target. |
+| G0.4 | `[x]` Auth-lifecycle e2e — pin register → /me → change-password → logout → re-login → /me → logout on a single supertest agent + idempotent logout + no user-existence leak | M | — | Done 2026-04-27. 4 tests, all green. |
+| G0.5 | `[x]` Error-envelope snapshot — pin shape + stable error-code enum at 6 representative status codes | S | — | Done 2026-04-27. Real finding: envelope is INCONSISTENT (most are `{error}`, only `409 EMAIL_EXISTS` is `{error, code}`); also unknown `/api/v1` paths return 401, not 404, because a session-requiring middleware sits in front of the catch-all. M9 target. |
+| G0.6 | `[x]` Security-headers snapshot per response family — pin CSP / HSTS / Cache-Control / Permissions-Policy on public JSON, JSON 4xx, unauth /me, authenticated logout, root /, with CSP nonce scrubbed | S | — | Done 2026-04-27. Hard assertions (in addition to snapshot) for `no-store` on logout and on `/auth/email-config-status` (F5.3 ratchet). |
 
 ---
 
