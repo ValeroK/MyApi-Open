@@ -14,7 +14,7 @@ exports[`[Cleanup pre-stage / G4.2] session cookie + persistence invariants snap
 
 exports[`[Cleanup pre-stage / G4.2] session cookie + persistence invariants snapshot: app.use(session({ ... })) source block: session() configuration source 1`] = `
 "app.use(session({
-  ...(sessionStore ? { store: sessionStore } : {}),
+  store: sessionStore,
   secret: process.env.SESSION_SECRET, // P0 Security Fix: No fallback - validated at startup
   name: 'myapi.sid',
   resave: false,

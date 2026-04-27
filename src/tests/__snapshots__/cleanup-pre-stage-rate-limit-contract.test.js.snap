@@ -14,7 +14,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "skip: () => process.env.NODE_ENV === 'test', // Skip in test mode",
       "});",
     ],
-    "line": 2190,
+    "line": 2196,
   },
   {
     "binding": "dashboardSpaRateLimit",
@@ -28,7 +28,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
       "});",
     ],
-    "line": 2200,
+    "line": 2206,
   },
 ]
 `;
@@ -126,7 +126,7 @@ const rateLimitCleanupInterval = setInterval(() => {
   }
 }, 60 * 60 * 1000); // Run every hour
 rateLimitCleanupInterval.unref?.();",
-  "startLine": 1061,
+  "startLine": 1064,
 }
 `;
 

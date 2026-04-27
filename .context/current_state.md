@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (M4-T4.1 + T4.2 — `SessionStore` interface, memory + sqlite drivers, factory + 20-test contract suite landed; upstream timer-leak in `better-sqlite3-session-store` neutralized in our wrapper)
+> - Last updated: **2026-04-27** (M4-T4.4 — `src/index.js` session wiring now goes through `createSessionStore({ env, db })`; `better-sqlite3-session-store` no longer required directly from the monolith; G4.2 source snapshot intentionally updated, G4.1 + G0.3 snapshots line-shifted only)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -76,7 +76,32 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **M4-T4.1 + T4.2 landed: `SessionStore`
+- **2026-04-27 (latest)** — **M4-T4.4 landed: `src/index.js`
+  session wiring now goes through `createSessionStore({ env, db })`.**
+  Pure refactor under the protection of every Stage-0 + G4.x gate.
+  Net diff: +6 lines in `src/index.js` (24 ins / 18 del). The
+  `BetterSqlite3StoreFactory` import and the inline `new
+  BetterSqlite3StoreFactory(...)` are gone — replaced by a single
+  factory call that returns `{ store, driver }`. The `app.use(
+  session({ ... }))` block lost its conditional spread (`...(
+  sessionStore ? { store: sessionStore } : {})`) since the factory
+  always returns a Store; in test/legacy-Mongo modes that Store is
+  the same `express-session.MemoryStore` express-session would
+  have allocated by default, so runtime behavior is bit-for-bit
+  identical. **Behavior preservation hatch:** `setAuthHardeningSession-
+  Store(...)` is now invoked with the store only when `driver ===
+  'sqlite'`, mirroring today's "test mode → null sessionStore in
+  authHardening" semantics so concurrent-session-cap tests do not
+  shift underneath us. Snapshot updates: 1 intentional in G4.2
+  (the `app.use(session({...}))` source block); 5 line-number-only
+  in G4.1 (globalRateLimitMap + expressRateLimit configs) and
+  G0.3 (timer registrations + module-load timers + orphan timer
+  ratchet) — every diff body byte-identical. Test baseline holds
+  at **703 / 703 passing / 22 skipped / 53 suites, exit 0** in
+  ~11 s. Next: T4.5 (`RateLimitStore` interface + memory + sqlite
+  drivers).
+
+- **2026-04-27** — **M4-T4.1 + T4.2 landed: `SessionStore`
   interface + memory + sqlite drivers + factory under `src/infra/session/`,
   with a 20-test driver-agnostic contract suite
   (`src/tests/cleanup-m4-session-store-contract.test.js`).** No

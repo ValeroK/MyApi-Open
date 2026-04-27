@@ -850,12 +850,15 @@ const isOAuthServiceEnabled = (service) => {
 const session = require('express-session');
 const isProd = process.env.NODE_ENV === 'production';
 
-// Only load BetterSqlite3 if not using MongoDB
+// ADR-0002 / M4-T4.1+T4.2 — session-store factory. Selects memory /
+// sqlite / redis at boot from process.env. The factory loads driver
+// implementations lazily, so this file no longer requires
+// `better-sqlite3-session-store` directly. The native `better-sqlite3`
+// handle is still allocated below in the same place it always was.
+const { createSessionStore } = require('./infra/session');
 let BetterSqlite3 = null;
-let BetterSqlite3StoreFactory = null;
 if (!process.env.DATABASE_URL) {
   BetterSqlite3 = require('better-sqlite3');
-  BetterSqlite3StoreFactory = require('better-sqlite3-session-store')(session);
 }
 
 // SOC2 Phase 2 — CC7: Assign a unique correlation ID to every request for log tracing
@@ -1161,29 +1164,32 @@ const secureCookie = process.env.SESSION_COOKIE_SECURE
   ? String(process.env.SESSION_COOKIE_SECURE).toLowerCase() === 'true'
   : isProd;
 
-let sessionStore;
+// Allocate the SQLite handle for the session driver iff we are NOT
+// in test mode and NOT on the legacy Mongo path. The factory below
+// branches on the same env vars and returns a memory driver in
+// those cases (where `sessionDb` stays null and is unused).
 let sessionDb = null;
-if (process.env.NODE_ENV !== 'test' && !process.env.DATABASE_URL) {
-  // Only use SQLite session store if not using MongoDB
+if (process.env.NODE_ENV !== 'test' && !process.env.DATABASE_URL && BetterSqlite3) {
   const sessionDbPath = process.env.SESSION_DB_PATH || path.join(__dirname, 'db.sqlite');
   sessionDb = new BetterSqlite3(sessionDbPath);
-  sessionStore = new BetterSqlite3StoreFactory({
-    client: sessionDb,
-    expired: {
-      clear: true,
-      intervalMs: 15 * 60 * 1000,
-    },
-  });
 }
 
+const { store: sessionStore, driver: sessionDriver } = createSessionStore({
+  env: process.env,
+  db: sessionDb,
+});
+
 // SOC2 CC6 — concurrent session cap, TOTP replay protection, and the
-// shared auth rate-limit live in `src/lib/authHardening.js`.  Wire this
-// module's sessionStore into that shared state so `registerUserSession`
-// can evict the oldest session when the per-user cap is exceeded.
-setAuthHardeningSessionStore(sessionStore);
+// shared auth rate-limit live in `src/lib/authHardening.js`. Pre-T4.4
+// this hand-off only happened when a persistent store was wired
+// (sqlite driver). Memory-mode tests had no Store handle in
+// authHardening, and we preserve that behavior here so existing test
+// expectations about concurrent-session-cap eviction in test mode do
+// not shift underneath them.
+setAuthHardeningSessionStore(sessionDriver === 'sqlite' ? sessionStore : null);
 
 app.use(session({
-  ...(sessionStore ? { store: sessionStore } : {}),
+  store: sessionStore,
   secret: process.env.SESSION_SECRET, // P0 Security Fix: No fallback - validated at startup
   name: 'myapi.sid',
   resave: false,
