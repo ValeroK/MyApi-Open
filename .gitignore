@@ -27,6 +27,9 @@ src/.db_integrity
 .cache/
 .tsbuildinfo
 
+# Scratch commit-message drafts authored by the agent.
+.commit-msg.tmp
+
 # Gitleaks scan artifacts — may contain raw secrets when not run with --redact.
 # Safe to generate locally; never commit.
 gitleaks-*.json

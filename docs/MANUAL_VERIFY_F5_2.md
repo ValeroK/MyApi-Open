@@ -208,3 +208,95 @@ If you don't want to leave the test user lying around, you can either:
 | 7    | P3.4 + P2 change-password | `POST /api/v1/auth/password/change`         |
 
 If every step passes, F5.2 is good to ship.
+
+---
+
+## F5.3 — Auth UX hardening (additional steps)
+
+These steps cover the four user-reported regressions fixed in F5.3.
+Run them after the F5.2 sweep above.
+
+### 9. Email-not-configured banner (Bug 1)
+
+1. Make sure `EMAIL_FROM` is **not** set in `src/.env` (or stop the
+   container, comment out `EMAIL_FROM`, then `npm run dashboard:reload`).
+2. Open `/dashboard/forgot-password`.
+   - Expected: amber banner "Email delivery is not configured on this
+     server" appears at the top of the form, listing the missing
+     environment variables.
+3. Open `/dashboard/settings`, scroll to **Change Password**.
+   - Expected: the same amber banner appears above the form.
+4. Set `EMAIL_FROM=noreply@example.com` (and `SMTP_HOST` / `SMTP_PORT`
+   if `EMAIL_PROVIDER=smtp`), restart with `npm run dashboard:reload`,
+   refresh both pages.
+   - Expected: banners are gone.
+
+### 10. Duplicate-email registration is blocked (Bug 2)
+
+1. Open `/dashboard/signup` and register `dup_user_a` with
+   `dup-test@example.com` / `Strong!Pass123`. Sign in successfully.
+2. Log out (Settings → Sign out, or click your avatar → Sign out).
+3. Open `/dashboard/signup` again and try to register `dup_user_b`
+   with the **same email** `dup-test@example.com`.
+   - Expected: red banner "An account with this email already exists.
+     Sign in instead, or use 'Forgot password' if you don't remember
+     it." Form does not submit.
+4. Try once more with `Dup-Test@Example.COM` (different case).
+   - Expected: same 409 / same banner — case-insensitive match.
+
+### 11. OAuth-only account guard (Bug 3)
+
+1. Sign up via Google (or another configured OAuth provider). Note the
+   email associated with the OAuth account.
+2. Log out.
+3. Open `/dashboard/login`, switch to the password form, and try to
+   sign in with that same email + any password.
+   - Expected: amber banner "Continue with Google" replaces the
+     password error. Password field is cleared. The banner contains a
+     **"Continue with Google →"** button that initiates the OAuth flow.
+4. Click the button.
+   - Expected: standard Google OAuth flow runs and you land in the
+     dashboard authenticated as that user.
+
+### 12. Post-login redirect stability (Bug 4)
+
+1. Sign in with password from `/dashboard/login`.
+   - Expected: lands on `/dashboard/` (the SPA), not back on `/`.
+2. Open a new tab → `/`. Click "Sign in" → "Sign in with email" →
+   complete login.
+   - Expected: lands on `/dashboard/`.
+3. Repeat with the **Forgot password → reset → confirm** flow.
+   - Expected: after the reset confirms and auto-logs you in, lands
+     on `/dashboard/`.
+4. Log out, then log back in immediately (within the same tab).
+   - Expected: lands on `/dashboard/` — no bounce back to `/`.
+
+> **Root cause for the regression:** the axios/fetch interceptors used to
+> treat **HTTP 403** as a session-expired event and force the user out.
+> The dashboard prefetches plan-gated endpoints (e.g. `/api/v1/afp/devices`)
+> on boot — for free-plan users that endpoint legitimately returned 403,
+> which silently logged the user out and bounced them to `/`. The
+> interceptors now only react to **401**; 403 is propagated to the
+> caller, which is the correct REST semantic ("authenticated but not
+> authorized for this resource").
+
+### 13. Plan tier-gating is dev-friendly
+
+The smoke / dev container runs with `NODE_ENV=development`, so plan
+tier-gates (AFP connectors, persona/service/vault limits, etc.) are
+**disabled** — every requester is treated as if they were on the highest
+tier. This lets engineers exercise Pro/Enterprise flows without having
+to flip plans in the DB.
+
+1. Sign in as a free-plan user, open DevTools → Network, refresh
+   `/dashboard/`.
+   - Expected: `/api/v1/afp/devices` returns **200** with
+     `{"ok":true,"devices":[]}` (not 403).
+2. In production (`NODE_ENV=production`) the gate stays active. To
+   re-enable it locally for a regression test, set
+   `ENFORCE_PLAN_LIMITS=true` *and* `NODE_ENV=production` on the
+   container, restart, and verify the same call now returns 403 with
+   the upgrade-hint payload.
+
+If all five F5.3 steps (10–13 plus the email banners in 9) pass,
+F5.3 is good to ship.

@@ -6,9 +6,21 @@
 const { getUserById, getWorkspaces, getBillingSubscriptionByWorkspace } = require('../database');
 const { PLAN_LIMITS: BILLING_PLAN_LIMITS, resolveWorkspaceCurrentPlan } = require('./billing');
 
-const PLAN_ENFORCEMENT_ENABLED = process.env.NODE_ENV === 'test'
-  ? false
-  : process.env.ENFORCE_PLAN_LIMITS !== 'false';
+// Plan enforcement should only kick in for real production deployments. In
+// `test` and `development` (incl. the `npm run docker:smoke` harness) every
+// plan-gated feature behaves as if the requester were on the highest tier, so
+// engineers can exercise Pro/Enterprise flows (AFP connectors, large vaults,
+// etc.) without flipping their plan in the DB. Production stays opt-out via
+// `ENFORCE_PLAN_LIMITS=false`.
+const _env = String(process.env.NODE_ENV || 'development').toLowerCase();
+const PLAN_ENFORCEMENT_ENABLED =
+  _env === 'test' || _env === 'development'
+    ? false
+    : process.env.ENFORCE_PLAN_LIMITS !== 'false';
+
+function isPlanEnforcementEnabled() {
+  return PLAN_ENFORCEMENT_ENABLED;
+}
 
 const PLAN_LIMITS = {
   free:       { personas: 1,  serviceConnections: 3,        knowledgeBytes: 10 * 1024 * 1024,  vaultTokens: 5,        skillsPerPersona: 4,        monthlyApiCalls: 1000,     teamMembers: 2        },
@@ -79,4 +91,10 @@ function enforcePlanLimit(req, key, currentValue, increment = 0) {
   return null;
 }
 
-module.exports = { PLAN_LIMITS, resolveRequesterPlan, planLimitError, enforcePlanLimit };
+module.exports = {
+  PLAN_LIMITS,
+  resolveRequesterPlan,
+  planLimitError,
+  enforcePlanLimit,
+  isPlanEnforcementEnabled,
+};

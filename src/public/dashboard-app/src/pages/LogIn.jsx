@@ -58,6 +58,11 @@ function Login() {
   const [pwTotpCode, setPwTotpCode] = useState('');
   // F5.2 P3.3 — surfaced after a successful /reset-password redirect.
   const [pwResetSuccess, setPwResetSuccess] = useState(false);
+  // F5.3 — set when /auth/login returns OAUTH_ONLY for the entered
+  // email so we can render a "use Google instead" banner and steer the
+  // user to the right OAuth button instead of leaving them stuck on
+  // the generic "invalid credentials" wall.
+  const [oauthOnly, setOauthOnly] = useState(null);
 
   const { setMasterToken, setUser, isAuthenticated } = useAuthStore();
 
@@ -225,6 +230,7 @@ function Login() {
     if (e && typeof e.preventDefault === 'function') e.preventDefault();
     setError('');
     setPwError('');
+    setOauthOnly(null);
     if (!pwEmail.trim() || !pwPassword) {
       setPwError('Email and password are required.');
       return;
@@ -251,6 +257,19 @@ function Login() {
 
       if (res.status === 429) {
         setPwError('Too many sign-in attempts. Please wait a moment and try again.');
+        return;
+      }
+
+      // F5.3 — backend signals "this email is registered with an OAuth
+      // provider, password login won't work" via 409 + code:OAUTH_ONLY.
+      // We replace the generic error with an actionable banner pointing
+      // the user at the correct provider button.
+      if (res.status === 409 && data?.code === 'OAUTH_ONLY' && data?.provider) {
+        setOauthOnly({
+          provider: String(data.provider).toLowerCase(),
+          message: data.error || `This account is registered with ${data.provider}. Please continue with ${data.provider}.`,
+        });
+        setPwPassword('');
         return;
       }
 
@@ -676,7 +695,7 @@ function Login() {
                     </div>
 
                     <form onSubmit={handlePasswordLogin} className="space-y-3" data-testid="password-login-form">
-                      {pwResetSuccess && !pwError && (
+                      {pwResetSuccess && !pwError && !oauthOnly && (
                         <div
                           role="status"
                           data-testid="password-reset-success-banner"
@@ -685,7 +704,33 @@ function Login() {
                           Password updated. Sign in with your new password.
                         </div>
                       )}
-                      {pwError && (
+                      {/* F5.3 — OAuth-only account banner.  When the entered
+                          email is registered via OAuth (no real password set),
+                          we can't bcrypt-compare anything useful, so steer the
+                          user to the correct provider instead of dropping a
+                          generic "invalid credentials" error. */}
+                      {oauthOnly && (
+                        <div
+                          role="status"
+                          data-testid="oauth-only-banner"
+                          className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+                        >
+                          <p className="font-semibold">
+                            Continue with {oauthOnly.provider.charAt(0).toUpperCase() + oauthOnly.provider.slice(1)}
+                          </p>
+                          <p className="mt-1 text-amber-200/80">{oauthOnly.message}</p>
+                          <button
+                            type="button"
+                            onClick={() => handleOAuthClick(oauthOnly.provider)}
+                            data-testid="oauth-only-continue"
+                            className="mt-2 inline-flex items-center gap-2 rounded-lg bg-amber-500/20 px-3 py-1.5 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+                          >
+                            <span>{OAuthIcons[oauthOnly.provider] || null}</span>
+                            <span>Continue with {oauthOnly.provider.charAt(0).toUpperCase() + oauthOnly.provider.slice(1)} →</span>
+                          </button>
+                        </div>
+                      )}
+                      {pwError && !oauthOnly && (
                         <div
                           role="alert"
                           data-testid="password-login-error"

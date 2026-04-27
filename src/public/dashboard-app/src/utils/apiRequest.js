@@ -32,11 +32,12 @@ export async function apiRequest(path, options = {}) {
     return response;
   }
 
-  if (response.status === 401 || response.status === 403) {
-    const data = await response.clone().json().catch(() => ({}));
-    if (response.status === 403 && data?.code === 'DEVICE_APPROVAL_REQUIRED') {
-      return response;
-    }
+  // F5.3 — 403 means "forbidden", not "session expired". Only 401 indicates
+  // an auth failure that warrants clearing artifacts and redirecting to the
+  // login screen. Treating 403 as logout used to evict legitimate sessions
+  // any time a plan-gated endpoint (e.g. /afp/devices for free-plan users)
+  // returned its expected denial.
+  if (response.status === 401) {
     clearAuthArtifacts();
     redirectToLoginOnce();
   }

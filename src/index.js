@@ -1343,6 +1343,13 @@ app.get('/', (req, res) => {
     const nonce = res.locals.cspNonce;
     let html = fs.readFileSync(landingPath, 'utf8');
     html = html.replace(/<script/g, `<script nonce="${nonce}"`);
+    // Marketing page: this changes rarely, so we let intermediaries
+    // (and the user's browser) keep a copy for a few minutes.
+    // `must-revalidate` paired with the `ETag` Express sends means a deploy
+    // takes effect in under 5 min on the worst-case path, and instantly on
+    // the normal "F5 in dev" path. Cheaper than `no-store` and avoids
+    // the round-trip on every navigation.
+    res.setHeader('Cache-Control', 'public, max-age=300, must-revalidate');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.send(html);
   }
@@ -1410,15 +1417,17 @@ app.use('/dashboard', (req, res, next) => {
   const patched = html
     .replace(/<script(\b[^>]*)>/gi, (_, attrs) => `<script${attrs} nonce="${nonce}">`)
     .replace(/<link(\b[^>]*rel=["']stylesheet["'][^>]*)>/gi, (_, attrs) => `<link${attrs} nonce="${nonce}">`);
-  // The SPA shell references hashed asset URLs, so it MUST be served fresh on
-  // every navigation — otherwise a cached `index.html` keeps pointing at a
-  // bundle hash that no longer exists after `npm run dashboard:rebuild`,
-  // leaving the user staring at an old UI (or a hard 404 on the asset).
-  // `no-store` defeats both disk + memory caches; `must-revalidate` forbids
-  // intermediaries from serving a stale copy.
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
+  // The SPA shell references hashed asset URLs, so the browser MUST
+  // revalidate before reusing a cached copy — otherwise a deploy that
+  // changes the bundle hash leaves the user staring at an old UI (or a
+  // hard 404 on the asset).
+  //
+  // `no-cache, must-revalidate` is the canonical SPA pattern: the
+  // browser may keep the file in its disk cache, but it has to send a
+  // conditional GET on every navigation. Express auto-emits an `ETag`,
+  // so unchanged shells return a tiny 304 — cheaper than `no-store`
+  // while still defeating staleness.
+  res.setHeader('Cache-Control', 'no-cache, must-revalidate');
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(patched);
 });
@@ -5811,9 +5820,16 @@ const BILLING_PLANS = {
   },
 };
 
-const PLAN_ENFORCEMENT_ENABLED = process.env.NODE_ENV === 'test'
-  ? false
-  : process.env.ENFORCE_PLAN_LIMITS !== 'false';
+// F5.3 — plan limits only kick in for real production deployments. `test` and
+// `development` (incl. the docker:smoke harness) treat every requester as if
+// they were on the highest tier so engineers can exercise plan-gated flows
+// without flipping plans in the DB. Production stays opt-out via
+// `ENFORCE_PLAN_LIMITS=false`.
+const _planEnv = String(process.env.NODE_ENV || 'development').toLowerCase();
+const PLAN_ENFORCEMENT_ENABLED =
+  _planEnv === 'test' || _planEnv === 'development'
+    ? false
+    : process.env.ENFORCE_PLAN_LIMITS !== 'false';
 
 const PLAN_LIMITS = {
   free: {

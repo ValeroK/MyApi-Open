@@ -52,6 +52,36 @@ router.get('/csrf-token', (req, res) => {
 });
 
 /**
+ * GET /api/v1/auth/email-config-status — F5.3
+ *
+ * Public read-only probe so the dashboard's password-recovery and
+ * change-password screens can warn the user upfront when the server
+ * has no usable email transport (e.g. self-hosted dev install with
+ * EMAIL_FROM unset).  Without this banner, /password/reset/request
+ * just silently swallows the send (it returns 202 by design to
+ * prevent email enumeration), leaving the user wondering why no
+ * email arrived.
+ *
+ * Response shape mirrors emailService.getConfigStatus() — no PII,
+ * no secrets, only which env vars are missing so the operator
+ * knows what to fix.
+ */
+router.get('/email-config-status', (req, res) => {
+  try {
+    const status = emailService.getConfigStatus();
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      configured: !!status.configured,
+      provider: status.provider,
+      missing: Array.isArray(status.missing) ? status.missing : [],
+    });
+  } catch (err) {
+    logger.warn('[Auth/EmailConfigStatus] probe error', { err: err?.message });
+    return res.status(500).json({ configured: false, provider: 'unknown', missing: [] });
+  }
+});
+
+/**
  * Middleware: validate CSRF token for cookie-session-based POST requests.
  * Bearer-token authenticated requests skip CSRF (inherently CSRF-safe).
  */
@@ -125,6 +155,38 @@ function regenerateSession(req) {
     if (!req.session || typeof req.session.regenerate !== 'function') return resolve();
     req.session.regenerate((err) => (err ? reject(err) : resolve()));
   });
+}
+
+// F5.3 — cached lookup of the `password_set_at` column.  Re-querying
+// PRAGMA on every password write would be silly; the schema doesn't
+// change at runtime.  We probe lazily and memoise.
+let _hasPasswordSetAtColumnCache = null;
+function hasPasswordSetAtColumn() {
+  if (_hasPasswordSetAtColumnCache !== null) return _hasPasswordSetAtColumnCache;
+  try {
+    const cols = db.prepare('PRAGMA table_info(users)').all();
+    _hasPasswordSetAtColumnCache = cols.some((c) => c.name === 'password_set_at');
+  } catch (_) {
+    _hasPasswordSetAtColumnCache = false;
+  }
+  return _hasPasswordSetAtColumnCache;
+}
+
+/**
+ * F5.3 — write a new password_hash AND stamp `password_set_at` so the
+ * OAUTH_ONLY guard in /auth/login lets the user back in once they've
+ * deliberately set a password (via /register, /password/reset/confirm,
+ * or /password/change).  Falls back to the old single-column UPDATE on
+ * stale deployments that haven't run the F5.3 migration yet.
+ */
+function writeUserPasswordHash(userId, newHash) {
+  const now = new Date().toISOString();
+  if (hasPasswordSetAtColumn()) {
+    db.prepare('UPDATE users SET password_hash = ?, password_set_at = ? WHERE id = ?')
+      .run(newHash, now, userId);
+  } else {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, userId);
+  }
 }
 
 /**
@@ -228,6 +290,65 @@ router.post('/login', authRateLimit, requireCsrfForSession, async (req, res) => 
     // Use a generic error string so we do not leak whether the account exists.
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    // F5.3 — OAuth-only account guard.  Users created via OAuth signup get
+    // a random throwaway `password_hash` they don't know; without this
+    // branch their password-login attempts just hit bcrypt-compare and
+    // bounce off as "invalid credentials" with zero hint that the account
+    // exists under a different sign-in method.  We detect by:
+    //   (a) `password_set_at` is NULL (no real password ever stamped)
+    //   (b) at least one `oauth_tokens` row links the account to a provider
+    // and respond with OAUTH_ONLY so the dashboard can surface "continue
+    // with Google instead".  Lookup is wrapped in try/catch because the
+    // column / table may legitimately be absent on older deployments —
+    // in that case we fall through to the original bcrypt path.
+    try {
+      const fullUserRow = db
+        .prepare('SELECT password_set_at FROM users WHERE id = ?')
+        .get(user.id);
+      const passwordSetAt = fullUserRow?.password_set_at || null;
+      if (!passwordSetAt) {
+        const linkedProvider = db
+          .prepare(
+            'SELECT service_name FROM oauth_tokens WHERE user_id = ? ORDER BY created_at ASC LIMIT 1',
+          )
+          .get(user.id);
+        if (linkedProvider?.service_name) {
+          // Capitalise for display ("google" -> "Google"); preserves
+          // the lowercase machine-readable code in the JSON shape.
+          const providerLabel = linkedProvider.service_name
+            .charAt(0)
+            .toUpperCase() + linkedProvider.service_name.slice(1);
+          try {
+            createAuditLog({
+              requesterId: user.id,
+              action: 'login_blocked_oauth_only',
+              resource: '/auth/login',
+              scope: 'session',
+              ip: req.ip,
+              details: { provider: linkedProvider.service_name },
+            });
+          } catch (auditErr) {
+            logger.warn('[Auth/Login] login_blocked_oauth_only audit emit error', {
+              err: auditErr?.message,
+            });
+          }
+          return res.status(409).json({
+            error: `This account is registered with ${providerLabel}. Please continue with ${providerLabel}.`,
+            code: 'OAUTH_ONLY',
+            provider: linkedProvider.service_name,
+          });
+        }
+      }
+    } catch (oauthCheckErr) {
+      // Schema not migrated yet — fall through to bcrypt path so we
+      // don't lock anyone out on a stale deployment.  Logged at warn
+      // so an operator running with a stale DB sees it but it doesn't
+      // spam in the steady state.
+      logger.warn('[Auth/Login] oauth-only detection skipped', {
+        err: oauthCheckErr?.message,
+      });
     }
 
     const passwordMatch = await bcrypt
@@ -412,7 +533,23 @@ router.post(
     const { db } = require('../database');
 
     const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-    if (existing) return res.status(409).json({ error: 'Username already exists' });
+    if (existing) return res.status(409).json({ error: 'Username already exists', code: 'USERNAME_EXISTS' });
+
+    // F5.3 — close the duplicate-email hole.  /auth/oauth-signup/complete
+    // already gates on this; /auth/register was the lone offender, which
+    // let the same email anchor multiple accounts and silently broke
+    // password login afterwards (whichever row getUserByEmail returned
+    // first won the bcrypt match).  The unique index added in the same
+    // commit's migration is the belt-and-braces guarantee against races.
+    if (email) {
+      const emailMatch = getUserByEmail(email);
+      if (emailMatch) {
+        return res.status(409).json({
+          error: 'An account with this email already exists. Please sign in instead.',
+          code: 'EMAIL_EXISTS',
+        });
+      }
+    }
 
     const id = 'usr_' + crypto.randomBytes(16).toString('hex');
     const hash = await bcrypt.hash(password, 12);
@@ -424,38 +561,70 @@ router.post(
     // `src/database.js` so operators on either migration state land in a
     // consistent audit posture.
     let hasConsentCols = false;
+    let hasPasswordSetAt = false;
     try {
       const cols = db.prepare('PRAGMA table_info(users)').all();
       hasConsentCols =
         cols.some((c) => c.name === 'accepted_terms_at') &&
         cols.some((c) => c.name === 'accepted_privacy_policy_at');
+      // F5.3 — only stamp password_set_at if the migration has run.
+      // Pre-migration deployments degrade silently (still register
+      // successfully; just won't get the OAUTH_ONLY signal).
+      hasPasswordSetAt = cols.some((c) => c.name === 'password_set_at');
     } catch (_) {
       hasConsentCols = false;
+      hasPasswordSetAt = false;
     }
 
     const termsAt = accepted_terms_at || now;
     const privacyAt = accepted_privacy_policy_at || now;
 
-    if (hasConsentCols) {
-      db.prepare(
-        `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles, accepted_terms_at, accepted_privacy_policy_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user', ?, ?)`,
-      ).run(
-        id,
-        username,
-        hash,
-        display_name || username,
-        email || '',
-        timezone || 'UTC',
-        now,
-        termsAt,
-        privacyAt,
-      );
-    } else {
-      db.prepare(
-        `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user')`,
-      ).run(id, username, hash, display_name || username, email || '', timezone || 'UTC', now);
+    // F5.3 — `password_set_at` marks accounts where the user actually
+    // chose a password (vs OAuth signup which mints a random throwaway
+    // hash).  /auth/login uses NULL here + a linked oauth_tokens row
+    // to drive the OAUTH_ONLY error code, so the dashboard can tell the
+    // user "use Google instead" instead of the generic "invalid creds".
+    try {
+      if (hasConsentCols && hasPasswordSetAt) {
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles, accepted_terms_at, accepted_privacy_policy_at, password_set_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user', ?, ?, ?)`,
+        ).run(
+          id, username, hash, display_name || username, email || '', timezone || 'UTC', now,
+          termsAt, privacyAt, now,
+        );
+      } else if (hasConsentCols) {
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles, accepted_terms_at, accepted_privacy_policy_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user', ?, ?)`,
+        ).run(
+          id, username, hash, display_name || username, email || '', timezone || 'UTC', now,
+          termsAt, privacyAt,
+        );
+      } else if (hasPasswordSetAt) {
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles, password_set_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user', ?)`,
+        ).run(id, username, hash, display_name || username, email || '', timezone || 'UTC', now, now);
+      } else {
+        db.prepare(
+          `INSERT INTO users (id, username, password_hash, display_name, email, timezone, created_at, status, roles)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 'user')`,
+        ).run(id, username, hash, display_name || username, email || '', timezone || 'UTC', now);
+      }
+    } catch (insertErr) {
+      // F5.3 — the unique index on LOWER(email) is the last line of
+      // defence against duplicate-email races.  Surface it as the same
+      // 409 + EMAIL_EXISTS code the explicit check returns so the UI has
+      // one branch to handle.
+      const msg = String(insertErr?.message || '');
+      if (/UNIQUE constraint failed.*email/i.test(msg) || /idx_users_email_unique/i.test(msg)) {
+        return res.status(409).json({
+          error: 'An account with this email already exists. Please sign in instead.',
+          code: 'EMAIL_EXISTS',
+        });
+      }
+      throw insertErr;
     }
     invalidateBetaFullCache();
 
@@ -1098,7 +1267,7 @@ router.post('/password/reset/confirm', authRateLimit, async (req, res) => {
     // if `consumed_at` fails the user can still log in with the new
     // password (the token will still expire on its own TTL).  This
     // keeps the failure mode strictly less bad than the alternative.
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, matched.user_id);
+    writeUserPasswordHash(matched.user_id, newHash);
     db.prepare('UPDATE password_reset_tokens SET consumed_at = ? WHERE id = ?')
       .run(new Date().toISOString(), matched.id);
   } catch (e) {
@@ -1357,7 +1526,7 @@ router.post('/password/change', authRateLimit, requireCsrfForSession, async (req
   }
 
   try {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(newHash, caller.userId);
+    writeUserPasswordHash(caller.userId, newHash);
   } catch (e) {
     logger.error('[Auth/PasswordChange] commit error', { err: e?.message });
     return res.status(500).json({ error: 'Internal server error' });

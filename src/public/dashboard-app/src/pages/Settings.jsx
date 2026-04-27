@@ -396,6 +396,11 @@ function SecuritySection() {
   const [twoFactorSuccess, setTwoFactorSuccess] = useState('');
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState('');
   const [manualSecret, setManualSecret] = useState('');
+  // F5.3 — same probe as ForgotPassword.jsx.  Surfaces a banner above
+  // Change Password if the server can't deliver the
+  // "your password was changed" notification email, since that
+  // notification is part of the change-password security contract.
+  const [emailConfig, setEmailConfig] = useState(null);
 
   useEffect(() => {
     if (passwordSuccess) {
@@ -403,6 +408,19 @@ function SecuritySection() {
       return () => clearTimeout(t);
     }
   }, [passwordSuccess]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/v1/auth/email-config-status', { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((cfg) => {
+        if (!cancelled && cfg) setEmailConfig(cfg);
+      })
+      .catch(() => {
+        if (!cancelled) setEmailConfig({ configured: false, provider: 'unknown', missing: [] });
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -767,6 +785,22 @@ function SecuritySection() {
         {/* Change Password */}
         <div>
           <h3 className="text-sm font-semibold ink mb-4">Change Password</h3>
+          {/* F5.3 — warn the user if the server has no email transport;
+              the change-password endpoint emails a security notification
+              and that path is best-effort.  At minimum the user should
+              know they won't be told if someone else changes it later. */}
+          {emailConfig && emailConfig.configured === false && (
+            <div
+              role="status"
+              data-testid="cp-email-not-configured-banner"
+              className="mb-3 rounded-md px-3 py-2 text-[12.5px]"
+              style={{ border: '1px solid #b45309', background: 'rgba(180, 83, 9, 0.12)', color: '#fcd34d' }}
+            >
+              <strong>Email delivery is not configured</strong> on this server.
+              {' '}You won't receive a "password changed" notification by email.
+              See README "Email Configuration" for setup details.
+            </div>
+          )}
           <ErrorBanner message={passwordError} onClose={clearPasswordError} />
           {passwordSuccess && (
             <SuccessBanner message={passwordSuccess} onClose={clearPasswordSuccess} />

@@ -85,22 +85,26 @@ apiClient.interceptors.response.use(
       return Promise.reject(error);
     }
 
-    if ((status === 401 || status === 403) && !isLogoutInProgress()) {
+    // F5.3 — only treat 401 (Unauthorized = no/invalid session) as a session
+    // expiry. A 403 means "authenticated but not allowed for this resource"
+    // (plan-locked feature, role missing, device not approved, etc.) and must
+    // NOT log the user out — doing so used to bounce freshly-logged-in users
+    // back to the marketing page when the dashboard prefetched a plan-gated
+    // endpoint like /afp/devices.
+    if (status === 403) {
       const errorData = error.response?.data || {};
 
-      // Plan limit — show upgrade modal instead of redirecting to login
-      if (status === 403 && typeof errorData.error === 'string' && errorData.error.startsWith('Plan limit reached')) {
+      if (typeof errorData.error === 'string' && errorData.error.startsWith('Plan limit reached')) {
         usePlanLimitStore.getState().show({
           plan: errorData.plan || null,
           limit: errorData.limit || null,
           errorMessage: errorData.error,
         });
-        return Promise.reject(error);
       }
+      return Promise.reject(error);
+    }
 
-      if (status === 403 && (errorData.code === 'DEVICE_APPROVAL_REQUIRED' || errorData.error === 'device_not_approved')) {
-        return Promise.reject(error);
-      }
+    if (status === 401 && !isLogoutInProgress()) {
       clearAuthArtifacts();
       redirectToLoginOnce();
     }

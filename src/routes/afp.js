@@ -35,7 +35,7 @@ function reconcileDeviceStatus(device) {
   }
   return device.status;
 }
-const { resolveRequesterPlan } = require('../lib/planEnforcement');
+const { resolveRequesterPlan, isPlanEnforcementEnabled } = require('../lib/planEnforcement');
 
 const router = express.Router();
 
@@ -51,7 +51,10 @@ function requireMaster(req, res, next) {
 }
 
 // ── Pro/Enterprise plan gate ──────────────────────────────────────────────────
+// Disabled in dev/test so engineers can exercise AFP without flipping plans
+// in the DB. Production keeps the gate active via `isPlanEnforcementEnabled`.
 function requireAfpPlan(req, res, next) {
+  if (!isPlanEnforcementEnabled()) return next();
   const plan = resolveRequesterPlan(req);
   if (plan !== 'pro' && plan !== 'enterprise') {
     return res.status(403).json({

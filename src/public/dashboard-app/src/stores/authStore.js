@@ -207,6 +207,15 @@ export const useAuthStore = create((set, get) => ({
   setUser: (user) => {
     setLogoutInProgress(false);
     const normalized = normalizeUserPayload(user);
+    // F5.3 — clear the post-logout flag whenever a real user lands in the
+    // store.  Previously only `setMasterToken` did this, but /auth/login's
+    // response only carries `data.masterToken` if one ALREADY existed for
+    // the user; first-time logins skipped the bootstrap and left the flag
+    // sticky, so `initialize()` skipped its fallback re-validation on the
+    // post-login page reload and bounced the user to the marketing page.
+    if (normalized) {
+      clearLoggedOut();
+    }
     set({ user: normalized, isAuthenticated: !!normalized });
   },
 

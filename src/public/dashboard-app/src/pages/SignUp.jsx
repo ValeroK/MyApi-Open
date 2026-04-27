@@ -252,7 +252,15 @@ function SignUp() {
       const data = await res.json().catch(() => ({}));
 
       if (res.status === 409) {
-        setPwError('An account with this username or email already exists. Try signing in instead.');
+        // F5.3 — backend now distinguishes USERNAME_EXISTS from
+        // EMAIL_EXISTS so we can give the user actionable copy.
+        if (data?.code === 'EMAIL_EXISTS') {
+          setPwError('An account with this email already exists. Sign in instead, or use "Forgot password" if you don\u2019t remember it.');
+        } else if (data?.code === 'USERNAME_EXISTS') {
+          setPwError('That username is taken. Try a different one.');
+        } else {
+          setPwError(data?.error || 'An account with this username or email already exists. Try signing in instead.');
+        }
         return;
       }
       if (res.status === 429) {

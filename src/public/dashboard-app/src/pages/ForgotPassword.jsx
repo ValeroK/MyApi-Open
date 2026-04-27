@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import BrandLogo from '../components/BrandLogo';
 
 /**
@@ -16,10 +16,41 @@ function ForgotPassword() {
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState('');
+  // F5.3 — pull /auth/email-config-status so we can warn the user up
+  // front when the server has no usable email transport (the most
+  // common case on a self-hosted dev install where EMAIL_FROM is
+  // unset).  Without this, /reset/request returns 202 by design (no
+  // email-enumeration oracle) and the user wonders why no email
+  // arrived.  `null` while the probe is in flight, `false` if the
+  // probe itself fails — only `configured === true` hides the banner.
+  const [emailConfig, setEmailConfig] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/v1/auth/email-config-status', { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((cfg) => {
+        if (!cancelled && cfg) setEmailConfig(cfg);
+      })
+      .catch(() => {
+        if (!cancelled) setEmailConfig({ configured: false, provider: 'unknown', missing: [] });
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // F5.3 — when the server has no email transport, the only honest
+  // outcome of submitting this form is "the link was never sent", so we
+  // both visually disable the button below *and* gate the handler here
+  // to defend against keyboard submit / scripted clicks.
+  const emailNotConfigured = emailConfig && emailConfig.configured === false;
 
   const handleSubmit = async (e) => {
     if (e && typeof e.preventDefault === 'function') e.preventDefault();
     setError('');
+    if (emailNotConfigured) {
+      setError('Email delivery is not configured on this server. Contact the administrator or see the README "Email Configuration" section.');
+      return;
+    }
     if (!email.trim()) {
       setError('Enter the email associated with your account.');
       return;
@@ -95,6 +126,27 @@ function ForgotPassword() {
               </div>
             ) : (
               <form onSubmit={handleSubmit} className="space-y-4" data-testid="forgot-password-form">
+                {/* F5.3 — visible upfront warning when the server has no
+                    working email transport.  Without it the user clicks
+                    "Send reset link", gets the timing-safe 202, and is
+                    left wondering why nothing arrived. */}
+                {emailConfig && emailConfig.configured === false && (
+                  <div
+                    role="status"
+                    data-testid="email-not-configured-banner"
+                    className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+                  >
+                    <p className="font-semibold">Email delivery is not configured on this server</p>
+                    <p className="mt-1 text-amber-200/80">
+                      Reset links cannot be sent right now. Contact the server
+                      administrator
+                      {Array.isArray(emailConfig.missing) && emailConfig.missing.length > 0 && (
+                        <> (missing: <span className="font-mono">{emailConfig.missing.join(', ')}</span>)</>
+                      )}
+                      , or see the README "Email Configuration" section for setup instructions.
+                    </p>
+                  </div>
+                )}
                 {error && (
                   <div role="alert" className="rounded-xl border border-red-500/35 bg-red-500/10 px-4 py-3 text-sm text-red-300">
                     {error}
@@ -110,7 +162,7 @@ function ForgotPassword() {
                     type="email"
                     autoComplete="email"
                     required
-                    disabled={busy}
+                    disabled={busy || emailNotConfigured}
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="min-h-[48px] w-full rounded-xl border border-slate-700 bg-slate-800/80 px-4 py-3 text-sm text-white placeholder-slate-500 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-500/25 disabled:opacity-60"
@@ -120,11 +172,16 @@ function ForgotPassword() {
                 </div>
                 <button
                   type="submit"
-                  disabled={busy || !email.trim()}
+                  disabled={busy || !email.trim() || emailNotConfigured}
                   data-testid="forgot-password-submit"
+                  title={emailNotConfigured ? 'Email delivery is not configured on this server' : undefined}
                   className="min-h-[48px] w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  {busy ? 'Sending…' : 'Send reset link'}
+                  {busy
+                    ? 'Sending…'
+                    : emailNotConfigured
+                      ? 'Email delivery unavailable'
+                      : 'Send reset link'}
                 </button>
                 <div className="pt-2 text-center">
                   <a

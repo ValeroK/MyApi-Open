@@ -289,6 +289,61 @@ openssl rand -hex 32
 
 OAuth providers follow the pattern `{SERVICE}_CLIENT_ID` / `{SERVICE}_CLIENT_SECRET` with a corresponding `ENABLE_OAUTH_{SERVICE}=true` feature flag. See [`docs/SERVICES_MANUAL.md`](docs/SERVICES_MANUAL.md) for the full configuration reference covering all 45+ supported services.
 
+### Email Configuration
+
+MyApi sends transactional email for password reset links and "your password
+was changed" notifications. If no email transport is configured, those
+features become no-ops on the server and the dashboard surfaces an amber
+banner on the **Forgot Password** and **Settings → Change Password** pages.
+
+The dashboard probes [`GET /api/v1/auth/email-config-status`](src/routes/auth.js)
+on mount and shows the banner whenever `configured: false`.
+
+#### Required environment variables
+
+| Variable | Description |
+|---|---|
+| `EMAIL_FROM` | The "from" address used for every outbound email. **Required for any email feature.** Example: `noreply@your-domain.com` |
+| `EMAIL_FROM_NAME` | Optional display name (default: `MyApi`) |
+| `EMAIL_PROVIDER` | One of `smtp` (default), `sendgrid`, or `resend` |
+
+#### Per-provider variables
+
+**SMTP (default):**
+
+| Variable | Description |
+|---|---|
+| `SMTP_HOST` | SMTP server hostname |
+| `SMTP_PORT` | SMTP port (typically `587` for STARTTLS or `465` for TLS) |
+| `SMTP_SECURE` | `true` for port 465, `false` otherwise |
+| `SMTP_USER` | Username (optional — leave unset for relay-without-auth) |
+| `SMTP_PASSWORD` | Password (required when `SMTP_USER` is set) |
+
+**Resend:**
+
+| Variable | Description |
+|---|---|
+| `RESEND_API_KEY` | API key from your Resend dashboard |
+
+**SendGrid:**
+
+| Variable | Description |
+|---|---|
+| `SENDGRID_API_KEY` | API key from your SendGrid dashboard |
+
+#### Verifying the configuration
+
+After setting the env vars and restarting the server, the dashboard banner
+will disappear and you can confirm directly:
+
+```bash
+curl http://localhost:4500/api/v1/auth/email-config-status
+# → {"configured":true,"provider":"smtp","missing":[]}
+```
+
+If `configured: false`, the `missing` array tells you exactly which
+variables to set.
+
 ---
 
 ## Agent Integration
