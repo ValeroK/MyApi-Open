@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (Cleanup Stage-0 baseline gates G0.1–G0.6 landed — see ADR-0019)
+> - Last updated: **2026-04-27** (Cleanup pre-stage gates G0.1–G0.6 + M4 pre-stage gates G4.1–G4.2 landed — see ADR-0019)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **51 / 51 suites, 668 pass / 22 skip, exit 0** (~55 s locally with `--forceExit`; +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added on 2026-04-27 — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **53 / 53 suites, 683 pass / 22 skip, exit 0** (~55 s locally with `--forceExit`; +15 tests from the M4 pre-stage gates G4.1–G4.2 added on 2026-04-27, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,35 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **Cleanup Stage-0 baseline gates landed
+- **2026-04-27 (latest)** — **M4 pre-stage gates G4.1–G4.2 landed
+  ahead of any source change to the session / rate-limit code
+  (ADR-0019 §"Per-milestone follow-ups").** Two new test files
+  (`src/tests/cleanup-pre-stage-rate-limit-contract.test.js` and
+  `cleanup-pre-stage-session-cookie-and-persistence.test.js`)
+  pin the M4 deletion target as a literal source snapshot
+  (bespoke `rateLimit()` factory, `globalRateLimitMap`,
+  `rateLimitMap`, `rateLimitCleanupInterval`,
+  `RATE_LIMIT_EXEMPT_PATHS`, every `expressRateLimit({ ... })`
+  configuration, `app.use(session({ ... }))` block, idle-timeout
+  middleware) plus the OBSERVABLE contract that any compliant
+  store driver must preserve (429 response envelope with
+  `Retry-After` and `RateLimit-*` headers, session-cookie
+  attributes from a real `Set-Cookie`, persistence of
+  `req.session.user` mutations across requests, login-rotates-
+  cookie regenerate semantics, destroy-invalidates-session
+  semantics, middleware-order invariant). Real finding already
+  surfaced: there are **TWO drifted exempt-path lists** —
+  `RATE_LIMIT_EXEMPT_PATHS` (8 entries) and an inline
+  `isExempt` block (different membership: includes `/health`,
+  `/ping`, `GET /api/v1/privacy/cookies`; excludes
+  `/api/v1/oauth/status`). M4 must consolidate. Test baseline:
+  **668 → 683 passing / 22 skipped / 53 suites, exit 0**. Both
+  gates are snapshot-stable across re-runs (CSP nonces and
+  cookie values scrubbed/excluded). Next: start M4 task T4.1
+  (`SessionStore` interface) under the protection of these
+  gates plus the Stage-0 baseline.
+
+- **2026-04-27** — **Cleanup Stage-0 baseline gates landed
   (ADR-0019).** Six new test files (`src/tests/cleanup-pre-stage-*`)
   pin the cross-cutting properties every upcoming cleanup milestone
   (M4 dual-driver session/rate-limit, M6 monolith extraction, M7

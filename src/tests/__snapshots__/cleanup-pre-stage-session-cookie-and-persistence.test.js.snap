@@ -1,0 +1,48 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup pre-stage / G4.2] session cookie + persistence invariants snapshot: Set-Cookie attributes after a real register call: myapi.sid attributes (NODE_ENV=test) 1`] = `
+{
+  "hasExpires": true,
+  "hasValue": true,
+  "httpOnly": true,
+  "name": "myapi.sid",
+  "path": "/",
+  "sameSite": "lax",
+  "secure": false,
+}
+`;
+
+exports[`[Cleanup pre-stage / G4.2] session cookie + persistence invariants snapshot: app.use(session({ ... })) source block: session() configuration source 1`] = `
+"app.use(session({
+  ...(sessionStore ? { store: sessionStore } : {}),
+  secret: process.env.SESSION_SECRET, // P0 Security Fix: No fallback - validated at startup
+  name: 'myapi.sid',
+  resave: false,
+  saveUninitialized: false,
+  proxy: true,
+  cookie: { secure: secureCookie, httpOnly: true, maxAge: 8 * 60 * 60 * 1000, sameSite: 'lax', path: '/' }
+}));"
+`;
+
+exports[`[Cleanup pre-stage / G4.2] session cookie + persistence invariants snapshot: idle-timeout middleware source block (20-min inactivity gate): idle-timeout source 1`] = `
+"const IDLE_TIMEOUT_MS = 20 * 60 * 1000;
+app.use((req, res, next) => {
+  // Only applies to session-authenticated requests (human dashboard)
+  if (!req.session || !req.session.user) return next();
+
+  const now = Date.now();
+  if (req.session.lastActivity && now - req.session.lastActivity > IDLE_TIMEOUT_MS) {
+    req.session.destroy((err) => {
+      if (err) logger.error('Session destroy error during idle timeout', { error: err.message });
+    });
+    return res.status(401).json({ error: 'Session expired due to inactivity' });
+  }
+  req.session.lastActivity = now;
+  next();
+});
+
+function buildCookieDomainCandidates(req) {
+  const candidates = new Set();
+  const configuredDomain = String(process.env.SESSION_COOKIE_DOMAIN || '').trim();
+  const hostname = String(req?.hostname || '').trim();"
+`;

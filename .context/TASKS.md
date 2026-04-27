@@ -66,7 +66,8 @@ See `.cursor/rules/test-first.mdc` for the full workflow.
 | M2 | Consolidate crypto (re-scoped to deletion per ADR-0013) | 8 | 8 | ✅ Done 2026-04-21 — T2.0, T2.1, T2.4, T2.5, T2.7, T2.8, T2.9, T2.10; T2.2/T2.3/T2.6 cancelled per ADR-0013 |
 | M3 | OAuth state + PKCE + callback hardening | 10 | 10 | ✅ **Complete 2026-04-24** — T3.0–T3.9 landed + wrap-up commit (provider_subject threading, legacy-export retirement, docs rebaseline, live Google OAuth smoke, F1/F2/F3 non-M3 follow-ups filed). C3 + C6 closed end-to-end; H1 remains closed. Session log: `sessions/2026-04-24-m3-smoke.md`. |
 | Stage 0 | Cleanup pre-stage baseline gates (G0.1–G0.6) | 6 | 6 | ✅ **Complete 2026-04-27** — see ADR-0019. Pins API surface, middleware chain, boot-side-effects, auth lifecycle, error envelope, security headers per response family. Test baseline jumped 638 → 668 / 22 skip / 51 suites, exit 0. |
-| M4 | Session + rate-limit dual-driver store | 9 | 0 | Not started (T4.9 data-integrity carry-over from ADR-0015). **Pre-stage gates required:** G0.1, G0.2, G0.3, G0.4, G0.6 must be green before any task in M4 changes. |
+| M4-pre | M4 pre-stage gates (G4.1–G4.2) | 2 | 2 | ✅ **Complete 2026-04-27** — see ADR-0019 §"Per-milestone follow-ups". G4.1 pins rate-limit implementation source + 429 envelope; G4.2 pins session config + cookie attributes + persistence/regenerate/destroy invariants. Surfaced finding: two drifted exempt-path lists in `src/index.js` (`RATE_LIMIT_EXEMPT_PATHS` constant vs inline `isExempt`) — M4 must consolidate. Test baseline jumped 668 → 683 / 22 skip / 53 suites, exit 0. |
+| M4 | Session + rate-limit dual-driver store | 9 | 0 | Not started (T4.9 data-integrity carry-over from ADR-0015). **Pre-stage gates required and green:** Stage-0 baseline (G0.1, G0.2, G0.3, G0.4, G0.6) + M4 layer (G4.1, G4.2). Every M4 PR MUST update the snapshots in G4.1 / G4.2 inline with the source change so reviewers can audit each deletion / replacement against the locked baseline. |
 | M5 | SSRF surface unification via SafeHTTPClient | 7 | 0 | Not started |
 | M6 | Monolith extraction (split `src/index.js`) | 10 | 0 | Not started |
 | M7 | TypeScript migration for domain + infra | 7 | 0 | Not started |
@@ -77,7 +78,7 @@ See `.cursor/rules/test-first.mdc` for the full workflow.
 | M12 | Testing uplift | 10 | 0 | Not started |
 | M13 | CI/CD & supply chain | 8 | 0 | Not started |
 | M14 | Docs & runbooks | 7 | 0 | Not started |
-| **Total** |  | **126** | **22** |  |
+| **Total** |  | **128** | **24** |  |
 
 ---
 
@@ -104,6 +105,30 @@ any of those milestones. See ADR-0019 for full rationale.
 | G0.4 | `[x]` Auth-lifecycle e2e — pin register → /me → change-password → logout → re-login → /me → logout on a single supertest agent + idempotent logout + no user-existence leak | M | — | Done 2026-04-27. 4 tests, all green. |
 | G0.5 | `[x]` Error-envelope snapshot — pin shape + stable error-code enum at 6 representative status codes | S | — | Done 2026-04-27. Real finding: envelope is INCONSISTENT (most are `{error}`, only `409 EMAIL_EXISTS` is `{error, code}`); also unknown `/api/v1` paths return 401, not 404, because a session-requiring middleware sits in front of the catch-all. M9 target. |
 | G0.6 | `[x]` Security-headers snapshot per response family — pin CSP / HSTS / Cache-Control / Permissions-Policy on public JSON, JSON 4xx, unauth /me, authenticated logout, root /, with CSP nonce scrubbed | S | — | Done 2026-04-27. Hard assertions (in addition to snapshot) for `no-store` on logout and on `/auth/email-config-status` (F5.3 ratchet). |
+
+---
+
+## M4-pre — M4 pre-stage gates ✅ Complete (2026-04-27)
+
+**Goal.** Pin the M4-specific deletion target (the in-memory rate-limit
+implementation) and the M4-specific persistence contract (session
+cookie + store-driver-agnostic invariants) BEFORE M4 makes any source
+change. Layered on top of the Stage-0 baseline. See ADR-0019
+§"Per-milestone follow-ups".
+
+**Exit criteria.**
+- G4.1 + G4.2 test files exist and are green twice in a row.
+- Full `npm test` is green.
+- M4 row in the global progress table references both gates as
+  required-and-green.
+
+**Depends on.** Stage 0 (G0.1–G0.6). Required-by: every task in M4
+(T4.1–T4.9).
+
+| # | Task | Effort | Depends on | Notes |
+|---|------|--------|------------|-------|
+| G4.1 | `[x]` Rate-limit contract — static snapshot of the in-memory rate-limit implementation (bespoke `rateLimit()` factory, `globalRateLimitMap`, `rateLimitMap`, `rateLimitCleanupInterval`, `RATE_LIMIT_EXEMPT_PATHS`, every `expressRateLimit({ ... })` call site) + runtime 429 envelope test (status, body shape, `Retry-After`, `RateLimit-*` standard headers) | M | Stage 0 | Done 2026-04-27. Real finding: TWO drifted exempt-path lists in `src/index.js` (`RATE_LIMIT_EXEMPT_PATHS` constant: 8 entries; inline `isExempt`: different membership including `/health`, `/ping`, `GET /api/v1/privacy/cookies`; excludes `/api/v1/oauth/status`). M4 must consolidate to a single source of truth. |
+| G4.2 | `[x]` Session cookie + persistence invariants — static snapshot of `app.use(session({ ... }))` block + idle-timeout middleware + runtime Set-Cookie attributes (HttpOnly, SameSite, Path, Max-Age, Secure) + invariants (mutation persists across requests on same agent, login-rotates-cookie regenerate, destroy-invalidates-session, middleware-order: /api/v1/auth/me has `req.session` populated) | M | Stage 0 | Done 2026-04-27. 8 tests, all green. Cookie value and Expires date excluded from snapshot (rotate per request / wall-clock-dependent). |
 
 ---
 

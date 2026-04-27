@@ -1,0 +1,194 @@
+// Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every expressRateLimit({ ... }) configuration in src/index.js: expressRateLimit configurations 1`] = `
+[
+  {
+    "binding": "billingUsageRateLimit",
+    "configHead": [
+      "const billingUsageRateLimit = expressRateLimit({",
+      "windowMs: 60000,",
+      "max: process.env.NODE_ENV === 'test' ? 1000 : 30,",
+      "standardHeaders: true,",
+      "legacyHeaders: false,",
+      "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
+      "skip: () => process.env.NODE_ENV === 'test', // Skip in test mode",
+      "});",
+    ],
+    "line": 2190,
+  },
+  {
+    "binding": "dashboardSpaRateLimit",
+    "configHead": [
+      "const dashboardSpaRateLimit = expressRateLimit({",
+      "windowMs: 60000,",
+      "max: process.env.NODE_ENV === 'test' ? 1000 : 60,",
+      "standardHeaders: true,",
+      "legacyHeaders: false,",
+      "skip: () => process.env.NODE_ENV === 'test',",
+      "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
+      "});",
+    ],
+    "line": 2200,
+  },
+]
+`;
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: 429 response envelope from express-rate-limit (the contract M4 must preserve): 429 envelope 1`] = `
+{
+  "bodyShape": {
+    "errorValue": "Rate limit exceeded",
+    "hasError": true,
+    "hasRetryAfterSeconds": true,
+    "keys": [
+      "error",
+      "retryAfterSeconds",
+    ],
+  },
+  "headerPresence": {
+    "ratelimit-limit": true,
+    "ratelimit-remaining": true,
+    "ratelimit-reset": true,
+    "retry-after": true,
+    "x-ratelimit-limit": false,
+    "x-ratelimit-remaining": false,
+  },
+  "status": 429,
+}
+`;
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: RATE_LIMIT_EXEMPT_PATHS list: RATE_LIMIT_EXEMPT_PATHS source block 1`] = `
+"const RATE_LIMIT_EXEMPT_PATHS = [
+  '/api/v1/auth/me',
+  '/api/v1/auth/debug',
+  '/api/v1/auth/logout',
+  '/api/v1/dashboard/metrics',
+  '/api/v1/oauth/status',
+  '/api/v1/ws',
+  '/dashboard/',
+  '/dashboard/myapi-logo.svg',
+];"
+`;
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: bespoke rateLimit() factory body: rateLimit() factory source 1`] = `
+"function rateLimit(windowMs = 60000, maxRequests = (process.env.NODE_ENV === 'test' ? 1000 : 60), namespace = 'default') {
+  return (req, res, next) => {
+    // Skip rate limiting for bootstrap/auth endpoints
+    if (RATE_LIMIT_EXEMPT_PATHS.some(p => req.path === p || req.path.startsWith(p))) {
+      return next();
+    }
+
+    const key = \`\${namespace}:\${req.ip}\`;
+    const now = Date.now();
+    if (!rateLimitMap[key]) rateLimitMap[key] = [];
+    rateLimitMap[key] = rateLimitMap[key].filter(t => now - t < windowMs);
+    if (rateLimitMap[key].length >= maxRequests) {
+      const retryAfterSeconds = Math.max(1, Math.ceil((windowMs - (now - rateLimitMap[key][0])) / 1000));
+      res.set('Retry-After', String(retryAfterSeconds));
+      return res.status(429).json({ error: 'Rate limit exceeded', retryAfterSeconds });
+    }
+    rateLimitMap[key].push(now);
+    res.set('X-RateLimit-Limit', String(maxRequests));
+    res.set('X-RateLimit-Remaining', String(maxRequests - rateLimitMap[key].length));
+    next();
+  };
+}"
+`;
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: globalRateLimitMap registration & top-level enforcer: globalRateLimitMap + app.use enforcer 1`] = `
+{
+  "body": "const globalRateLimitMap = {};
+
+// P1 Security Fix: Cleanup old rate limit entries (in-memory maps grow unbounded)
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+  // Clean globalRateLimitMap
+  for (const [key, timestamps] of Object.entries(globalRateLimitMap || {})) {
+    const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
+    if (recentTimestamps.length === 0) {
+      delete globalRateLimitMap[key];
+    } else {
+      globalRateLimitMap[key] = recentTimestamps;
+    }
+  }
+
+  // Clean rateLimitMap if it exists
+  if (typeof rateLimitMap !== 'undefined') {
+    for (const [key, timestamps] of Object.entries(rateLimitMap || {})) {
+      const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
+      if (recentTimestamps.length === 0) {
+        delete rateLimitMap[key];
+      } else {
+        rateLimitMap[key] = recentTimestamps;
+      }
+    }
+  }
+}, 60 * 60 * 1000); // Run every hour
+rateLimitCleanupInterval.unref?.();",
+  "startLine": 1061,
+}
+`;
+
+exports[`[Cleanup pre-stage / G4.1] rate-limit contract snapshot: rateLimitCleanupInterval registration: rateLimitCleanupInterval source 1`] = `
+"const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+
+  // Clean globalRateLimitMap
+  for (const [key, timestamps] of Object.entries(globalRateLimitMap || {})) {
+    const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
+    if (recentTimestamps.length === 0) {
+      delete globalRateLimitMap[key];
+    } else {
+      globalRateLimitMap[key] = recentTimestamps;
+    }
+  }
+
+  // Clean rateLimitMap if it exists
+  if (typeof rateLimitMap !== 'undefined') {
+    for (const [key, timestamps] of Object.entries(rateLimitMap || {})) {
+      const recentTimestamps = timestamps.filter(ts => now - ts < maxAge);
+      if (recentTimestamps.length === 0) {
+        delete rateLimitMap[key];
+      } else {
+        rateLimitMap[key] = recentTimestamps;
+      }
+    }
+  }
+}, 60 * 60 * 1000); // Run every hour
+rateLimitCleanupInterval.unref?.();
+
+// Email processor: Send pending emails every 5 minutes
+const emailProcessorInterval = setInterval(async () => {
+  try {
+    const result = await emailService.processPendingEmails(50);
+    if (result.sent > 0 || result.failed > 0) {
+      console.log(\`[Email] Processed batch: \${result.sent} sent, \${result.failed} failed\`);
+    }
+  } catch (err) {
+    console.error('[Email] Error processing pending emails:', err.message);
+  }
+}, 5 * 60 * 1000); // Run every 5 minutes
+emailProcessorInterval.unref?.();
+
+app.use((req, res, next) => {
+  // CRITICAL: Exempt all auth/dashboard bootstrap paths from rate limiting
+  const isExempt = req.path === '/api/v1/auth/me' ||
+                   req.path === '/api/v1/auth/debug' ||
+                   req.path === '/api/v1/auth/logout' ||
+                   req.path === '/api/v1/dashboard/metrics' ||
+                   (req.path === '/api/v1/privacy/cookies' && req.method === 'GET') ||
+                   req.path.startsWith('/api/v1/ws') ||
+                   req.path === '/health' ||
+                   req.path === '/ping' ||
+                   req.path.startsWith('/dashboard/');
+
+  // Bearer token (API/agent) requests: apply a separate, higher rate limit
+  // Device approval middleware provides additional rate limiting for API tokens
+  const hasBearer = req.headers.authorization?.startsWith('Bearer ') || req.query.token || req.query.api_key;
+
+  if (isExempt) {
+    return next();
+  }"
+`;
