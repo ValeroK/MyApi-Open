@@ -6,7 +6,9 @@ exports[`[Cleanup Stage 0 / G0.2] middleware chain snapshot snapshot: app-level 
   "etag": "weak",
   "json escape": undefined,
   "strict routing": undefined,
-  "trust proxy": 1,
+  "trust proxy": [
+    "loopback",
+  ],
   "x-powered-by": true,
 }
 `;

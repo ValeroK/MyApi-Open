@@ -1,8 +1,8 @@
 // Jest Snapshot v1, https://jestjs.io/docs/snapshot-testing
 
 exports[`[Cleanup Stage / G4.3] trust-proxy contract snapshot: app.set('trust proxy', …) source-line region: trust-proxy source-line region 1`] = `
-"
-const app = express();
-app.set('trust proxy', 1);
+"// Operators behind a real proxy must declare it via TRUSTED_PROXIES;
+// see src/lib/trust-proxy.js for the env contract.
+app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES));
 const PORT = process.env.PORT || 4500;"
 `;

@@ -14,7 +14,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "skip: () => process.env.NODE_ENV === 'test', // Skip in test mode",
       "});",
     ],
-    "line": 2192,
+    "line": 2199,
   },
   {
     "binding": "dashboardSpaRateLimit",
@@ -28,7 +28,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
       "});",
     ],
-    "line": 2202,
+    "line": 2209,
   },
 ]
 `;
@@ -140,6 +140,6 @@ const secureCookie = process.env.SESSION_COOKIE_SECURE
 // Allocate the SQLite handle for the session driver iff we are NOT
 // in test mode and NOT on the legacy Mongo path. The factory below
 // branches on the same env vars and returns a memory driver in",
-  "startLine": 1112,
+  "startLine": 1119,
 }
 `;

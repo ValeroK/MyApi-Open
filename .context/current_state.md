@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (M4-T4.6 — `src/index.js` is fully behind the M4 rate-limit factory; bespoke `globalRateLimitMap` + `rateLimitMap` + hourly `rateLimitCleanupInterval` + drifted exempt-path lists all deleted; G4.1 has a permanent negative-assertion ratchet preventing their reintroduction; orphan-timer count 6 → 5; folded follow-on: `/ping` liveness handler added (was a dead exempt entry surfaced during e2e); M4 critical path COMPLETE for OSS-only deployments. Live-DB e2e verification done: 119/130 flood requests allowed → 11 throttled with `Retry-After: 6` header, body `{ error: 'Rate limit exceeded', retryAfter: 6 }`, atomic UPSERT into `rate_limit_counters` confirmed at the SQLite layer)
+> - Last updated: **2026-04-27** (M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; new `src/lib/trust-proxy.js` helper validates entries, fails loud on bogus CIDR, defaults to `['loopback']` for secure-by-default behavior; closes H5 from plan.md §6.3. G4.3 expanded from 6 → 41 tests (parseTrustedProxies unit cases × 28 + integration probes × 7 confirming the H5 closure at the Express trust-fn level). G0.2 snapshot now pins `'trust proxy': ['loopback']`. New `.cursor/rules/commit-message-hygiene.mdc` (alwaysApply) forbids any AI/Cursor/agent attribution in commits. Earlier the same day: M4-T4.6 — `src/index.js` is fully behind the M4 rate-limit factory + folded follow-on `/ping` liveness handler.)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **55 / 55 suites, 732 pass / 22 skip, 28 / 28 snapshots, exit 0** (~11 s locally with `--forceExit`; M4-T4.8 pre-stage gate G4.3 added 6 tests + 1 snapshot on 2026-04-27, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite added the same day, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added the same day, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **55 / 55 suites, 767 pass / 22 skip, 28 / 28 snapshots, exit 0** (~11 s locally with `--forceExit`; M4-T4.8 landed 2026-04-27 — G4.3 expanded from 6 → 41 tests with `parseTrustedProxies` unit cases + Express trust-fn integration probes, G0.2 / G0.3 / G4.1 snapshots updated for `trust proxy: 1 → ['loopback']` + 7-line drift; M4-T4.8 pre-stage gate G4.3 originally added 6 tests + 1 snapshot earlier the same day, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite added the same day, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added the same day, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,77 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **M4-T4.6 landed: `src/index.js`
+- **2026-04-27 (latest)** — **M4-T4.8 landed: `app.set('trust
+  proxy', 1)` replaced with `app.set('trust proxy', parseTrusted-
+  Proxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md
+  §6.3.** New `src/lib/trust-proxy.js` (0-dep regex-based) parses
+  a comma-separated list of CIDRs / bare IPs / symbolic names
+  (`loopback`, `linklocal`, `uniquelocal`); fails loud with a
+  message echoing the bad entries when given garbage; defaults to
+  `['loopback']` so X-Forwarded-For is only honored when the
+  immediate connection is from `127.0.0.1` / `::1`. Two escape
+  hatches: `none` / `false` → returns `false` (paranoid mode,
+  trust nobody); empty/unset → secure default. Pre-T4.8 the
+  literal `1` honored a single-hop XFF from any client, allowing
+  any caller on the network to spoof `req.ip` and bypass the
+  ~3 IP-keyed rate-limit sites + ~50 audit-log writes + ~5
+  security-warning logs that depend on it. **G4.3 expanded from
+  6 → 41 tests:** 28 unit cases for `parseTrustedProxies` (every
+  documented input shape + every fail-loud case), 1 spot-check
+  on `isValidEntry`, 2 axiom tests preserved (trust=1 honors XFF;
+  trust=false ignores XFF — kept as regression anchors), 6 new
+  integration probes calling Express's compiled `trust proxy fn`
+  directly with various IPs (`127.0.0.1` ✓ trusted by default,
+  `203.0.113.42` ✓ NOT trusted by default, `uniquelocal` does
+  NOT auto-include loopback, etc.), 1 supertest e2e (default +
+  loopback connection still honors XFF — by design, the fix
+  closes spoofs from PUBLIC clients not from the host itself),
+  3 negative ratchets flipped to positive (`TRUSTED_PROXIES` IS
+  in src/index.js, `parseTrustedProxies` IS imported,
+  `src/lib/trust-proxy.js` exists). Snapshot impact: G0.2 (G4.3
+  pin) `'trust proxy': 1` → `['loopback']` (intentional content
+  change), G0.3 timer inventory + G4.1 rate-limit source slices
+  shifted +7 lines (matches the 7-line block I added: 1 require
+  + 6-line comment justifying the change). `.env.smoke.example`
+  and the gitignored `.env.smoke` both set `TRUSTED_PROXIES=
+  loopback,uniquelocal` so curl-from-host through the docker
+  bridge gets per-client `req.ip` resolution during e2e (the
+  comment block in `.env.smoke.example` documents the production
+  alternatives). E2e probe (echo server + 3 trust configs ran
+  inside the container, scripts deleted post-verification)
+  confirmed: default `['loopback']` blocks `req.ip` spoofs from
+  any non-loopback source; `['loopback','uniquelocal']` adds
+  the docker bridge to the trust set; the legacy literal `1`
+  unconditionally honored XFF from any source — exactly H5.
+  Live `/api/v1/auth/me` + `/ping` continue to respond 401 / 200.
+  Test baseline: **55 / 55 suites, 767 / 789 passing / 22
+  skipped, 28 / 28 snapshots, exit 0** in ~11 s. **Env / docs
+  alignment** also folded in: `.env.example` and `src/.env.example`
+  gained the 5 vars that had drifted into smoke without being
+  documented (`SESSION_DB_PATH`, `TRUSTED_PROXIES`, `OAUTH_PRUNE_
+  INTERVAL_MS`, `OAUTH_PRUNE_GRACE_SEC`, `LOG_LEVEL` formalized
+  out of the "Advanced/commented" section), plus `SESSION_COOKIE_
+  DOMAIN` which was referenced by code (`src/index.js:1226` +
+  `src/routes/auth.js:112`) but never templated. README §
+  Configuration → Optional table reformatted with explicit defaults
+  and a new "Trust Proxy & Session DB notes" subsection covering
+  the H5 risk-and-fix in user-facing language. README §
+  Production / Self-Hosting nginx block now ends with the matching
+  `TRUSTED_PROXIES=loopback` env directive. New end-of-README
+  "Step-by-Step Setup Guide" section covers all four supported
+  topologies (Local Dev / Docker Dev / Docker Smoke / Docker
+  Production) with per-topology env-file recipes and verification
+  curls. Folded into the same commit: `.cursor/rules/commit-
+  message-hygiene.mdc`
+  (`alwaysApply: true`) — forbidding any AI/Cursor/agent
+  attribution in commit messages, PR titles, PR bodies, or
+  squash-merge messages, captured per the owner's "put in
+  memory" instruction. Next: pause on M4 follow-ups (T4.3 +
+  T4.7 still blocked on OQ-11 Redis TLS; T4.9 is a different
+  layer — FK migration on access_tokens.owner_id) and discuss
+  whether to keep grinding M4 or shift to M5 (SSRF unification).
+
+- **2026-04-27** — **M4-T4.6 landed: `src/index.js`
   fully behind both M4 store factories; bespoke rate-limit
   in-memory maps + hourly GC interval + drifted exempt-path
   lists all DELETED.** This is the M4 critical-path completion

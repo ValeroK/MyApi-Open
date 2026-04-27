@@ -2,40 +2,43 @@
 //
 // Purpose
 // -------
-// Pin the baseline behavior of `app.set('trust proxy', 1)` ahead of
-// M4-T4.8 (env-driven TRUSTED_PROXIES + secure-by-default loopback,
-// closes H5 from plan.md §6.3). Three things must be locked before
-// the implementation lands so the M4-T4.8 PR diff is the audit trail
-// of what changed and why:
+// Pin the trust-proxy semantics across the M4-T4.8 boundary
+// (env-driven TRUSTED_PROXIES + secure-by-default loopback, closes
+// H5 from plan.md §6.3). After T4.8 this gate locks four things:
 //
 //   1. The exact source-line region in `src/index.js` where the
-//      `trust proxy` setting lives today. Snapshotting this as TEXT
-//      means M4-T4.8's PR is forced to update the snapshot, which
-//      surfaces every line of the change in code review.
+//      `trust proxy` setting lives. Snapshotting this as TEXT means
+//      any future change to the wiring is forced to update the
+//      snapshot, surfacing the change in code review.
 //
-//   2. Today's codebase has NO `TRUSTED_PROXIES` env reference and
-//      NO `parseTrustedProxies` helper. These are negative ratchets
-//      that flip to positive in the same commit that lands T4.8 —
-//      a reviewer can grep the snapshot diff and confirm the new
-//      symbols appear in the right places.
+//   2. POSITIVE assertions that the new symbols are present:
+//      `TRUSTED_PROXIES` referenced, `parseTrustedProxies` imported,
+//      `src/lib/trust-proxy.js` exists. These were negative ratchets
+//      pre-T4.8 and flipped in the same commit that landed T4.8.
 //
-//   3. Today's spoofability: with `trust proxy: 1`, an `X-Forwarded-
-//      For` header from a non-loopback connection is HONORED — i.e.
-//      `req.ip` ends up as the spoofed value. We pin this with a
-//      tiny test app (NOT the full `src/index.js`) so the test is
-//      fast and unaffected by other src/index.js changes. Post-T4.8
-//      the same spoof against a `trust proxy: ['loopback']` app
-//      will be IGNORED.
+//   3. Unit-level coverage of `parseTrustedProxies(envValue)` —
+//      every documented input shape (default, empty, escape hatch,
+//      symbolic names, IPv4/IPv6, CIDR, mixed list, whitespace) +
+//      every fail-loud case (bogus name, octet overflow, prefix
+//      overflow, partially-bad list).
+//
+//   4. Behavioral assertions on the resulting Express
+//      `trust proxy` setting:
+//        (a) Pre-T4.8 axiom: `trust=1` honors single-hop XFF (the
+//            H5 risk we just closed — kept as a regression anchor).
+//        (b) Pre-T4.8 control: `trust=false` ignores XFF.
+//        (c) Post-T4.8 default: `trust = parseTrustedProxies(undefined)`
+//            yields `['loopback']`, and the resulting Express trust
+//            function says YES to loopback addresses + NO to
+//            arbitrary public IPs (the H5 closure).
 //
 // Why a separate gate from G0.4 (middleware-chain snapshot)?
 // ---------------------------------------------------------
-// G0.4 already pins `'trust proxy': 1` as one of four app-level
-// settings, but its scope is the WHOLE middleware chain — its diff
-// surface is large and an M4-T4.8 reviewer cannot tell from the G0.4
-// diff alone WHY trust-proxy changed. G4.3 is the dedicated gate
-// that scopes the change to this single setting + provides the
-// behavioral assertion (spoofability probe) that G0.4 deliberately
-// avoids.
+// G0.4 pins `'trust proxy'` as one of four app-level settings, but
+// its scope is the WHOLE middleware chain — its diff surface is
+// large and a reviewer cannot tell from the G0.4 diff alone WHY
+// trust-proxy changed. G4.3 scopes the change to this single
+// setting + the helper that drives it + the behavior it produces.
 //
 // Updating
 // --------
@@ -59,13 +62,19 @@ const express = require('express');
 const request = require('supertest');
 
 const SERVER_ENTRY = path.resolve(__dirname, '..', 'index.js');
+const HELPER_PATH = path.resolve(__dirname, '..', 'lib', 'trust-proxy.js');
+
+const { parseTrustedProxies, isValidEntry } = require('../lib/trust-proxy');
 
 function readSource() {
   return fs.readFileSync(SERVER_ENTRY, 'utf8');
 }
 
-// Strip JS comments so the negative-ratchet assertions below ignore
-// any explanatory comments that mention the future symbols.
+// Strip JS comments so the symbol-presence assertions below
+// don't false-positive on explanatory prose that mentions the
+// names. (For positive assertions the stripping is unnecessary,
+// but we keep it so the test reads consistently across the
+// pre-T4.8 negative form and post-T4.8 positive form.)
 function stripComments(src) {
   return src.replace(/\/\/[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '');
 }
@@ -83,29 +92,97 @@ describe('[Cleanup Stage / G4.3] trust-proxy contract', () => {
     expect(region).toMatchSnapshot('trust-proxy source-line region');
   });
 
-  test('today: src/index.js does NOT reference TRUSTED_PROXIES env var (flips post-T4.8)', () => {
+  test('post-T4.8: src/index.js references TRUSTED_PROXIES env var', () => {
     const code = stripComments(readSource());
-    expect(code).not.toMatch(/\bTRUSTED_PROXIES\b/);
+    expect(code).toMatch(/\bTRUSTED_PROXIES\b/);
   });
 
-  test('today: src/index.js does NOT import parseTrustedProxies (flips post-T4.8)', () => {
+  test('post-T4.8: src/index.js imports parseTrustedProxies from ./lib/trust-proxy', () => {
     const code = stripComments(readSource());
-    expect(code).not.toMatch(/\bparseTrustedProxies\b/);
+    expect(code).toMatch(/\bparseTrustedProxies\b/);
+    expect(code).toMatch(/require\(['"]\.\/lib\/trust-proxy['"]\)/);
   });
 
-  test('today: src/lib/trust-proxy.js does NOT exist (flips post-T4.8)', () => {
-    const helperPath = path.resolve(__dirname, '..', 'lib', 'trust-proxy.js');
-    expect(fs.existsSync(helperPath)).toBe(false);
+  test('post-T4.8: src/lib/trust-proxy.js exists and exports parseTrustedProxies', () => {
+    expect(fs.existsSync(HELPER_PATH)).toBe(true);
+    const mod = require('../lib/trust-proxy');
+    expect(typeof mod.parseTrustedProxies).toBe('function');
   });
 
-  // ─── Behavioral probe ──────────────────────────────────────────
+  // ─── parseTrustedProxies unit tests ────────────────────────────
+  describe('parseTrustedProxies(envValue)', () => {
+    test.each([
+      ['undefined  →  default loopback', undefined, ['loopback']],
+      ['null       →  default loopback', null, ['loopback']],
+      ['empty str  →  default loopback', '', ['loopback']],
+      ['whitespace →  default loopback', '   ', ['loopback']],
+      ['"none"     →  false (paranoid)', 'none', false],
+      ['"false"    →  false (paranoid)', 'false', false],
+      ['symbolic loopback', 'loopback', ['loopback']],
+      ['symbolic linklocal', 'linklocal', ['linklocal']],
+      ['symbolic uniquelocal', 'uniquelocal', ['uniquelocal']],
+      ['symbolic list', 'loopback,uniquelocal', ['loopback', 'uniquelocal']],
+      ['ipv4 bare', '127.0.0.1', ['127.0.0.1']],
+      ['ipv4 cidr', '10.0.0.0/8', ['10.0.0.0/8']],
+      ['ipv4 mix', '127.0.0.1,10.0.0.0/8', ['127.0.0.1', '10.0.0.0/8']],
+      ['ipv6 bare', '::1', ['::1']],
+      ['ipv6 cidr', '2001:db8::/32', ['2001:db8::/32']],
+      ['mixed v4+v6+symbolic', 'loopback,10.0.0.0/8,::1', ['loopback', '10.0.0.0/8', '::1']],
+      ['trims surrounding whitespace', '  loopback , uniquelocal ', ['loopback', 'uniquelocal']],
+      ['drops empty entries', 'loopback,,uniquelocal,', ['loopback', 'uniquelocal']],
+    ])('parses: %s', (_label, input, expected) => {
+      expect(parseTrustedProxies(input)).toEqual(expected);
+    });
+
+    test.each([
+      ['unknown symbolic', 'wikipedia'],
+      ['ipv4 octet > 255', '999.0.0.1'],
+      ['ipv4 too few octets', '10.0.0'],
+      ['ipv4 prefix > 32', '10.0.0.0/33'],
+      ['ipv6 prefix > 128', '2001:db8::/129'],
+      ['cidr without addr', '/8'],
+      ['mixed bad with good (any-bad fails the whole list)', 'loopback,wikipedia'],
+      ['negative prefix', '10.0.0.0/-1'],
+      ['non-numeric prefix', '10.0.0.0/abc'],
+    ])('throws for invalid: %s', (_label, input) => {
+      expect(() => parseTrustedProxies(input)).toThrow(/Invalid TRUSTED_PROXIES/);
+    });
+
+    test('throw message echoes the input verbatim and the bad entries', () => {
+      try {
+        parseTrustedProxies('loopback,wikipedia,999.0.0.1');
+      } catch (err) {
+        expect(err.message).toContain('"wikipedia"');
+        expect(err.message).toContain('"999.0.0.1"');
+        expect(err.message).toContain('loopback,wikipedia,999.0.0.1');
+        return;
+      }
+      throw new Error('expected parseTrustedProxies to throw');
+    });
+
+    test('isValidEntry: spot-check the predicate directly', () => {
+      expect(isValidEntry('loopback')).toBe(true);
+      expect(isValidEntry('127.0.0.1')).toBe(true);
+      expect(isValidEntry('10.0.0.0/8')).toBe(true);
+      expect(isValidEntry('::1')).toBe(true);
+      expect(isValidEntry('2001:db8::/32')).toBe(true);
+      expect(isValidEntry('wikipedia')).toBe(false);
+      expect(isValidEntry('999.0.0.1')).toBe(false);
+      expect(isValidEntry('10.0.0.0/33')).toBe(false);
+      expect(isValidEntry(undefined)).toBe(false);
+      expect(isValidEntry(null)).toBe(false);
+      expect(isValidEntry(123)).toBe(false);
+    });
+  });
+
+  // ─── Behavioral probe (pre-T4.8 axioms preserved) ──────────────
   //
-  // Build a minimal Express app that mirrors today's setting
-  // (`trust proxy: 1`), bounce a request through it with a spoofed
-  // X-Forwarded-For, and capture `req.ip`. This is decoupled from
-  // src/index.js so the assertion stays valid regardless of M6
-  // monolith extraction.
-  test('today: trust proxy = 1 honors a single-hop X-Forwarded-For (spoofable from any client)', async () => {
+  // These two cases are FACTS-OF-EXPRESS, not properties of our
+  // code — they're kept so the diff between trust=1 and the new
+  // default is auditable from the test file alone. If you change
+  // these, you've changed Express, not us, and that needs its own
+  // discussion.
+  test('axiom: a tiny app with trust proxy = 1 honors single-hop X-Forwarded-For (the H5 risk we closed)', async () => {
     const app = express();
     app.set('trust proxy', 1);
     app.get('/probe', (req, res) => {
@@ -117,19 +194,10 @@ describe('[Cleanup Stage / G4.3] trust-proxy contract', () => {
       .set('X-Forwarded-For', '203.0.113.42'); // RFC 5737 documentation IP
 
     expect(res.status).toBe(200);
-    // With trust=1, Express trusts the LAST hop in X-Forwarded-For
-    // and exposes it as req.ip. This is the H5 risk: the supertest
-    // connection is from loopback, but the test app trusts the
-    // header anyway because trust=1 means "trust the immediate
-    // connection's claim about who's behind it".
     expect(res.body.ip).toBe('203.0.113.42');
   });
 
-  test('today: an app with trust proxy = false IGNORES X-Forwarded-For (control case)', async () => {
-    // Sanity-check the spoofability probe by inverting it: with
-    // trust=false, Express must NOT honor X-Forwarded-For. If this
-    // ever passes with the spoofed value, the probe above is
-    // measuring the wrong thing.
+  test('axiom: a tiny app with trust proxy = false IGNORES X-Forwarded-For (control case)', async () => {
     const app = express();
     app.set('trust proxy', false);
     app.get('/probe', (req, res) => {
@@ -142,10 +210,105 @@ describe('[Cleanup Stage / G4.3] trust-proxy contract', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.ip).not.toBe('203.0.113.42');
-    // supertest connects via loopback, so req.ip should be a loopback
-    // address. We don't assert the exact form (`::ffff:127.0.0.1` vs
-    // `127.0.0.1` vs `::1`) because it depends on the platform's
-    // dual-stack settings.
     expect(res.body.ip).toMatch(/127\.0\.0\.1$|::1$/);
+  });
+
+  // ─── Post-T4.8 integration ─────────────────────────────────────
+  //
+  // Probe the Express `trust proxy fn` directly — that's the
+  // compiled function proxy-addr produces from whatever you passed
+  // to `app.set('trust proxy', …)`. Calling it with various IPs
+  // tells us EXACTLY which sources Express considers a trusted
+  // proxy. This is the cleanest way to assert the H5 closure
+  // without spinning up a non-loopback supertest connection
+  // (which is a hard problem on most CI runners).
+  describe('integration: app.set(trust proxy, parseTrustedProxies(...)) compiled trust function', () => {
+    function buildApp(envValue) {
+      const app = express();
+      app.set('trust proxy', parseTrustedProxies(envValue));
+      return app;
+    }
+
+    test('default (unset) trusts ONLY loopback addresses', () => {
+      const app = buildApp(undefined);
+      const trust = app.get('trust proxy fn');
+      expect(typeof trust).toBe('function');
+
+      expect(trust('127.0.0.1', 0)).toBe(true);
+      expect(trust('::1', 0)).toBe(true);
+
+      // The H5 closure: arbitrary public IPs are NOT trusted.
+      expect(trust('203.0.113.42', 0)).toBe(false);
+      expect(trust('8.8.8.8', 0)).toBe(false);
+      expect(trust('10.0.0.1', 0)).toBe(false); // RFC 1918, but NOT in default list
+      expect(trust('192.168.1.1', 0)).toBe(false);
+      expect(trust('172.17.0.1', 0)).toBe(false); // common docker bridge
+    });
+
+    test('TRUSTED_PROXIES=uniquelocal trusts RFC 1918 + ULA + loopback (combined with default? no — replaces)', () => {
+      // `uniquelocal` alone does NOT include loopback. Operators
+      // who want both must say so explicitly. This locks the
+      // intended semantics: each entry is independently considered.
+      const app = buildApp('uniquelocal');
+      const trust = app.get('trust proxy fn');
+
+      expect(trust('10.0.0.1', 0)).toBe(true);
+      expect(trust('172.17.0.1', 0)).toBe(true);
+      expect(trust('192.168.1.1', 0)).toBe(true);
+
+      expect(trust('203.0.113.42', 0)).toBe(false);
+      expect(trust('127.0.0.1', 0)).toBe(false); // explicitly NOT covered
+    });
+
+    test('TRUSTED_PROXIES=loopback,uniquelocal trusts both (composition is union)', () => {
+      const app = buildApp('loopback,uniquelocal');
+      const trust = app.get('trust proxy fn');
+
+      expect(trust('127.0.0.1', 0)).toBe(true);
+      expect(trust('::1', 0)).toBe(true);
+      expect(trust('10.0.0.1', 0)).toBe(true);
+      expect(trust('172.17.0.1', 0)).toBe(true);
+
+      expect(trust('203.0.113.42', 0)).toBe(false);
+    });
+
+    test('TRUSTED_PROXIES=10.0.0.0/8 trusts that exact CIDR only', () => {
+      const app = buildApp('10.0.0.0/8');
+      const trust = app.get('trust proxy fn');
+
+      expect(trust('10.0.0.1', 0)).toBe(true);
+      expect(trust('10.255.255.254', 0)).toBe(true);
+
+      expect(trust('11.0.0.1', 0)).toBe(false);
+      expect(trust('127.0.0.1', 0)).toBe(false); // loopback NOT auto-included
+    });
+
+    test('TRUSTED_PROXIES=none trusts NOBODY (paranoid mode)', () => {
+      const app = buildApp('none');
+      const trust = app.get('trust proxy fn');
+
+      expect(trust('127.0.0.1', 0)).toBe(false);
+      expect(trust('::1', 0)).toBe(false);
+      expect(trust('10.0.0.1', 0)).toBe(false);
+      expect(trust('203.0.113.42', 0)).toBe(false);
+    });
+
+    // End-to-end: the helper output drives Express, Express drives
+    // req.ip, req.ip drives ratelimit + audit. With default
+    // ['loopback'] and a supertest connection (which IS from
+    // loopback), an X-Forwarded-For IS honored — that's by design;
+    // the fix is closing spoofs from PUBLIC clients, not from the
+    // host itself.
+    test('default + supertest (loopback connection): X-Forwarded-For IS honored — by design', async () => {
+      const app = buildApp(undefined);
+      app.get('/probe', (req, res) => res.json({ ip: req.ip }));
+
+      const res = await request(app)
+        .get('/probe')
+        .set('X-Forwarded-For', '203.0.113.42');
+
+      expect(res.status).toBe(200);
+      expect(res.body.ip).toBe('203.0.113.42');
+    });
   });
 });

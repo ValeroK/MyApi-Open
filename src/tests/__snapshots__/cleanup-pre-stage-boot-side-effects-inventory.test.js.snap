@@ -9,17 +9,17 @@ exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory every registered t
   },
   {
     "kind": "interval",
-    "line": 12429,
+    "line": 12436,
     "snippet": "setInterval(() => {",
   },
   {
     "kind": "interval",
-    "line": 12688,
+    "line": 12695,
     "snippet": "setInterval(() => {",
   },
   {
     "kind": "interval",
-    "line": 12715,
+    "line": 12722,
     "snippet": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
   },
 ]
@@ -38,28 +38,28 @@ exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory snapshot: every se
     "contextComment": "Email processor: Send pending emails every 5 minutes",
     "indent": 0,
     "kind": "interval",
-    "line": 1100,
+    "line": 1107,
     "sourceSlice": "const emailProcessorInterval = setInterval(async () => {",
   },
   {
     "contextComment": "AFP heartbeat — ping every 30s, terminate and mark offline if no pong within 10s",
     "indent": 2,
     "kind": "interval",
-    "line": 12429,
+    "line": 12436,
     "sourceSlice": "setInterval(() => {",
   },
   {
     "contextComment": "own schedule above.",
     "indent": 4,
     "kind": "interval",
-    "line": 12688,
+    "line": 12695,
     "sourceSlice": "setInterval(() => {",
   },
   {
     "contextComment": null,
     "indent": 4,
     "kind": "interval",
-    "line": 12715,
+    "line": 12722,
     "sourceSlice": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
   },
 ]
@@ -78,7 +78,7 @@ exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory snapshot: top-leve
     "contextComment": "Email processor: Send pending emails every 5 minutes",
     "indent": 0,
     "kind": "interval",
-    "line": 1100,
+    "line": 1107,
     "sourceSlice": "const emailProcessorInterval = setInterval(async () => {",
   },
 ]

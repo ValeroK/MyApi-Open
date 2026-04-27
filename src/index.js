@@ -395,9 +395,16 @@ const {
   computeUsageVsLimits,
   getRangeDays,
 } = require('./lib/billing');
+const { parseTrustedProxies } = require('./lib/trust-proxy');
 
 const app = express();
-app.set('trust proxy', 1);
+// M4-T4.8: env-driven trust-proxy CIDR list. Default is `['loopback']`
+// — secure-by-default, X-Forwarded-For only honored when the immediate
+// connection is from 127.0.0.1 / ::1. Pre-T4.8 this was a literal `1`
+// which honored a single-hop X-Forwarded-For from any client (H5).
+// Operators behind a real proxy must declare it via TRUSTED_PROXIES;
+// see src/lib/trust-proxy.js for the env contract.
+app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES));
 const PORT = process.env.PORT || 4500;
 const WORKSPACE_ROOT = path.join(__dirname, '..', '..', '..');
 const USER_MD_PATH = process.env.USER_MD_PATH || path.join(WORKSPACE_ROOT, 'USER.md');
