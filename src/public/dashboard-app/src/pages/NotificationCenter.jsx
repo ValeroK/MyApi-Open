@@ -58,39 +58,41 @@ const getTypeColor = (type) => {
 
 export default function NotificationCenter() {
   const currentWorkspace = useAuthStore((state) => state.currentWorkspace);
-  const { notifications, fetchNotifications } = useNotificationStore();
+  const masterToken = useAuthStore((state) => state.masterToken);
+  const {
+    notifications,
+    fetchNotifications,
+    markAsRead,
+    markAllAsRead,
+    deleteNotification,
+  } = useNotificationStore();
   const [loading, setLoading] = useState(false);
+  const [busyAll, setBusyAll] = useState(false);
   const [filter, setFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     setLoading(true);
-    fetchNotifications().finally(() => setLoading(false));
-  }, [filter, typeFilter, currentWorkspace?.id, fetchNotifications]);
-
-  const { markAsRead, deleteNotification } = useNotificationStore();
+    fetchNotifications(masterToken).finally(() => setLoading(false));
+  }, [filter, typeFilter, currentWorkspace?.id, fetchNotifications, masterToken]);
 
   const handleMarkAsRead = async (notificationId) => {
-    await markAsRead(undefined, notificationId);
-    await fetchNotifications();
+    await markAsRead(masterToken, notificationId);
   };
 
   const handleMarkAllAsRead = async () => {
+    if (busyAll) return;
+    setBusyAll(true);
     try {
-      await fetch('/api/v1/notifications/read-all', {
-        method: 'POST',
-        credentials: 'include'
-      });
-      await fetchNotifications();
-    } catch (err) {
-      console.error('Error marking all as read:', err);
+      await markAllAsRead(masterToken);
+    } finally {
+      setBusyAll(false);
     }
   };
 
   const handleDelete = async (notificationId) => {
-    await deleteNotification(undefined, notificationId);
-    await fetchNotifications();
+    await deleteNotification(masterToken, notificationId);
   };
 
   const filteredNotifications = notifications.filter(n => {
@@ -144,16 +146,25 @@ export default function NotificationCenter() {
               {f.charAt(0).toUpperCase() + f.slice(1)}
             </button>
           ))}
-          {filter === 'unread' && unreadCount > 0 && (
+          {unreadCount > 0 && (
             <button
               onClick={handleMarkAllAsRead}
+              disabled={busyAll}
               className="btn"
-              style={{ color: 'var(--green)', borderColor: 'var(--green)', opacity: 0.85 }}
+              style={{
+                color: 'var(--green)',
+                borderColor: 'var(--green)',
+                opacity: busyAll ? 0.5 : 0.85,
+                cursor: busyAll ? 'default' : 'pointer',
+                marginLeft: 'auto',
+              }}
+              title="Mark all notifications as read"
+              aria-label="Mark all notifications as read"
             >
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style={{ marginRight: '4px' }}>
                 <path d="M1.5 6l3 3 6-6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
-              Mark all as read
+              {busyAll ? 'Marking...' : `Mark all as read (${unreadCount})`}
             </button>
           )}
         </div>

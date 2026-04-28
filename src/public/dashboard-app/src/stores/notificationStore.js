@@ -96,6 +96,30 @@ export const useNotificationStore = create((set) => ({
     }
   },
   
+  // Mark all notifications as read
+  markAllAsRead: async (masterToken) => {
+    try {
+      const headers = masterToken ? { Authorization: `Bearer ${masterToken}` } : {};
+      const response = await fetch('/api/v1/notifications/read-all', {
+        method: 'POST',
+        headers,
+        credentials: 'include',
+      });
+
+      if (response.ok) {
+        const nowIso = new Date().toISOString();
+        set(state => ({
+          notifications: state.notifications.map(n =>
+            n.read_at ? n : { ...n, isRead: true, read_at: nowIso }
+          ),
+          unreadCount: 0,
+        }));
+      }
+    } catch (error) {
+      console.error('Error marking all notifications as read:', error);
+    }
+  },
+
   // Delete notification
   deleteNotification: async (masterToken, notificationId) => {
     try {

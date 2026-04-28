@@ -8,10 +8,12 @@ function NotificationDropdown({ open, onClose }) {
   const dropdownRef = useRef(null);
   const {
     notifications,
+    unreadCount,
     isLoading,
     error,
     fetchNotifications,
     markAsRead,
+    markAllAsRead,
     deleteNotification,
   } = useNotificationStore();
 
@@ -56,6 +58,13 @@ function NotificationDropdown({ open, onClose }) {
     markAsRead(masterToken, notificationId);
   };
 
+  const handleMarkAllAsRead = () => {
+    markAllAsRead(masterToken);
+  };
+
+  const hasUnread = (typeof unreadCount === 'number' && unreadCount > 0)
+    || notifications.some((n) => !n.read_at);
+
   const handleDelete = (notificationId) => {
     deleteNotification(masterToken, notificationId);
   };
@@ -90,15 +99,34 @@ function NotificationDropdown({ open, onClose }) {
     return icons[type] || <svg className={svgClass} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>;
   };
 
-  const formatTime = (isoString) => {
-    if (!isoString) return '';
-    const date = new Date(isoString);
+  // The notifications API returns `created_at` as a Unix timestamp in
+  // *seconds* (see `createNotification` in src/database.js). Treat numeric
+  // values as seconds-since-epoch, and only fall back to Date's native
+  // parser for ISO strings. Without this, JS interprets the seconds value
+  // as milliseconds and every notification renders as Jan 1970.
+  const toDate = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'number' || /^\d+$/.test(String(value))) {
+      const n = Number(value);
+      // Heuristic: a 10-digit value is seconds; 13-digit is already ms.
+      const ms = n < 1e12 ? n * 1000 : n;
+      const d = new Date(ms);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+
+  const formatTime = (value) => {
+    const date = toDate(value);
+    if (!date) return '';
     const now = new Date();
     const diffMs = now - date;
     const diffMins = Math.floor(diffMs / 60000);
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
 
+    if (diffMs < 0) return date.toLocaleDateString();
     if (diffMins < 1) return 'just now';
     if (diffMins < 60) return `${diffMins}m ago`;
     if (diffHours < 24) return `${diffHours}h ago`;
@@ -128,15 +156,39 @@ function NotificationDropdown({ open, onClose }) {
       }}
     >
       {/* Header */}
-      <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--line-2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0 }}>
+      <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--line-2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0, gap: '8px' }}>
         <span className="micro">Notifications</span>
-        <button
-          onClick={onClose}
-          className="ink-3"
-          style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', padding: '2px' }}
-        >
-          <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          {hasUnread && (
+            <button
+              onClick={handleMarkAllAsRead}
+              disabled={isLoading}
+              className="ink-3 text-[12px]"
+              style={{
+                background: 'none',
+                border: 'none',
+                cursor: isLoading ? 'default' : 'pointer',
+                opacity: isLoading ? 0.5 : 1,
+                padding: '2px 6px',
+                borderRadius: '4px',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--ink)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = ''; }}
+              title="Mark all as read"
+              aria-label="Mark all notifications as read"
+            >
+              Mark all as read
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="ink-3"
+            style={{ background: 'none', border: 'none', cursor: 'pointer', display: 'flex', padding: '2px' }}
+            aria-label="Close notifications"
+          >
+            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+          </button>
+        </div>
       </div>
 
       {/* Notifications list */}
