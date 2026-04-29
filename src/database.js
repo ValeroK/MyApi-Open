@@ -739,9 +739,17 @@ function initDatabase() {
   // Seed example personas
   // seedExamplePersonas(); // TODO: MongoDB version
 
-  // Seed service categories and services
-  // seedServiceCategories(); // TODO: MongoDB version
-  // seedServices(); // TODO: MongoDB version
+  // Seed service categories and services. F10 / GAP-010 (2026-04-28):
+  // these were commented out as `TODO: MongoDB version` during the
+  // since-cancelled MongoDB experiment, leaving the `services` table
+  // empty on every clean boot — `getServiceByName('google')` returned
+  // undefined, so `POST /api/v1/services/{name}/execute` always 404'd.
+  // Both seeders are idempotent (`INSERT … ON CONFLICT DO NOTHING`)
+  // and run AFTER migrations, so re-runs and schema changes are safe.
+  // See `.context/capability-gaps.md` GAP-010 and
+  // `src/tests/services-catalog-boot.test.js` for the static ratchet.
+  seedServiceCategories();
+  seedServices();
 
   // Vault token schema migrations
   const vaultTokenMigrations = [

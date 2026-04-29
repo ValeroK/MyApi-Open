@@ -2983,7 +2983,14 @@ app.get('/api/v1/agent-guide', (req, res) => {
 });
 
 const createGoogleRoutes = require('./routes/google');
-app.use('/api/v1/google', createGoogleRoutes());
+// F6.1 / GAP-002: the Google service router was previously mounted
+// without `authenticate`, leaving the Gmail proxy reachable by an
+// unauthenticated remote caller because `resolveUserId(req)` in the
+// router falls back to the literal `'owner'` userId. Every sibling
+// /api/v1/* mount above uses `authenticate` — this brings the Google
+// mount in line. See `.context/capability-gaps.md` GAP-002 and
+// `src/tests/google-mount-auth-posture.test.js`.
+app.use('/api/v1/google', authenticate, createGoogleRoutes());
 
 // --- PUBLIC: RUNTIME CONFIG (no auth required) ---
 // Landing page + signup flows read this to decide whether to render the
@@ -6383,6 +6390,25 @@ app.post("/api/v1/connectors", authenticate, (req, res) => {
   if (!isMaster(req)) return res.status(403).json({ error: "Insufficient scope" });
   const { type, config, label } = req.body;
   if (!type || !label) return res.status(400).json({ error: "type and label are required" });
+
+  // F6.6 / ADR-0020: when `type === 'generic_oauth'` the `config`
+  // is a `GenericOAuthAdapter`-shaped spec and must validate
+  // against `validateConnectorSpec`. Master-only is unchanged.
+  // Other connector types (legacy / future) pass through as before
+  // until each gets its own schema. See
+  // `src/lib/schemas/connector-spec.js` and
+  // `src/tests/connectors-spike.test.js`.
+  const { validateConnectorSpec, isGenericOAuthType } = require('./lib/schemas/connector-spec');
+  if (isGenericOAuthType(type)) {
+    const v = validateConnectorSpec(config || {});
+    if (!v.ok) {
+      return res.status(400).json({
+        error: v.error,
+        code: v.code,
+        fields: v.fields,
+      });
+    }
+  }
 
   const connectorCount = getConnectors().length;
   const connectorLimitErr = enforcePlanLimit(req, 'serviceConnections', connectorCount, 1);

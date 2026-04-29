@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-27** (M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; new `src/lib/trust-proxy.js` helper validates entries, fails loud on bogus CIDR, defaults to `['loopback']` for secure-by-default behavior; closes H5 from plan.md §6.3. G4.3 expanded from 6 → 41 tests (parseTrustedProxies unit cases × 28 + integration probes × 7 confirming the H5 closure at the Express trust-fn level). G0.2 snapshot now pins `'trust proxy': ['loopback']`. New `.cursor/rules/commit-message-hygiene.mdc` (alwaysApply) forbids any AI/Cursor/agent attribution in commits. Earlier the same day: M4-T4.6 — `src/index.js` is fully behind the M4 rate-limit factory + folded follow-on `/ping` liveness handler.)
+> - Last updated: **2026-04-28** (F6 — Agent capability verification — ✅ Complete. All 8 tasks (F6.0–F6.7) landed in one session: gap-ledger bootstrap, 8 L1 supertest suites, L3 walkthrough script, 4 L2 live-smoke suites, connector spike (ADR-0020 Option C — `src/lib/schemas/connector-spec.js` + handler wiring), gap-ledger triage with follow-up briefs F8 / F9 / F10. Closed GAP-002 P0 in the same change as the test that surfaced it. Test baseline 55 / 56 / 767 → **64 / 69 / 855** (+9 suites, +88 tests, 5 L2 suites correctly skip when env unset, 28 / 28 snapshots stable, exit 0). Earlier 2026-04-27: M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md §6.3.)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **55 / 55 suites, 767 pass / 22 skip, 28 / 28 snapshots, exit 0** (~11 s locally with `--forceExit`; M4-T4.8 landed 2026-04-27 — G4.3 expanded from 6 → 41 tests with `parseTrustedProxies` unit cases + Express trust-fn integration probes, G0.2 / G0.3 / G4.1 snapshots updated for `trust proxy: 1 → ['loopback']` + 7-line drift; M4-T4.8 pre-stage gate G4.3 originally added 6 tests + 1 snapshot earlier the same day, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite added the same day, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite added the same day, +15 tests from the M4 pre-stage gates G4.1–G4.2 added the same day, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 added the same day — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression` and rewrote 2 pre-F4 assertions to the new `user_identity_links` contract) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **64 / 69 suites, 855 pass / 42 skip, 28 / 28 snapshots, exit 0** (~64 s locally with `--forceExit` on Windows; **F6 ✅ Complete** 2026-04-28 — added 8 new behavioral L1 suites (+88 tests across L1) plus 4 L2 live-smoke suites that skip silently when `SMOKE_URL` etc. are unset (5 skipped suites total: 4 F6 + the existing `oauth-authorize-url-live-smoke`); F6 connector spike added 7 more tests + 1 schema module (`src/lib/schemas/connector-spec.js`); G0.3 snapshot regenerated twice in same change set for legitimate line-number drift (GAP-002 fix + connector validator wiring); L1 suites included: `google-mount-auth-posture` (closes GAP-002 P0; regenerates G0.1 / G0.2 / G0.3 snapshots in same change), `agent-discovery-contract`, `services-proxy-behavioral` (surfaces GAP-008 + GAP-009; static SSRF resilience gate), `services-execute-behavioral` (surfaces GAP-010), `ask-endpoint-behavioral`, `handshake-flow-behavioral` (surfaces GAP-011; pins GAP-005), `connectors-master-only`, `agent-capabilities-end-to-end`. Pre-F6.1 baseline was 55 / 56 / 767. Earlier 2026-04-27: M4-T4.8 G4.3 expanded from 6 → 41 tests, G0.2 / G0.3 / G4.1 snapshots updated for `trust proxy: 1 → ['loopback']` + 7-line drift; pre-stage gate G4.3 originally added 6 tests + 1 snapshot earlier the same day, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite, +15 tests from the M4 pre-stage gates G4.1–G4.2, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression`) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,105 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-27 (latest)** — **M4-T4.8 landed: `app.set('trust
+- **2026-04-28 (latest)** — **F6 ✅ Complete — Agent capability
+  verification.** All 8 tasks (F6.0–F6.7) landed in one session,
+  +88 passing tests, 5 new live-smoke suites (gated, silent in
+  `npm test`), one new schema module + handler wiring in
+  `src/index.js`, three follow-up briefs filed (F8 / F9 / F10).
+  Net: every agent-facing capability now has a green test, and
+  every known limitation has a `GAP-NNN` row pointing at a
+  milestone. **Production-code changes:** GAP-002 one-liner
+  (`authenticate` middleware on the `/api/v1/google` mount,
+  `src/index.js`) + connector schema validator wiring
+  (`src/index.js:6389-6411`, calls into the new
+  `src/lib/schemas/connector-spec.js`). Both are tiny diffs
+  guarded by static gates so future edits show up as deliberate
+  changes. **What this proves about the gateway:** (a) the agent
+  cannot reach Gmail without a token; (b) `/openapi.json` +
+  `/api/v1/capabilities` + `/api/v1/tokens/me/capabilities` are
+  faithful discovery surfaces — the agent can reason about its
+  own scope without ever being shown a credential; (c) the
+  proxy + execute + ask handlers gate auth → scope → validation
+  → connection in that order, never reaching upstream without
+  every gate green; (d) the SSRF posture by construction
+  (proxy reads only `path/method/body/query` from `req.body`)
+  is now a static ratchet; (e) the handshake bootstrap flow is
+  end-to-end safe — public POST + public poll never carry the
+  issued token, only `/handshakes/:id/approve` (master-only)
+  surfaces it. **What this surfaces:** GAP-002 P0 (resolved),
+  plus 4 new gaps GAP-008 through GAP-011, all triaged into M6 /
+  M14 / new F8-F10 briefs. **Documentation:** `agent-real-life.md`
+  runbook (markdown only, plan-mode) walks the same trajectory
+  manually. `agent-walkthrough.mjs` script runs the runbook
+  programmatically with a single bearer. Test baseline: 55 / 56
+  / 767 → **64 / 69 / 855**, 28 / 28 snapshots stable. Earlier
+  same-day session log:
+  `.context/sessions/2026-04-28-f6-agent-verification.md` (this
+  session's wrap-up).
+- **2026-04-28** — **F6.1 landed: 8 L1 supertest
+  behavioral suites for the agent-facing surface; closes GAP-002
+  P0 in the same change; surfaces GAP-008..GAP-011 with
+  disposition.** New suites under `src/tests/`:
+  `google-mount-auth-posture` (5 tests; runtime + static gate
+  forcing `authenticate` middleware on the `/api/v1/google` mount
+  — pre-F6.1 the mount was naked, and `resolveUserId` falling
+  back to `'owner'` meant Gmail data was reachable to any
+  unauthenticated remote caller on a connected deployment),
+  `agent-discovery-contract` (12 tests; pins `/openapi.json`
+  public, `/api/v1/capabilities` narrowed by scope, `/api/v1/-
+  tokens/me/capabilities` echoes scope without leaking the raw
+  token, `/api/v1/gateway/context` master-only with
+  vault-tokens-metadata-only — pins GAP-003's mismatch with
+  `llms.txt`), `services-proxy-behavioral` (12 tests; pins the
+  auth/scope/validation/connection gates AND a static
+  SSRF-resilience gate on the `req.body` destructure — handler
+  reads only `path/method/body/query`, refuses
+  `baseUrl/host/apiRoot/origin/url` overrides; surfaces GAP-008
+  scope-hierarchy not implemented + GAP-009 `validateScope` /
+  `grantScopes` self-contradiction), `services-execute-behavioral`
+  (9 tests; pins the `{method, params}` validation + 404 / 400
+  / 403 envelopes; surfaces GAP-010 `seedServiceCategories();
+  seedServices();` boot calls commented out — service catalog
+  is empty on every clean boot), `ask-endpoint-behavioral`
+  (8 tests; pins the LLM-availability 503 + the no-services-
+  connected 400 BEFORE any OpenAI call — cardinal cost-control
+  property), `handshake-flow-behavioral` (16 tests; covers the
+  whole agent bootstrap flow public-POST → public-status-poll →
+  master-approve → token-issued-out-of-band, asserts no token
+  ever appears in the public poll envelope; surfaces GAP-011
+  duplicate `/status` handler at `src/index.js:7847` — count
+  pinned at exactly 2 with a static gate; pins GAP-005 `user_id
+  = 'owner'` literal), `connectors-master-only` (8 tests; pins
+  master-vs-scoped + round-trip + scoped-POST-does-not-persist
+  defense in depth), `agent-capabilities-end-to-end` (11 tests;
+  the composite walk — public discover → master mints scoped
+  agent token via `POST /api/v1/tokens` → agent uses scoped
+  token for `/capabilities` and `/tokens/me/capabilities` →
+  agent reaches proxy connection gate cleanly → agent CANNOT
+  reach `gateway/context` / `connectors` / `audit` /
+  handshake-approve). **GAP-002 fix: `app.use('/api/v1/google',
+  authenticate, createGoogleRoutes())`** with a comment block
+  cross-referencing the gap and the test. Snapshot impact: 3
+  G0.x snapshots regenerated in the same change (G0.1 API surface
+  now pins `M(2)` middleware count for the Google mount; G0.2
+  middleware-chain order shifts by 1 layer; G0.3 boot-side-
+  effects line numbers drift +1) — diffs ARE the security-fix
+  evidence per ADR-0019. **No production-code change other than
+  the GAP-002 one-liner + comment block.** New `.context/
+  capability-gaps.md` ledger went from 7 pre-seeded rows to 11
+  rows: GAP-002 marked `resolved P0` with full audit trail; new
+  rows GAP-008 (P1, scope hierarchy not implemented), GAP-009
+  (P1, `validateScope` accepts narrow regex but `grantScopes`
+  fails FK), GAP-010 (P1, service catalog seed is dead code at
+  boot), GAP-011 (P2, duplicate `/status` handler at
+  `src/index.js:7847` is unreachable). Test baseline: 55 / 56
+  suites + 767 / 789 passing → **63 / 64 / 848 / 870**, 28 /
+  28 snapshots stable, exit 0; full sweep ~64 s on Windows. F6
+  global progress: 1 / 8 → 2 / 8. F6.2 (L3 walkthrough script),
+  F6.3 / F6.4 / F6.5 (L2 live-smoke trio), F6.6 (connector
+  schema spike per ADR-0020), F6.7 (gap-ledger triage)
+  remaining.
+- **2026-04-27** — **M4-T4.8 landed: `app.set('trust
   proxy', 1)` replaced with `app.set('trust proxy', parseTrusted-
   Proxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md
   §6.3.** New `src/lib/trust-proxy.js` (0-dep regex-based) parses
@@ -1433,7 +1531,40 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **M3 ✅ Complete (2026-04-24).** All ten tasks
+- **Now:** **F6 ✅ Complete — Agent capability verification.**
+  All 8 tasks landed 2026-04-28; the gateway has full L1 +
+  partial L2 + L3 (manual + scripted) coverage of every agent-
+  facing capability. The "is MyApi ready for OpenClaude /
+  Hermes?" question now has a documented answer: **yes for the
+  read path, with three known gaps (F8 / F9 / F10) the operator
+  must accept or close before going live.**
+- **Next, in priority order (operator pick):**
+  1. **Run `npm run docker:smoke` once + the L2 smoke trio**
+     (`smoke:agent` / `smoke:google` / `smoke:github`) against
+     real OAuth apps. Captures whatever the L1 layer can't see
+     (stale Docker image, env var typos, real Google/GitHub
+     scope drift). Expected runtime ~30 s once the connect flow
+     is green.
+  2. **F10 (XS, half a day)** — uncomment the two
+     `seedServiceCategories(); seedServices();` calls. Smallest
+     possible win; un-blocks the dashboard's service catalog,
+     `services/{name}/execute`, the runbook's Phase 1.
+  3. **F8 (S, half a day)** — pick Option B (rewrite `llms.txt`
+     to point at `/api/v1/capabilities` instead of
+     `/gateway/context`); the L1 test in
+     `agent-discovery-contract.test.js` already pins the
+     current behavior so the diff IS the sign-off.
+  4. **F9 (M, 1-2 days, naturally bundles into M6)** — the
+     scope-hierarchy engine. Fixes GAP-008 + GAP-009 together.
+     Until it lands, the runbook + walkthrough script tell
+     operators to mint **broad** scopes (`services:read` /
+     `services:write`) rather than narrow.
+  5. **M5** — SSRF surface unification (a separate planned
+     milestone). F7 (agent-defined connectors at runtime) is
+     gated on M5 closing per ADR-0020.
+- **Just landed (2026-04-28):** **F6 complete** + 3 follow-up
+  briefs (F8 / F9 / F10). See §5 for the blow-by-blow.
+- **Recently closed:** **M3 ✅ Complete (2026-04-24).** All ten tasks
   (T3.0–T3.9) landed plus the M3 wrap-up commit. C3 ("OAuth state
   not DB-validated" + the session-fixation variant) and C6
   ("Discord state bypass") from `plan.md` §6.3 are closed

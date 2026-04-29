@@ -9,17 +9,17 @@ exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory every registered t
   },
   {
     "kind": "interval",
-    "line": 12436,
+    "line": 12462,
     "snippet": "setInterval(() => {",
   },
   {
     "kind": "interval",
-    "line": 12695,
+    "line": 12721,
     "snippet": "setInterval(() => {",
   },
   {
     "kind": "interval",
-    "line": 12722,
+    "line": 12748,
     "snippet": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
   },
 ]
@@ -45,21 +45,21 @@ exports[`[Cleanup Stage 0 / G0.3] boot-side-effects inventory snapshot: every se
     "contextComment": "AFP heartbeat — ping every 30s, terminate and mark offline if no pong within 10s",
     "indent": 2,
     "kind": "interval",
-    "line": 12436,
+    "line": 12462,
     "sourceSlice": "setInterval(() => {",
   },
   {
     "contextComment": "own schedule above.",
     "indent": 4,
     "kind": "interval",
-    "line": 12695,
+    "line": 12721,
     "sourceSlice": "setInterval(() => {",
   },
   {
     "contextComment": null,
     "indent": 4,
     "kind": "interval",
-    "line": 12722,
+    "line": 12748,
     "sourceSlice": "setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000); // daily",
   },
 ]
