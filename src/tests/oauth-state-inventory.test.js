@@ -307,9 +307,13 @@ describe('[M3 / Step 6] oauth_pending_logins + oauth_tokens schema (T3.7)', () =
 // establishes:
 //
 //   (A) Every `storeOAuthToken(...)` call in `src/index.js` passes
-//       at least 7 positional arguments, so `provider_subject` is
-//       NEVER written NULL. Closes the `COALESCE`-fallback gap flagged
-//       in ADR-0016 for signup-mode + connect-mode call sites.
+//       at least 8 positional arguments, so `provider_subject` AND
+//       `connected_email` are NEVER written NULL silently. Closes the
+//       `COALESCE`-fallback gap flagged in ADR-0016 for signup-mode +
+//       connect-mode call sites; F3 Pass 4 (ADR-0022) extends the
+//       same gate to the 8th positional `connectedEmail` so the
+//       dashboard's "Connected as <email>" UI never goes blank because
+//       a future call site forgot to pass it.
 //
 //   (B) The legacy state-token surface on `./database` (pre-M3
 //       variants: random state, no PKCE verifier column, naive
@@ -390,7 +394,7 @@ describe('[M3 wrap-up] provider_subject threading (storeOAuthToken call-site aud
     return { arity, end: i };
   }
 
-  test('every storeOAuthToken(...) call in src/index.js passes >= 7 positional args', () => {
+  test('every storeOAuthToken(...) call in src/index.js passes >= 8 positional args', () => {
     const serverSrc = fs.readFileSync(SERVER_ENTRY, 'utf8');
 
     // Find every call site. We don't want the FUNCTION DEFINITION in
@@ -413,13 +417,14 @@ describe('[M3 wrap-up] provider_subject threading (storeOAuthToken call-site aud
 
     expect(sites.length).toBeGreaterThan(0);
 
-    const shortCalls = sites.filter((s) => s.arity < 7);
+    const shortCalls = sites.filter((s) => s.arity < 8);
     if (shortCalls.length > 0) {
       // Fail-loud with the exact offending line numbers so the next
       // developer can find them in seconds.
       throw new Error(
-        `storeOAuthToken(...) must always pass providerSubject ` +
-          `(7th positional arg). Offending call sites in src/index.js: ` +
+        `storeOAuthToken(...) must always pass providerSubject (7th) and ` +
+          `connectedEmail (8th positional args). Offending call sites in ` +
+          `src/index.js: ` +
           shortCalls
             .map((s) => `L${s.line} (arity=${s.arity})`)
             .join(', ')

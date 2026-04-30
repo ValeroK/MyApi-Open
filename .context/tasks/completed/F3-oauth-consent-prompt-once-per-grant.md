@@ -16,20 +16,27 @@
 
 ## Status
 
-- **State.** **Pass 1 + Pass 2 landed on main (2026-04-24); Pass 3 landed
-  on main (2026-04-30)**. F3 is now ✅ **Complete (re-closed).** Pass 1 =
-  `959059c` (drop `max_age=0` + unit + live-smoke coverage). Pass 2 =
-  atomic commit shipping the adapter default flip, `invalid_grant`
-  recovery, `REAUTH_REQUIRED` envelope, dashboard banner, and ADR-0017.
-  **Pass 3 = connect-mode forces `prompt=consent` to guarantee Google
-  issues a refresh_token (ADR-0021).** Surfaced 2026-04-30 by
-  `mailer.kv@gmail.com` reproducer: the dashboard "Connect Google"
-  button silently re-issued an access_token without a refresh_token,
-  putting the row on a ~1h fuse to `REAUTH_REQUIRED`.
+- **State.** **Pass 1 + Pass 2 landed on main (2026-04-24); Pass 3 +
+  Pass 4 landed on main (2026-04-30)**. F3 is now ✅ **Complete
+  (re-closed twice).** Pass 1 = `959059c` (drop `max_age=0` + unit +
+  live-smoke coverage). Pass 2 = atomic commit shipping the adapter
+  default flip, `invalid_grant` recovery, `REAUTH_REQUIRED` envelope,
+  dashboard banner, and ADR-0017. **Pass 3 = connect-mode forces
+  `prompt=consent` to guarantee Google issues a refresh_token
+  (ADR-0021).** Surfaced 2026-04-30 by `mailer.kv@gmail.com`
+  reproducer: the dashboard "Connect Google" button silently re-issued
+  an access_token without a refresh_token, putting the row on a ~1h
+  fuse to `REAUTH_REQUIRED`. **Pass 4 = persist + display the
+  connected provider account email (ADR-0022).** User-visible follow-on
+  from the same review: the dashboard now shows "Connected as
+  alice@work.gmail.com" beneath each connected service card, so users
+  who connect a service with a different account than their login
+  account can see which account holds the grant.
 - **Assignee.** anyone
 - **Started.** 2026-04-24.
 - **Target done.** Same week.
-- **Actually done.** Pass 1 + Pass 2: 2026-04-24. Pass 3: 2026-04-30.
+- **Actually done.** Pass 1 + Pass 2: 2026-04-24. Pass 3 + Pass 4:
+  2026-04-30.
 
 ### Pass 3 (landed 2026-04-30, ADR-0021)
 
@@ -68,6 +75,48 @@
   in that suite), +1 tripwire in `security-regression` (no count
   change in the smoke test). 13 OAuth-related suites confirmed green
   post-fix: 220 passing, 8 skipped.
+
+### Pass 4 (landed 2026-04-30, ADR-0022)
+
+- **Gap.** ADR-0018 split identity (`user_identity_links`) from
+  service (`oauth_tokens`) at the storage layer, but `oauth_tokens`
+  carried only `provider_subject` and not the granting account's
+  email. A user who logs in as `alice@personal.gmail.com` and
+  connects Drive using `alice@work.gmail.com` (Google account picker
+  → different account) had no way to see from the dashboard which
+  account was actually granting Drive — the Services page rendered a
+  generic "Connected" chip with no per-account label. That made
+  disconnect/reconnect unsafe.
+- **Fix.** Single column `connected_email TEXT` on `oauth_tokens`
+  (CREATE TABLE + safeMigration), `storeOAuthToken` extended from 7
+  to 8 positional args (8th = `connectedEmail`), connect-mode
+  callback in `src/index.js` captures email from the `verifyToken`
+  response (or the id_token `email` claim for Google — signed source
+  preferred) and threads it through, `/api/v1/oauth/status` exposes
+  `connectedEmail` per service, and `ServiceConnectors.jsx` renders
+  "Connected as {email}" beneath each connected card. Email is
+  normalised (`trim().toLowerCase()`) on write. UPDATE-path uses
+  `COALESCE(?, connected_email)` so refresh-style calls don't wipe
+  the stored email.
+- **Test coverage added.**
+  - New `src/tests/oauth-connect-account-display.test.js` — 5 tests
+    covering DB round-trip, casing normalisation, COALESCE-on-update,
+    `/oauth/status` shape, and **multi-account independence** (login
+    identity row + service grant row stay independent when the user
+    connects with a different provider account).
+  - New `src/tests/oauth-connect-no-email-graceful.test.js` — 4 tests
+    covering null email, empty string, whitespace-only string, and a
+    static tripwire on the connect-mode capture block.
+  - `src/tests/oauth-state-inventory.test.js` — flipped the
+    source-level tripwire from "every `storeOAuthToken(...)` call in
+    `src/index.js` passes ≥ 7 args" to "passes ≥ 8 args".
+  - `src/tests/security-regression.test.js` — three new tripwires
+    (schema column, 8-arg signature, `/oauth/status` response key).
+- **Test baseline impact.** Pass 4 adds 9 new behavioural tests +
+  3 new static tripwires + 1 flipped tripwire. Targeted bundle
+  (15 OAuth + security-regression suites): 220 → **232 passing** (+12),
+  same 16 skipped, exit 0. Full non-cleanup-pre-stage suite: 60 of
+  60 active suites passing, 805 tests.
 
 ### Pass 1 (landed 2026-04-24, commit `959059c`)
 

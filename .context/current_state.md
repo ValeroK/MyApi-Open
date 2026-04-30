@@ -76,7 +76,31 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-30 (latest)** — **F3 Pass 3 (ADR-0021): connect-mode for
+- **2026-04-30 (latest)** — **F3 Pass 4 (ADR-0022): persist + display
+  the connected provider account on each service grant.** Same review
+  cycle as Pass 3, separate concern: the dashboard had no way to show
+  which provider account holds a service grant when the user picks a
+  different account on Google's account picker than the one they're
+  logged in with. `oauth_tokens` gains one column `connected_email`,
+  `storeOAuthToken` goes 7-arg → 8-arg (8th = `connectedEmail`,
+  COALESCE-on-update so refresh paths don't wipe), connect-mode
+  callback in `src/index.js` captures email from the `verifyToken`
+  response or the id_token `email` claim (Google prefers signed
+  source), `/api/v1/oauth/status` exposes `connectedEmail` per
+  service, and `ServiceConnectors.jsx` renders "Connected as
+  alice@work.gmail.com" beneath each connected card. Multi-account
+  independence is locked: a behavioural test asserts that an existing
+  `user_identity_links` row for the LOGIN account (e.g. sub=11111,
+  email=alice@personal) is NOT mutated when the connect callback
+  writes a SERVICE row with a different account (sub=99999,
+  email=alice@work). Test coverage: 2 new behavioural suites
+  (`oauth-connect-account-display.test.js`, 5 tests;
+  `oauth-connect-no-email-graceful.test.js`, 4 tests) + 3 new static
+  tripwires + 1 flipped tripwire (oauth-state-inventory 7-arg → 8-arg).
+  Targeted bundle: 220 → **232 passing** (+12), same 16 skipped,
+  exit 0. Full non-cleanup-pre-stage suite: 60 of 60 active suites
+  passing, 805 tests.
+- **2026-04-30** — **F3 Pass 3 (ADR-0021): connect-mode for
   Google now forces `prompt=consent` in the authorize URL.** Bug
   reproducer: dashboard "Connect Google" with `mailer.kv@gmail.com`
   (existing identity-only grant) silently re-issued an access_token

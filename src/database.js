@@ -266,7 +266,15 @@ function initDatabase() {
       -- through the OAuth confirm-gesture screen at least once for this
       -- subject and further logins can skip the screen.
       provider_subject TEXT,
-      first_confirmed_at TEXT
+      first_confirmed_at TEXT,
+      -- F3 Pass 4 (ADR-0022): connected_email is the email of the
+      -- provider-side account that GRANTED the service scopes (e.g.
+      -- alice@work.gmail.com when MyApi user alice@personal.gmail.com
+      -- connects Drive using a different Google account). Surfaced
+      -- via /api/v1/oauth/status so the dashboard can render
+      -- "Connected as alice@work.gmail.com" beneath the service card.
+      -- Independent from user_identity_links.email (login identity).
+      connected_email TEXT
     );
 
     CREATE TABLE IF NOT EXISTS oauth_status (
@@ -1085,6 +1093,8 @@ function initDatabase() {
   // Phase 5 migrations: Token encryption key rotation, rate limiting, audit logs
   safeMigration("ALTER TABLE oauth_tokens ADD COLUMN key_version INTEGER DEFAULT 1");
   safeMigration("ALTER TABLE oauth_tokens ADD COLUMN last_api_call TEXT");
+  // F3 Pass 4 (ADR-0022): connected-account email per service grant.
+  safeMigration("ALTER TABLE oauth_tokens ADD COLUMN connected_email TEXT");
   safeMigration("ALTER TABLE audit_log ADD COLUMN service_name TEXT");
   safeMigration("ALTER TABLE audit_log ADD COLUMN api_method TEXT");
   safeMigration("ALTER TABLE audit_log ADD COLUMN api_endpoint TEXT");
@@ -2705,7 +2715,7 @@ function encryptOAuthTokenValue(plainText, keyBytes) {
   return JSON.stringify(payload);
 }
 
-function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expiresAt, scope, providerSubject = null) {
+function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expiresAt, scope, providerSubject = null, connectedEmail = null) {
   const id = 'oauth_' + crypto.randomBytes(16).toString('hex');
   const now = new Date().toISOString();
 
@@ -2733,23 +2743,31 @@ function storeOAuthToken(serviceName, userId, accessToken, refreshToken, expires
   // on subject change" branch has moved to `src/domain/oauth/identity-links.js`.
   // Callers that don't know the subject pass null → COALESCE keeps the
   // stored value.
+  // F3 Pass 4 (ADR-0022): `connected_email` is the email of the granting
+  // provider account (from id_token claim or userinfo response). COALESCE
+  // semantics same as provider_subject — null arg preserves existing value
+  // so a pure refresh that doesn't re-fetch identity doesn't wipe the email.
+  const normalizedConnectedEmail = (typeof connectedEmail === 'string' && connectedEmail.trim())
+    ? connectedEmail.trim().toLowerCase()
+    : null;
   const existing = db.prepare('SELECT id FROM oauth_tokens WHERE service_name = ? AND user_id = ?').get(serviceName, userId);
 
   if (existing) {
     db.prepare(`
       UPDATE oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, scope = ?, updated_at = ?,
-                              provider_subject = COALESCE(?, provider_subject)
+                              provider_subject = COALESCE(?, provider_subject),
+                              connected_email = COALESCE(?, connected_email)
       WHERE service_name = ? AND user_id = ?
-    `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, serviceName, userId);
+    `).run(accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, providerSubject, normalizedConnectedEmail, serviceName, userId);
     return { id: existing.id, serviceName, userId, expiresAt, scope, createdAt: now, updated: true };
   }
 
   const stmt = db.prepare(`
-    INSERT INTO oauth_tokens (id, service_name, user_id, access_token, refresh_token, expires_at, scope, created_at, updated_at, provider_subject)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO oauth_tokens (id, service_name, user_id, access_token, refresh_token, expires_at, scope, created_at, updated_at, provider_subject, connected_email)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  stmt.run(id, serviceName, userId, accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, now, providerSubject);
+  stmt.run(id, serviceName, userId, accessTokenEncrypted, refreshTokenEncrypted, expiresAt, scope, now, now, providerSubject, normalizedConnectedEmail);
 
   return {
     id,
@@ -2888,7 +2906,9 @@ function getOAuthToken(serviceName, userId) {
     scope: row.scope,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    lastApiCall: row.last_api_call  // Phase 5.4: Track last API call
+    lastApiCall: row.last_api_call,  // Phase 5.4: Track last API call
+    providerSubject: row.provider_subject || null,
+    connectedEmail: row.connected_email || null  // F3 Pass 4 (ADR-0022)
   };
 }
 

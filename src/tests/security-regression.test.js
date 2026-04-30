@@ -708,6 +708,56 @@ describe('[F3 Pass 2] REAUTH_REQUIRED envelope + status surface tripwires', () =
     expect(stripped).toMatch(/service\s*===\s*['"]google['"]/);
     expect(stripped).toMatch(/runtimeAuthParams\.prompt\s*=\s*['"]consent['"]/);
   });
+
+  // ----------------------------------------------------------------
+  // F3 Pass 4 (ADR-0022) — connected-account email tripwires
+  //
+  // Behavioural coverage: oauth-connect-account-display.test.js +
+  // oauth-connect-no-email-graceful.test.js. These three statics fire
+  // if a refactor silently drops the column, the API field, or the
+  // callback's email-capture branch — any one of which would regress
+  // the user-visible "Connected as <email>" label without breaking
+  // any behavioural test that doesn't read the dashboard string.
+  // ----------------------------------------------------------------
+
+  test('oauth_tokens schema has connected_email column (F3 Pass 4 / ADR-0022)', () => {
+    const dbSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'database.js'),
+      'utf8'
+    );
+    // The CREATE TABLE statement and the safeMigration row both
+    // mention `connected_email` — require both. (The migration row
+    // is what keeps existing dev DBs working without a wipe.)
+    expect(dbSrc).toMatch(/connected_email\s+TEXT/);
+    expect(dbSrc).toMatch(
+      /safeMigration\(\s*["']ALTER TABLE oauth_tokens ADD COLUMN connected_email TEXT["']\s*\)/
+    );
+  });
+
+  test('storeOAuthToken signature accepts 8 positional args (providerSubject + connectedEmail)', () => {
+    const dbSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'database.js'),
+      'utf8'
+    );
+    // Match the function declaration. We accept any default-value
+    // shape on the trailing two params so a future refactor that
+    // drops the defaults still passes — the only invariant is that
+    // the 7th and 8th positional names exist.
+    expect(dbSrc).toMatch(
+      /function\s+storeOAuthToken\s*\(\s*serviceName\s*,\s*userId\s*,\s*accessToken\s*,\s*refreshToken\s*,\s*expiresAt\s*,\s*scope\s*,\s*providerSubject[^,]*,\s*connectedEmail/
+    );
+  });
+
+  test('/oauth/status response object literal includes connectedEmail', () => {
+    // Strip comments first so the rationale block doesn't count.
+    const stripped = indexSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*\n/g, '\n');
+
+    // The response shape returned per service in /oauth/status now
+    // includes a `connectedEmail` key sourced from `token?.connectedEmail`.
+    expect(stripped).toMatch(/connectedEmail:\s*token\?\.connectedEmail/);
+  });
 });
 
 /**

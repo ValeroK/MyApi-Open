@@ -259,6 +259,19 @@ function ServiceConnectors() {
           <div className="flex-1 min-w-0">
             <span className="ink text-[15px] font-medium">{service.label}</span>
             <div className="text-[11.5px] ink-3 mt-0.5">{service.category_label || service.category || 'Integration'}</div>
+            {/* F3 Pass 4 (ADR-0022): show the provider account that granted
+                the service when present. Service-grant account can differ
+                from the MyApi user's login email (the user can pick a
+                different account on the provider's account picker). */}
+            {isConnected && service.connectedEmail && (
+              <div
+                className="text-[11.5px] ink-3 mt-0.5 truncate"
+                title={`Connected as ${service.connectedEmail}`}
+                data-testid={`connected-email-${service.name}`}
+              >
+                Connected as <span className="ink-2 font-mono">{service.connectedEmail}</span>
+              </div>
+            )}
           </div>
           <Chip tone={st.chip}><StatusDot s={service.status} />{st.label}</Chip>
         </div>

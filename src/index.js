@@ -8904,13 +8904,36 @@ app.get([
       // it here best-effort so the stored oauth_tokens row carries the
       // stable subject identifier — useful for future revocation /
       // identity-linking / audit without requiring a re-call to Google.
-      if (!providerUserId && typeof oauthAdapters[service]?.verifyToken === 'function') {
+      //
+      // F3 Pass 4 (ADR-0022): also extract `connectedEmail` — the email
+      // of the provider account that GRANTED the service (which may
+      // differ from the MyApi user's login email when the user picks a
+      // different account on Google's account picker). For Google we
+      // prefer the id_token `email` claim (signed) and fall back to the
+      // userinfo response. The dashboard surfaces this as
+      // "Connected as alice@work.gmail.com" beneath the service card.
+      let connectedEmail = null;
+      if (typeof oauthAdapters[service]?.verifyToken === 'function') {
         try {
           const profileResp = await oauthAdapters[service].verifyToken(tokenData.accessToken);
           const p = profileResp?.data || {};
-          providerUserId = String(p.id || p.sub || p.user_id || p.login || '').trim() || null;
+          if (!providerUserId) {
+            providerUserId = String(p.id || p.sub || p.user_id || p.login || '').trim() || null;
+          }
+          if (service === 'google' && tokenData?.idToken) {
+            try {
+              const [, payload = ''] = String(tokenData.idToken).split('.');
+              const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+              const idTokenPayload = JSON.parse(Buffer.from(base64, 'base64').toString('utf8')) || {};
+              connectedEmail = String(idTokenPayload.email || p.email || '').trim().toLowerCase() || null;
+            } catch {
+              connectedEmail = String(p.email || '').trim().toLowerCase() || null;
+            }
+          } else {
+            connectedEmail = String(p.email || '').trim().toLowerCase() || null;
+          }
         } catch (verifyErr) {
-          // Non-fatal: we can still store the token without a subject.
+          // Non-fatal: we can still store the token without a subject or email.
           console.warn(`[OAuth Callback] connect-mode verifyToken failed for ${service}:`, verifyErr.message);
         }
       }
@@ -8922,7 +8945,8 @@ app.get([
         tokenData.refreshToken || null,
         expiresAt,
         tokenData.scope,
-        providerUserId || null
+        providerUserId || null,
+        connectedEmail || null
       );
       tokenStoredForUser = true;
       // B10 (2026-04-24 post-F4 hardening): drop any pre-disconnect entry
@@ -9198,6 +9222,12 @@ app.get("/api/v1/oauth/status", async (req, res) => {
       lastSync: status?.lastSyncedAt || null,
       lastApiCall: token?.lastApiCall || null,  // Phase 5.4: Last API call timestamp
       scope: token?.scope || null,
+      // F3 Pass 4 (ADR-0022): email of the provider account that granted
+      // the service scopes. May differ from the MyApi user's login email
+      // when the user picked a different account on the provider's
+      // account picker. Surfaced in /dashboard/services as
+      // "Connected as <email>" beneath the connected service card.
+      connectedEmail: token?.connectedEmail || null,
       enabled: isOAuthServiceEnabled(service),
       auth_type: 'oauth2',  // All services use OAuth 2.0
       auth_type_label: 'OAuth 2.0'
@@ -9322,7 +9352,13 @@ app.post("/api/v1/oauth/confirm", authRateLimit, (req, res) => {
         tokenData.refreshToken || null,
         tokenData.expiresAt || null,
         tokenData.scope || null,
-        providerSubject
+        providerSubject,
+        // F3 Pass 4 (ADR-0022): legacy confirm path forwards the pending
+        // payload's email if present. New connect-mode flows skip this
+        // path entirely and capture email at the callback (see L8918);
+        // this 8-arg shape is required by the source-level tripwire in
+        // src/tests/oauth-state-inventory.test.js regardless of flow.
+        payload.email || null
       );
       // B10 (2026-04-24 post-F4 hardening): invalidate the token cache
       // for this {service,user} so the dashboard's next poll sees the
