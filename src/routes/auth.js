@@ -384,7 +384,7 @@ router.post('/login', authRateLimit, requireCsrfForSession, async (req, res) => 
         secret: user.totpSecret,
         encoding: 'base32',
         token: totpKey,
-        window: 2,
+        window: 4,
       });
       if (!verified) {
         try {

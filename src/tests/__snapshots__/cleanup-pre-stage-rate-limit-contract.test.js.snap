@@ -14,7 +14,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "skip: () => process.env.NODE_ENV === 'test', // Skip in test mode",
       "});",
     ],
-    "line": 2199,
+    "line": 2206,
   },
   {
     "binding": "dashboardSpaRateLimit",
@@ -28,7 +28,7 @@ exports[`[Cleanup pre-stage / G4.1] rate-limit contract inventory: every express
       "message: { error: 'Rate limit exceeded', retryAfterSeconds: 60 },",
       "});",
     ],
-    "line": 2209,
+    "line": 2216,
   },
 ]
 `;

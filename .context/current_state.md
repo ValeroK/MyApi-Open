@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-28** (F6 — Agent capability verification — ✅ Complete. All 8 tasks (F6.0–F6.7) landed in one session: gap-ledger bootstrap, 8 L1 supertest suites, L3 walkthrough script, 4 L2 live-smoke suites, connector spike (ADR-0020 Option C — `src/lib/schemas/connector-spec.js` + handler wiring), gap-ledger triage with follow-up briefs F8 / F9 / F10. Closed GAP-002 P0 in the same change as the test that surfaced it. Test baseline 55 / 56 / 767 → **64 / 69 / 855** (+9 suites, +88 tests, 5 L2 suites correctly skip when env unset, 28 / 28 snapshots stable, exit 0). Earlier 2026-04-27: M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md §6.3.)
+> - Last updated: **2026-04-30** (Tactical fix: TOTP verify window widened from `window: 2` (±60 s) → `window: 4` (±120 s) at every verify call site in `src/index.js` and `src/routes/auth.js`; `TOTP_CODE_TTL_MS` raised 90 s → 270 s in `src/lib/authHardening.js` to cover the wider validity span. Real-incident driver: `mailer.kv@gmail.com` enrolment failed against a freshly-wiped DB and freshly-scanned QR; live `verifyDelta` against the running container proved the user's phone was running exactly +120 s ahead of server (Android NTP drift), outside the old ±60 s window. New source-pin test `src/tests/totp-window-tolerance.test.js` (6 tests: 3 behavioural ±90 s / +150 s assertions on `/auth/login` totpCode + 3 source-pins on every verify block + the replay TTL constant). Test baseline 66 / 71 / 870 → **67 / 72 / 876** (+1 suite, +6 tests, no regressions, 28/28 snapshots stable, exit 0, 61 s on Windows). Decision recorded in ADR-0022. Earlier 2026-04-29: 2FA challenge per-IP rate-limit cap raised from 3/min → 10/min in `src/index.js` (`twoFactorRateLimit`). Original BUG-15 cap of 3/min locked legitimate users out after a single double-submit + one mistyped TOTP code; 10/min keeps brute-force protection intact (≈14 days for 50% probability against the 1M-code TOTP space, and the 30s code rotation is the binding control anyway) while giving real users headroom for honest typos. Source-pinned to band [10, 30] in `src/tests/2fa-rate-limit-cap.test.js` (4 tests). G4.1 + G0.3 snapshots regenerated for the +7-line comment-block drift (content-stable, line-only). Test baseline 64 / 69 / 855 → **66 / 71 / 870** (+1 suite, +4 tests; 5 skipped suites unchanged, 28 / 28 snapshots stable, exit 0). 2026-04-28: F6 — Agent capability verification — ✅ Complete. All 8 tasks (F6.0–F6.7) landed in one session: gap-ledger bootstrap, 8 L1 supertest suites, L3 walkthrough script, 4 L2 live-smoke suites, connector spike (ADR-0020 Option C — `src/lib/schemas/connector-spec.js` + handler wiring), gap-ledger triage with follow-up briefs F8 / F9 / F10. Closed GAP-002 P0 in the same change as the test that surfaced it. Test baseline 55 / 56 / 767 → **64 / 69 / 855** (+9 suites, +88 tests, 5 L2 suites correctly skip when env unset, 28 / 28 snapshots stable, exit 0). Earlier 2026-04-27: M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md §6.3.)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -24,7 +24,7 @@ is subordinate.
 
 | Gate | Today | Blocking? | Notes |
 |------|-------|-----------|-------|
-| `npm test` | **64 / 69 suites, 855 pass / 42 skip, 28 / 28 snapshots, exit 0** (~64 s locally with `--forceExit` on Windows; **F6 ✅ Complete** 2026-04-28 — added 8 new behavioral L1 suites (+88 tests across L1) plus 4 L2 live-smoke suites that skip silently when `SMOKE_URL` etc. are unset (5 skipped suites total: 4 F6 + the existing `oauth-authorize-url-live-smoke`); F6 connector spike added 7 more tests + 1 schema module (`src/lib/schemas/connector-spec.js`); G0.3 snapshot regenerated twice in same change set for legitimate line-number drift (GAP-002 fix + connector validator wiring); L1 suites included: `google-mount-auth-posture` (closes GAP-002 P0; regenerates G0.1 / G0.2 / G0.3 snapshots in same change), `agent-discovery-contract`, `services-proxy-behavioral` (surfaces GAP-008 + GAP-009; static SSRF resilience gate), `services-execute-behavioral` (surfaces GAP-010), `ask-endpoint-behavioral`, `handshake-flow-behavioral` (surfaces GAP-011; pins GAP-005), `connectors-master-only`, `agent-capabilities-end-to-end`. Pre-F6.1 baseline was 55 / 56 / 767. Earlier 2026-04-27: M4-T4.8 G4.3 expanded from 6 → 41 tests, G0.2 / G0.3 / G4.1 snapshots updated for `trust proxy: 1 → ['loopback']` + 7-line drift; pre-stage gate G4.3 originally added 6 tests + 1 snapshot earlier the same day, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite, +15 tests from the M4 pre-stage gates G4.1–G4.2, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression`) | **Hard gate** | Do not merge anything that reduces this count. |
+| `npm test` | **67 / 72 suites, 876 pass / 42 skip, 28 / 28 snapshots, exit 0** (~61 s locally with `--forceExit` on Windows; 2026-04-30: TOTP verify window widened ±60 s → ±120 s at every verify call site (`src/index.js` 4 sites + `src/routes/auth.js` 1 site) + `TOTP_CODE_TTL_MS` 90 s → 270 s in `src/lib/authHardening.js`; new source-pin suite `src/tests/totp-window-tolerance.test.js` (+1 suite / +6 tests). Decision in ADR-0022. Pre-fix baseline was 66 / 71 / 870. Earlier 2026-04-29: 2FA challenge cap raised 3 → 10/min/IP, source-pinned in new `src/tests/2fa-rate-limit-cap.test.js` (+1 suite / +4 tests); G4.1 + G0.3 snapshots regenerated for content-stable +7-line comment drift; pre-fix baseline was 64 / 69 / 855. Earlier 2026-04-28: **F6 ✅ Complete** — added 8 new behavioral L1 suites (+88 tests across L1) plus 4 L2 live-smoke suites that skip silently when `SMOKE_URL` etc. are unset (5 skipped suites total: 4 F6 + the existing `oauth-authorize-url-live-smoke`); F6 connector spike added 7 more tests + 1 schema module (`src/lib/schemas/connector-spec.js`); G0.3 snapshot regenerated twice in same change set for legitimate line-number drift (GAP-002 fix + connector validator wiring); L1 suites included: `google-mount-auth-posture` (closes GAP-002 P0; regenerates G0.1 / G0.2 / G0.3 snapshots in same change), `agent-discovery-contract`, `services-proxy-behavioral` (surfaces GAP-008 + GAP-009; static SSRF resilience gate), `services-execute-behavioral` (surfaces GAP-010), `ask-endpoint-behavioral`, `handshake-flow-behavioral` (surfaces GAP-011; pins GAP-005), `connectors-master-only`, `agent-capabilities-end-to-end`. Pre-F6.1 baseline was 55 / 56 / 767. Earlier 2026-04-27: M4-T4.8 G4.3 expanded from 6 → 41 tests, G0.2 / G0.3 / G4.1 snapshots updated for `trust proxy: 1 → ['loopback']` + 7-line drift; pre-stage gate G4.3 originally added 6 tests + 1 snapshot earlier the same day, M4-T4.6 deleted 2 legacy snapshots + added 1 new + added 1 negative-assertion test on 2026-04-27, +23 tests from M4-T4.5 RateLimitStore contract suite, +20 tests from M4-T4.1 + T4.2 SessionStore contract suite, +15 tests from the M4 pre-stage gates G4.1–G4.2, +30 tests from the Stage-0 cleanup gates G0.1–G0.6 — see ADR-0019; F4 added the `oauth-identity-service-separation` suite [22 tests] + 7 static tripwires in `security-regression`) | **Hard gate** | Do not merge anything that reduces this count. |
 | `npm audit --audit-level=high` | clean (ADR-0008) | **Hard gate** | Per ADR-0008, blocks at HIGH+. |
 | `npm run lint:backend` | 243 problems (112 errors / 131 warnings) | Report-only (ADR-0012) | Ratchet-only: don't grow on files you touched. |
 | `npm run typecheck` | 739 `error TS*` under strict `checkJs` | Report-only (ADR-0012) | Drops as legacy JS converts to TS (M7). |
@@ -76,7 +76,154 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-28 (latest)** — **F6 ✅ Complete — Agent capability
+- **2026-04-30 (latest)** — **TOTP verify window widened from
+  `window: 2` (±60 s) → `window: 4` (±120 s) at every verify call
+  site, and replay-tracker TTL raised 90 s → 270 s.** Real-incident
+  driver, second day in a row of `mailer.kv@gmail.com` 2FA
+  enrolment failures: after the 2026-04-29 ops fix didn't stick,
+  the operator wiped `data/myapi.db` clean (5 files: `myapi.db`,
+  `-wal`, `-shm`, `sessions.sqlite`, `.db_integrity`), restarted
+  the container, re-signed up via Google, scanned a fresh QR, and
+  still hit `Invalid 2FA code` on every verify attempt. Live
+  instrumentation against the running container (read in-process
+  via a second `better-sqlite3` connection inside the container so
+  WAL writes from the live app process are visible — host-side
+  reads get masked by the container's open WAL on Windows Docker
+  bind mounts) proved the failure was not a server bug:
+  `speakeasy.totp.verifyDelta({ secret, encoding: 'base32',
+  token: '910278', window: 10 })` returned `{ delta: +4 }` — the
+  user's phone TOTP step was exactly +120 s ahead of server. The
+  previous `window: 2` only accepts ±60 s, so every honest code
+  was rejected at the verifier despite QR generation,
+  secret storage, container clock, session auth, and account
+  routing all being verified correct under direct probe. Operator
+  judgement call: bump tolerance to `window: 4` rather than make
+  the user run "Time correction for codes" (which they had already
+  done — the drift re-acquired the same +120 s, consistent with
+  cheap Android NTP). **Code changes:** 4 sites in `src/index.js`
+  (`/auth/2fa/verify`, `/auth/2fa/disable`, `/auth/2fa/challenge`,
+  `/admin/security/rotate-key`) + 1 site in `src/routes/auth.js`
+  (`POST /auth/login` 2FA gate) flipped from `window: 2` → `window:
+  4`; `TOTP_CODE_TTL_MS` in `src/lib/authHardening.js` raised
+  `90_000` → `270_000` because the verifier's validity span at
+  `window: 4` is 240 s and the replay-tracker TTL must cover it
+  (with a 30 s buffer for clock skew between the verify call and
+  the replay-mark write); the inline comment block updated to
+  point at the new source-pin test. **Decision rationale + brute-
+  force math + revisit trigger** are recorded in
+  `.context/decisions/ADR-0022-totp-window-tolerance.md`. **Test-
+  first discipline:** new `src/tests/totp-window-tolerance.test.js`
+  (6 tests, written red-first against the pre-fix tree — 5 fail /
+  1 pass — then flipped green by the bumps): three behavioural
+  assertions against `POST /api/v1/auth/login` with `totpCode`
+  generated at `±90 s` (accepted) and `+150 s` (rejected); two
+  source-pins that fail the build if any future edit silently
+  re-tightens the window in either `src/index.js` or
+  `src/routes/auth.js`; one source-pin on `TOTP_CODE_TTL_MS >=
+  240_000` so the replay-tracker TTL can never silently drop
+  below the verifier's validity span. **No `.context/`
+  follow-up required** beyond this entry + the ADR — F11 (the
+  master-only `POST /api/v1/admin/users/:id/2fa/reset` endpoint)
+  remains the right next step for the operator-side recovery
+  story; this fix closes the *enrolment-side* failure mode but
+  not the *post-enrolment-loss* failure mode. Test baseline:
+  66 / 71 / 870 → **67 / 72 / 876** (+1 suite, +6 tests, no
+  regressions, 28 / 28 snapshots stable, exit 0, 61 s on Windows
+  with `--forceExit`).
+- **2026-04-29** — **2FA challenge per-IP rate-limit cap
+  raised from 3/min → 10/min** (`twoFactorRateLimit` in
+  `src/index.js:2195-2204`). Direct follow-up to today's earlier
+  ops-fix entry below (`mailer.kv@gmail.com` failing
+  `/auth/2fa/challenge` six times in a row before the operator
+  manually nulled their TOTP secret): part of the reason that
+  user got stuck was BUG-15's 3-attempts-per-minute-per-IP cap,
+  which kicked in after a single dashboard double-submit + two
+  fat-fingered TOTP codes and bounced every subsequent attempt
+  with a generic `429 Rate limit exceeded` for the rest of the
+  60s window. 3/min was hostile to legitimate users. Brute-force
+  math against the 6-digit TOTP space (1M codes, speakeasy
+  `window: 2` ≈ 5 codes per submission) tolerates 10/min with
+  no meaningful security loss — at 10/min it still takes ~14
+  days to hit 50% probability against the keyspace, and the
+  binding control is the 30s code rotation + per-user replay
+  guard in `src/lib/authHardening.js`, not the per-minute cap.
+  Test-first discipline: new `src/tests/2fa-rate-limit-cap.test.js`
+  (4 tests, written red-first against the `3` literal — 1 fail
+  / 3 pass — then flipped green by the bump) source-pins the
+  production cap to the band **[10, 30]** so a future edit can
+  neither silently re-introduce the UX bug (cap < 10) nor
+  silently weaken the brute-force ratchet (cap > 30) without
+  breaking the gate. Also pins the `'2fa-attempts'` namespace
+  (so the limiter can't quietly collapse into the broader
+  `authRateLimit` bucket) and the `app.post('/api/v1/auth/2fa/-
+  challenge', twoFactorRateLimit, …)` wiring (so the route
+  can't be silently un-throttled). The inline comment block
+  grew 1 line → 8 lines explaining the trade-off + linking the
+  new test, which caused content-stable +7-line drift in two
+  pre-stage gate snapshots (`cleanup-pre-stage-rate-limit-
+  contract.test.js` G4.1 + `cleanup-pre-stage-boot-side-
+  effects-inventory.test.js` G0.3 — the latter twice for the
+  timer-registration line list and the orphan-timer ratchet);
+  all three regenerated in the same change per ADR-0019. **No
+  ADR opened** — this is a security-control tuning fix, not a
+  new architectural decision, and the design rationale lives
+  in the suite header + the source comment. **No code change
+  outside `src/index.js:2195-2204`.** Test baseline: 64 / 69 /
+  855 → **66 / 71 / 870** (+1 suite, +4 tests; 5 skipped suites
+  unchanged, 28 / 28 snapshots stable, exit 0). Does NOT close
+  F11 — that brief still tracks the master-only "Reset 2FA"
+  endpoint + the defensive `409 ALREADY_ENROLLED` guard on
+  `/auth/2fa/setup`, both of which remain unaddressed.
+- **2026-04-29** — **Ops fix: reset 2FA for `mailer.kv@gmail.com`
+  + filed F11 backlog brief.** User was failing
+  `/auth/2fa/challenge` six times in a row today (last successful
+  challenge was 2026-04-28T08:24Z). Diagnosis: not a code
+  regression — F5.1 (2026-04-25) is the only commit that reworked
+  2FA and it only touched the password-login path; the OAuth-side
+  challenge handler at `src/index.js:7445` (which is where the user
+  actually lives, since they sign in via Google) has been
+  byte-stable through F6. Most likely root cause: phone-side
+  authenticator entry drift — the audit log shows two
+  `2fa_setup_started` rows ~45 s apart on 2026-04-25, and
+  `/auth/2fa/setup` (`src/index.js:7314`) silently overwrites
+  `users.totp_secret` on every call, so a user who scans QR #1 and
+  then accidentally re-loads setup ends up with QR #2 in the DB.
+  Operator fix: direct SQL update of the user row
+  (`two_factor_enabled = 0, totp_secret = NULL`). **Second-step
+  finding:** prompt was still showing post-reset because two stale
+  rows in `data/sessions.sqlite` carried a frozen
+  `pending_2fa_user.twoFactorEnabled: true` snapshot from the
+  OAuth callback's session stash (`src/index.js:8708`). DB write
+  alone does not clear that — `/auth/2fa/challenge` rechecks the
+  live DB and returns `400 "2FA is not enabled for this account"`,
+  but the SPA keeps showing the prompt. Cleared the stale rows.
+  **Third-step finding (the real root cause):** even after the
+  host DB write AND the session-clear, fresh OAuth callbacks
+  continued to route through `pending_2fa`. Diagnosis: the
+  running `myapi-smoke` container holds `myapi.db-wal` and
+  `myapi.db-shm` open inside the container, **invisible to the
+  host's `ls`** (Windows Docker bind-mount semantics). The
+  host-side `UPDATE` landed in the base file but was masked by
+  the container's WAL-shadowed snapshot view, so `getUsers()`
+  inside the container kept returning `twoFactorEnabled: true`.
+  `docker restart myapi-smoke` checkpointed the WAL and reopened
+  the base file; verified by tailing the container log — first
+  post-restart OAuth callback at `2026-04-29T16:11:42Z` logged
+  `routing=fast_path_returning` instead of `routing=pending_2fa`.
+  **F11 brief updated** with two non-negotiable requirements
+  derived from this incident: (a) the admin endpoint must scrub
+  sessions in the same call, and (b) it must execute through
+  the app's running DB connection (host-side / sidecar SQL is
+  silently masked by the container's open WAL). User re-enrolls
+  cleanly via Settings on next login. **No code change.** Filed
+  `.context/tasks/backlog/F11-2fa-reset-mechanism.md` so the next
+  occurrence does not require hand-editing SQLite — scope is a
+  master-only `POST /api/v1/admin/users/:id/2fa/reset` endpoint, a
+  dashboard "Reset 2FA" affordance for operators, plus a defensive
+  `409 ALREADY_ENROLLED` guard on `/auth/2fa/setup` so a re-run
+  cannot silently rotate the live secret. Global progress
+  136 → 137; F11 row at 0/1.
+- **2026-04-28** — **F6 ✅ Complete — Agent capability
   verification.** All 8 tasks (F6.0–F6.7) landed in one session,
   +88 passing tests, 5 new live-smoke suites (gated, silent in
   `npm test`), one new schema module + handler wiring in
@@ -1610,6 +1757,14 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
     wrap-up stubbed the missing `onboardingUtils.js` exports as
     localStorage-backed no-ops to unblock the SPA build. Either
     ship the wizard properly or retire it. Bundles with M9.
+  - **`F11`** (filed 2026-04-29) — operator-driven 2FA reset
+    surface. Today the only recovery path is hand-editing
+    `users.totp_secret = NULL, two_factor_enabled = 0` in SQLite
+    (we did this once for `mailer.kv@gmail.com`). F11 ships a
+    master-only `POST /api/v1/admin/users/:id/2fa/reset`, a
+    dashboard button, and a `409 ALREADY_ENROLLED` guard on
+    `/auth/2fa/setup` so a re-run cannot silently rotate the
+    secret. Effort: S (half a day to one day).
 - **After F3/M3 wrap-up:** next-up is **M4** (section above).
 - **Recently closed:** **M3 complete.** All ten tasks (T3.0–T3.9)
   + the wrap-up commit + the live Google smoke. Previous

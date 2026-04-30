@@ -64,6 +64,7 @@ backups/
 # Throwaway test/debug scripts
 test-db-query.js
 test-*.js
+*-tmp.js
 
 # SSL certificates (sensitive)
 certs/

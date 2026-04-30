@@ -178,12 +178,16 @@ function revokeAllUserSessions(userId, options = {}) {
 // ────────────────────────────────────────────────────────────────────
 // TOTP replay protection (issue #17)
 //
-// TTL = 90s covers speakeasy window:2 (±60s) with a small buffer so
-// codes cannot be replayed within their validity window across parallel
-// login + step-up-auth flows.
+// TTL must cover the verifier's full validity span so a code cannot be
+// replayed within its acceptance window across parallel login +
+// step-up-auth flows. The verify call sites use `speakeasy.totp.verify
+// ({ window: 4 })` (= ±120 s, total span 240 s), so the TTL is set to
+// 270 s (240 s span + 30 s buffer for clock skew between the verify
+// call and the replay-mark write). See
+// `src/tests/totp-window-tolerance.test.js` for the source-pin.
 // ────────────────────────────────────────────────────────────────────
 const usedTotpCodes = new Map(); // `${userId}:${code}` → expiresAt
-const TOTP_CODE_TTL_MS = 90_000;
+const TOTP_CODE_TTL_MS = 270_000;
 
 function isTotpCodeUsed(userId, code) {
   const key = `${userId}:${code}`;

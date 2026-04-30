@@ -214,6 +214,31 @@ test lands they all carry `evidence` pointing at the static read of
   single-owner behavior with an explicit comment so it is not mistaken
   for "intended" once M6 opens.
 - **Status.** `open`
+- **Notes — 2026-04-30 incident, second concrete repro of the same
+  literal.** When `mailer.kv@gmail.com` had no active session (their
+  session row had been over-deleted during the 2026-04-29 2FA-reset
+  ops fix), the dashboard fell back to
+  `Authorization: Bearer <master-token>` whose `owner_id` is the
+  seeded literal `'owner'`. `authenticate` at `src/index.js:2581-2586`
+  deliberately does NOT populate `req.user` when
+  `matched.ownerId === 'owner'`, so every self-service endpoint that
+  does `userId = req?.user?.id || req?.tokenMeta?.ownerId` resolved
+  to `'owner'`. The user clicked **Settings → Enable 2FA**;
+  `setUserTotpSecret('owner', 'LVITE43MMUQSC...')` wrote the user's
+  TOTP secret onto a row no other code path treats as a real user
+  (no email, no OAuth links, no per-user features). Their actual
+  `mailer.kv@gmail.com` row stayed at `totp_secret = NULL,
+  two_factor_enabled = 0` — so even a successful verify would have
+  protected nothing. The 2FA setup / verify / disable / status
+  endpoints in `src/index.js:7302 / 7338 / 7388 / 7436` should
+  refuse master-token auth with `403
+  MASTER_TOKEN_NOT_ALLOWED_FOR_SELF_SERVICE` until M6 fixes the
+  underlying `'owner'` literal, OR the same M6 pass plumbs the
+  bearer master-token's actual operator user row through. Both
+  options recorded in the F11 brief §"In scope" #4. **Until the
+  fix lands, the runbook is: log out → log in via Google →
+  Settings → 2FA setup, never via `Authorization: Bearer
+  <master-token>`.**
 
 ### GAP-006 — `/api/v1/services/available` and `/categories` require auth but no scope
 

@@ -2192,8 +2192,15 @@ const planFeatureRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 
 // the many inline route handlers below keep referencing `authRateLimit`.
 const authRateLimit = authRateLimitShared;
 
-// BUG-15: Stricter rate limit for 2FA/TOTP attempts (3 attempts per minute to prevent brute force)
-const twoFactorRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 1000 : 3, '2fa-attempts');
+// BUG-15 (raised 2026-04-29): per-IP rate limit on the 2FA challenge endpoint.
+// Original cap was 3/min/IP, which locked out legitimate users after a single
+// dashboard double-submit + one fat-fingered TOTP code. 10/min still blunts
+// brute force against a 6-digit TOTP space (≈14 days for 50% probability,
+// which is meaningless given the 30s code rotation) while giving real users
+// enough headroom for honest typos. Source-pinned in
+// `src/tests/2fa-rate-limit-cap.test.js` to the band [10, 30] so future edits
+// can't silently re-introduce the UX bug or weaken the cap unbounded.
+const twoFactorRateLimit = rateLimit(60000, process.env.NODE_ENV === 'test' ? 1000 : 10, '2fa-attempts');
 
 // Rate limit for billing usage endpoint (DB access + authorization)
 const billingUsageRateLimit = expressRateLimit({
@@ -7349,7 +7356,7 @@ app.post('/api/v1/auth/2fa/verify', authenticate, (req, res) => {
       secret: state.totpSecret,
       encoding: 'base32',
       token: String(code).replace(/\s+/g, ''),
-      window: 2,
+      window: 4,
     });
 
     if (!verified) return res.status(400).json({ error: 'Invalid 2FA code (check phone time sync and try current code)' });
@@ -7399,7 +7406,7 @@ app.post('/api/v1/auth/2fa/disable', authenticate, (req, res) => {
       secret: state.totpSecret,
       encoding: 'base32',
       token: String(code).replace(/\s+/g, ''),
-      window: 2,
+      window: 4,
     });
 
     if (!verified) return res.status(400).json({ error: 'Invalid 2FA code' });
@@ -7469,7 +7476,7 @@ app.post('/api/v1/auth/2fa/challenge', twoFactorRateLimit, (req, res) => {
       secret: state.totpSecret,
       encoding: 'base32',
       token: String(code).replace(/\s+/g, ''),
-      window: 2,
+      window: 4,
     });
     if (!verified) {
       // Log failed 2FA attempt for security auditing
@@ -8362,6 +8369,30 @@ app.get("/api/v1/oauth/authorize/:service", async (req, res) => {
         runtimeAuthParams.prompt = null;
         runtimeAuthParams.max_age = null;
       }
+    }
+
+    // F3 Pass 3 (ADR-0021): connect-mode for Google MUST request
+    // `prompt=consent` so Google issues a refresh_token. Without it,
+    // Google's incremental-authorization path (paired with F4's
+    // `include_granted_scopes=true`) silently re-issues an access_token
+    // with NO refresh_token for users who already granted these scopes
+    // — Google's documented policy is "refresh_token only on consent
+    // shown." The stored row ends up with `refresh_token IS NULL`,
+    // expires in ~1h, and flips to REAUTH_REQUIRED on the next API
+    // call; every "Reconnect" then re-produces the same broken row.
+    //
+    // Pass 2 deliberately suppressed re-consent for LOGIN-mode (returning
+    // users shouldn't be re-consented for an identity-only sign-in).
+    // CONNECT-mode is the inverse — it's the moment we're asking for
+    // long-lived offline access, and consent is the price of admission.
+    //
+    // This block sits AFTER the explicitForcePrompt nullification so it
+    // wins regardless of `forcePrompt` (the dashboard "Connect Google"
+    // button always sends `forcePrompt=0`). Adapter default stays
+    // `select_account` (safe-by-default at the adapter, escalation at
+    // the call site — preserving the ADR-0017 boundary).
+    if (mode === 'connect' && service === 'google') {
+      runtimeAuthParams.prompt = 'consent';
     }
 
     if (['twitter', 'airtable', 'canva'].includes(service)) {
@@ -9607,7 +9638,7 @@ app.post('/api/v1/admin/security/rotate-key', authenticate, adminOnly, async (re
           secret: owner.totpSecret,
           encoding: 'base32',
           token: String(totpCode).replace(/\s+/g, ''),
-          window: 2,
+          window: 4,
         });
         if (!verified) {
           createAuditLog({
