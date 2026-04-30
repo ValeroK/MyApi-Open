@@ -76,7 +76,40 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
-- **2026-04-30 (latest)** — **TOTP verify window widened from
+- **2026-04-30 (latest)** — **F3 Pass 3 (ADR-0021): connect-mode for
+  Google now forces `prompt=consent` in the authorize URL.** Bug
+  reproducer: dashboard "Connect Google" with `mailer.kv@gmail.com`
+  (existing identity-only grant) silently re-issued an access_token
+  *without* a refresh_token because (a) the F3 Pass 2 adapter default
+  is `select_account`, (b) the `explicitForcePrompt=false` branch in
+  `src/index.js` NULLs the prompt for `forcePrompt=0`, (c) F4
+  added `include_granted_scopes=true` for connect-mode. Combined,
+  the URL went out with no `prompt=`, no consent screen rendered,
+  and Google's policy ("refresh_token only on consent shown") meant
+  the row landed with `refresh_token IS NULL` → ~1h fuse to
+  `REAUTH_REQUIRED` → every reconnect re-produced the same broken
+  row. **Fix:** `src/index.js` authorize handler now appends
+  `runtimeAuthParams.prompt = 'consent'` for
+  `mode === 'connect' && service === 'google'`, after the
+  explicitForcePrompt nullification block (so it wins regardless of
+  `forcePrompt`). Adapter default stays `select_account` — policy
+  at the call site, preserving the ADR-0017 boundary. Login/signup
+  modes are untouched, so the F3 Pass 1 + Pass 2 login UX win is
+  preserved end-to-end. Test coverage: +3 behavioural tests in
+  `src/tests/oauth-security-hardening.test.js` (HTTP authorize URL
+  emits `prompt=consent` regardless of `forcePrompt`, plus a
+  cross-cutting "complete connect-mode contract" test asserting the
+  four properties — prompt + access_type + include_granted_scopes +
+  full service scope set — together), +1 static tripwire in
+  `src/tests/security-regression.test.js`, +1 flip in
+  `src/tests/oauth-authorize-url-live-smoke.test.js`. 13 OAuth-
+  related suites green post-fix: **220 passing, 8 skipped**.
+  Behavioural baseline for the targeted bundle (3 suites:
+  `oauth-security-hardening` + `security-regression` +
+  `oauth-identity-service-separation`): 82 → **85 passing** (+3),
+  same 8 skipped, exit 0. ADR-0021 supersedes the connect-mode arm
+  of ADR-0017 (login/signup arm of ADR-0017 stands).
+- **2026-04-30** — **TOTP verify window widened from
   `window: 2` (±60 s) → `window: 4` (±120 s) at every verify call
   site, and replay-tracker TTL raised 90 s → 270 s.** Real-incident
   driver, second day in a row of `mailer.kv@gmail.com` 2FA

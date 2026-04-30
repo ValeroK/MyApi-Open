@@ -106,31 +106,95 @@ describe('OAuth security hardening', () => {
     expect(authUrl.searchParams.get('max_age')).toBeNull();
   });
 
-  test('google connect mode emits prompt=select_account via adapter default (F3 Pass 2)', async () => {
-    // F3 Pass 2 flipped `google-adapter.js` default from `prompt: 'consent'`
-    // to `prompt: 'select_account'`. Connect mode (user clicks "Connect
-    // Google" from the Services page) doesn't set any runtime prompt
-    // override, so it falls through to the adapter default. Before Pass 2
-    // this was `consent` on every single connect click; after Pass 2 it's
-    // `select_account`, which gives the user an account picker instead of
-    // a full scope-approval screen. The consent screen still appears
-    // naturally when Google has no existing grant for this client+user
-    // (the correct threat model — fresh grant or revoked grant needs
-    // explicit scope approval).
+  test('google connect mode forces prompt=consent at the HTTP handler (F3 Pass 3 / ADR-0021)', async () => {
+    // F3 Pass 3 (ADR-0021) supersedes the connect-mode arm of ADR-0017.
     //
-    // The `invalid_grant` recovery path (F3 Pass 2 Item B, `refreshOAuthToken`
-    // nulling the dead refresh_token) is the OTHER way consent legitimately
-    // re-surfaces: after a grant revocation on Google's side, the next
-    // re-authorize attempt will see `prompt=select_account` from us but
-    // Google itself will escalate to consent because it has no active grant.
+    // The Google adapter default is still `prompt=select_account` (safe-by-
+    // default at the adapter, see ADR-0017 boundary). What changed is the
+    // HTTP authorize handler in `src/index.js`: when `mode=connect` AND
+    // `service=google`, it OVERRIDES the adapter default with `prompt=consent`.
+    //
+    // Why: pre-Pass-3, connect-mode produced a quiet authorize URL — no
+    // `prompt=` param, plus `include_granted_scopes=true` from F4. For a
+    // user who had already granted these scopes, Google's incremental-
+    // authorization path silently re-issued an access_token WITHOUT a
+    // refresh_token (Google policy: refresh_token only on consent shown).
+    // Result: `oauth_tokens` row stored with `refresh_token IS NULL`, ~1h
+    // fuse to REAUTH_REQUIRED, and every reconnect attempt re-produced
+    // the same broken row. Connect-mode is the moment the user is granting
+    // long-lived offline access; consent screen is the right UX AND the
+    // technical requirement for Google to issue a refresh_token.
+    //
+    // Pairs with the "complete connect-mode contract" test below, which
+    // asserts the four properties (prompt, access_type, include_granted_scopes,
+    // scope set) together.
     const res = await request(app)
       .get('/api/v1/oauth/authorize/google?mode=connect&json=1');
 
     expect(res.status).toBe(200);
     const authUrl = new URL(res.body.authUrl);
     expect(authUrl.hostname).toBe('accounts.google.com');
-    expect(authUrl.searchParams.get('prompt')).toBe('select_account');
+    expect(authUrl.searchParams.get('prompt')).toBe('consent');
     expect(authUrl.searchParams.get('max_age')).toBeNull();
+  });
+
+  test('google connect mode (frontend forcePrompt=0) STILL forces prompt=consent (F3 Pass 3 / ADR-0021)', async () => {
+    // The dashboard "Connect Google" button calls
+    // `startOAuthFlow('google', { mode: 'connect' })` which sends
+    // `forcePrompt=0` on the wire (see src/public/dashboard-app/src/utils/
+    // oauth.js). Pre-Pass-3, the `explicitForcePrompt === false` branch in
+    // `src/index.js` would NULL `runtimeAuthParams.prompt` for Google,
+    // suppressing even the adapter's `select_account` default — so the
+    // outbound URL had no prompt at all.
+    //
+    // Pass 3's override block sits AFTER the explicitForcePrompt
+    // nullification block, so it wins regardless of what forcePrompt is.
+    // Connect-mode = consent, period.
+    const res = await request(app)
+      .get('/api/v1/oauth/authorize/google?mode=connect&forcePrompt=0&json=1');
+
+    expect(res.status).toBe(200);
+    const authUrl = new URL(res.body.authUrl);
+    expect(authUrl.searchParams.get('prompt')).toBe('consent');
+  });
+
+  test('google connect-mode complete URL contract (F3 Pass 3 / ADR-0021 / F4)', async () => {
+    // Cross-cutting assertion: the four properties that together define a
+    // healthy Google connect-mode authorize URL. Each is owned by a
+    // different layer; this test fails loudly if a refactor drops any one.
+    //
+    //   1. `prompt=consent`        — F3 Pass 3 / ADR-0021. Without it,
+    //                                Google won't issue a refresh_token
+    //                                for an existing grant.
+    //   2. `access_type=offline`   — ADR-0018 / F4. Asks Google for a
+    //                                refresh_token in the first place.
+    //   3. `include_granted_scopes=true` — F4 follow-up. Lets users
+    //                                upgrade scopes without a "approve
+    //                                everything from scratch" screen.
+    //   4. service scopes present  — Drive/Gmail/Calendar are the actual
+    //                                grants connect-mode is asking for;
+    //                                identity scopes (openid email profile)
+    //                                ride along for `provider_subject`.
+    //
+    // (1) without (2) gives no refresh_token. (2) without (1) silently
+    // omits the refresh_token (the actual bug). (3) without (1) is the
+    // F3-Pass-2 + F4 bad state. All four together are the contract.
+    const res = await request(app)
+      .get('/api/v1/oauth/authorize/google?mode=connect&forcePrompt=0&json=1');
+
+    expect(res.status).toBe(200);
+    const authUrl = new URL(res.body.authUrl);
+    expect(authUrl.searchParams.get('prompt')).toBe('consent');
+    expect(authUrl.searchParams.get('access_type')).toBe('offline');
+    expect(authUrl.searchParams.get('include_granted_scopes')).toBe('true');
+
+    const scope = authUrl.searchParams.get('scope') || '';
+    expect(scope).toMatch(/openid/);
+    expect(scope).toMatch(/email/);
+    expect(scope).toMatch(/profile/);
+    expect(scope).toMatch(/gmail\.modify/);
+    expect(scope).toMatch(/calendar\.readonly/);
+    expect(scope).toMatch(/drive\.file/);
   });
 
   test('GoogleAdapter default getAuthorizationUrl emits prompt=select_account (F3 Pass 2, defence-in-depth)', () => {

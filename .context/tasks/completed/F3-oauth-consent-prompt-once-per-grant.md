@@ -16,15 +16,58 @@
 
 ## Status
 
-- **State.** **Pass 1 + Pass 2 landed on main (2026-04-24)**. F3 is now
-  ✅ **Complete**. Pass 1 = `959059c` (drop `max_age=0` + unit +
-  live-smoke coverage). Pass 2 = atomic commit shipping the adapter
-  default flip, `invalid_grant` recovery, `REAUTH_REQUIRED` envelope,
-  dashboard banner, and ADR-0017.
+- **State.** **Pass 1 + Pass 2 landed on main (2026-04-24); Pass 3 landed
+  on main (2026-04-30)**. F3 is now ✅ **Complete (re-closed).** Pass 1 =
+  `959059c` (drop `max_age=0` + unit + live-smoke coverage). Pass 2 =
+  atomic commit shipping the adapter default flip, `invalid_grant`
+  recovery, `REAUTH_REQUIRED` envelope, dashboard banner, and ADR-0017.
+  **Pass 3 = connect-mode forces `prompt=consent` to guarantee Google
+  issues a refresh_token (ADR-0021).** Surfaced 2026-04-30 by
+  `mailer.kv@gmail.com` reproducer: the dashboard "Connect Google"
+  button silently re-issued an access_token without a refresh_token,
+  putting the row on a ~1h fuse to `REAUTH_REQUIRED`.
 - **Assignee.** anyone
 - **Started.** 2026-04-24.
 - **Target done.** Same week.
-- **Actually done.** 2026-04-24.
+- **Actually done.** Pass 1 + Pass 2: 2026-04-24. Pass 3: 2026-04-30.
+
+### Pass 3 (landed 2026-04-30, ADR-0021)
+
+- **Bug.** Connect-mode authorize for Google was emitting an authorize
+  URL with `include_granted_scopes=true` (F4) AND no `prompt=` param
+  (Pass 2 + the `explicitForcePrompt=false` nullification in
+  `src/index.js`). For users with a prior grant, Google's incremental-
+  authorization path issued a fresh access_token *without* a
+  refresh_token (Google policy: refresh_token only on consent shown).
+  Result: `oauth_tokens` row stored with `refresh_token IS NULL`,
+  expires in ~1h, and flips to `REAUTH_REQUIRED` on the next API call.
+  Every "Reconnect" silently re-produced the same broken row.
+- **Fix.** `src/index.js` authorize handler now appends an explicit
+  `runtimeAuthParams.prompt = 'consent'` for `mode === 'connect' &&
+  service === 'google'`, after the explicitForcePrompt nullification
+  block (so it wins regardless of `forcePrompt=0` from the dashboard).
+  Adapter default stays `select_account` — policy lives at the call
+  site, preserving the ADR-0017 boundary.
+- **Test coverage added.**
+  - `src/tests/oauth-security-hardening.test.js` — flipped the existing
+    "google connect mode emits prompt=select_account" assertion to
+    `prompt=consent`, plus added a "frontend forcePrompt=0 still forces
+    consent" test, plus added a complete-contract test asserting all
+    four properties together (prompt=consent, access_type=offline,
+    include_granted_scopes=true, full service scope set).
+  - `src/tests/oauth-authorize-url-live-smoke.test.js` — flipped the
+    connect-mode smoke to expect `prompt=consent`.
+  - `src/tests/security-regression.test.js` — added a static-analysis
+    tripwire that fires if a refactor drops the override block (regex
+    against `mode === 'connect'`, `service === 'google'`, and
+    `runtimeAuthParams.prompt = 'consent'` in `src/index.js`, with JS
+    comments stripped first so ADR rationale doesn't satisfy the
+    tripwire).
+- **Test baseline impact.** Pass 3 adds +3 tests in
+  `oauth-security-hardening` (10 → 13 visible tests, 7 → 10 passing
+  in that suite), +1 tripwire in `security-regression` (no count
+  change in the smoke test). 13 OAuth-related suites confirmed green
+  post-fix: 220 passing, 8 skipped.
 
 ### Pass 1 (landed 2026-04-24, commit `959059c`)
 

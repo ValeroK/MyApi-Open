@@ -678,6 +678,36 @@ describe('[F3 Pass 2] REAUTH_REQUIRED envelope + status surface tripwires', () =
       .replace(/\/\/[^\n]*\n/g, '\n');
     expect(stripped).not.toMatch(/prompt:\s*['"]consent['"]/);
   });
+
+  test('src/index.js connect-mode override forces prompt=consent on Google (F3 Pass 3 / ADR-0021)', () => {
+    // Behavioural coverage for the connect-mode override is in
+    // `src/tests/oauth-security-hardening.test.js` — three tests asserting
+    // that the HTTP authorize URL emits `prompt=consent` regardless of
+    // `forcePrompt`, plus a complete-contract test (prompt + access_type
+    // + include_granted_scopes + scope set).
+    //
+    // This static tripwire fires if a refactor silently drops the override
+    // block. Without `prompt=consent` on connect-mode, Google's
+    // incremental-authorization path silently re-issues an access_token
+    // without a refresh_token — the row goes onto a ~1h fuse to
+    // REAUTH_REQUIRED. See ADR-0021.
+    //
+    // We strip JS comments first so the ADR rationale block doesn't
+    // count toward satisfying the tripwire — only an actual code branch
+    // does.
+    const stripped = indexSrc
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*\n/g, '\n');
+
+    // The override block must (a) gate on `mode === 'connect'`, (b) gate
+    // on `service === 'google'`, and (c) assign `prompt = 'consent'` to
+    // the runtime auth params. Encoded as three requirements rather than
+    // one mega-regex so the failure mode is informative if any single
+    // piece is removed.
+    expect(stripped).toMatch(/mode\s*===\s*['"]connect['"]/);
+    expect(stripped).toMatch(/service\s*===\s*['"]google['"]/);
+    expect(stripped).toMatch(/runtimeAuthParams\.prompt\s*=\s*['"]consent['"]/);
+  });
 });
 
 /**
