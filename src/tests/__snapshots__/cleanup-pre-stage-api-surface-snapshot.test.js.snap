@@ -46,7 +46,7 @@ exports[`[Cleanup Stage 0 / G0.1] API surface snapshot snapshot: in-memory route
 [38] POST /api/v1/security/csp-report
 [39] GET /api/v1/privacy/settings
 [40] PUT /api/v1/privacy/settings
-[41] <router with 10 layers>
+[41] <router with 11 layers>
   [41.0] GET /csrf-token
   [41.1] GET /email-config-status
   [41.2] POST /token-login
@@ -54,9 +54,10 @@ exports[`[Cleanup Stage 0 / G0.1] API surface snapshot snapshot: in-memory route
   [41.4] POST /register
   [41.5] POST /logout
   [41.6] GET /me
-  [41.7] POST /password/reset/request
-  [41.8] POST /password/reset/confirm
-  [41.9] POST /password/change
+  [41.7] POST /onboarding/dismiss
+  [41.8] POST /password/reset/request
+  [41.9] POST /password/reset/confirm
+  [41.10] POST /password/change
 [42] GET /api/v1/afp/download/:platform
 [43] GET /api/v1/afp/download-info
 [44] GET /api/v1/afp/download-oauth/:platform

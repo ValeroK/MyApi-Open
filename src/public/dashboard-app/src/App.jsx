@@ -83,10 +83,9 @@ function App() {
     }
   }, [isAuthenticated, fetchWorkspaces]);
 
-  // New users enter onboarding mode immediately.
+  // New users enter onboarding mode immediately (server needsOnboarding flag).
   useEffect(() => {
     if (isAuthenticated && user?.needsOnboarding) {
-      restartOnboarding();
       setShowOnboarding(true);
     }
   }, [isAuthenticated, user?.needsOnboarding]);

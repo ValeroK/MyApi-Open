@@ -73,6 +73,7 @@ export default function OnboardingModal({ onClose }) {
   const [error, setError]         = useState(null);
   const navigate = useNavigate();
   const user = useAuthStore((state) => state.user);
+  const setUser = useAuthStore((state) => state.setUser);
 
   const [name, setName]             = useState(user?.displayName || '');
   const [role, setRole]             = useState('');
@@ -103,10 +104,26 @@ export default function OnboardingModal({ onClose }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step]);
 
-  const handleDismiss = () => {
+  /** @returns {Promise<boolean>} true if the modal closed */
+  const handleDismiss = async () => {
+    setError(null);
+    try {
+      const res = await apiClient.post('/auth/onboarding/dismiss');
+      const updated = res.data?.user;
+      const current = useAuthStore.getState().user;
+      if (updated && current) {
+        setUser({ ...current, ...updated, needsOnboarding: false });
+      } else if (current) {
+        setUser({ ...current, needsOnboarding: false });
+      }
+    } catch (err) {
+      setError(err.response?.data?.error || 'Could not save — try again');
+      return false;
+    }
     dismissModal();
     setVisible(false);
     setTimeout(onClose, 280);
+    return true;
   };
 
   const goTo = (next) => {
@@ -162,9 +179,9 @@ export default function OnboardingModal({ onClose }) {
     window.location.href = `/api/v1/oauth/authorize/${serviceId}?mode=connect&next=${next}&redirect=1`;
   };
 
-  const handleFinish = (path) => {
-    handleDismiss();
-    if (path) setTimeout(() => navigate(path), 320);
+  const handleFinish = async (path) => {
+    const ok = await handleDismiss();
+    if (ok && path) setTimeout(() => navigate(path), 320);
   };
 
   const [copied, setCopied] = useState(false);

@@ -56,6 +56,7 @@ const AUTH_MAX = process.env.NODE_ENV === 'test' ? 1000 : 5;
 // not diverge across cookies/bearer auth.
 const AUTH_EXEMPT_PATHS = new Set([
   '/api/v1/auth/me',
+  '/api/v1/auth/onboarding/dismiss',
   '/api/v1/auth/logout',
   '/api/v1/auth/csrf-token',
   '/api/v1/auth/debug',

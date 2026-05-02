@@ -4,7 +4,7 @@
 > **what, in what order, and at what status**. Update task checkboxes and the
 > per-milestone progress counters as work lands.
 >
-> - Last updated: **2026-04-27**
+> - Last updated: **2026-04-30** (onboarding dismiss: `POST /api/v1/auth/onboarding/dismiss` + dashboard wiring; full gate 70/75 suites, 894 pass, exit 0)
 > - Owner: repo maintainers
 > - Source of truth for decisions: [`plan.md` §0.1](plan.md#01-decisions-log)
 >   and `decisions/ADR-0001…ADR-0010`.

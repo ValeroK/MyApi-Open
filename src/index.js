@@ -1077,6 +1077,7 @@ const { createRateLimitStore } = require('./infra/rate-limit');
 // /api/v1/privacy/cookies is encoded in `isRateLimitExempt()` below.
 const RATE_LIMIT_EXEMPT_PATHS = [
   '/api/v1/auth/me',
+  '/api/v1/auth/onboarding/dismiss',
   '/api/v1/auth/debug',
   '/api/v1/auth/logout',
   '/api/v1/dashboard/metrics',

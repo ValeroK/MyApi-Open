@@ -12,6 +12,7 @@ function Dashboard() {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
   const currentWorkspace = useAuthStore((state) => state.currentWorkspace);
   const user = useAuthStore((state) => state.user);
+  const setUser = useAuthStore((state) => state.setUser);
   const wsRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
 
@@ -358,12 +359,39 @@ function Dashboard() {
   const isChecklistComplete = checklistItems.length > 0 && completedChecklistCount === checklistItems.length;
 
   useEffect(() => {
-    if (onboardingActive && isChecklistComplete) {
+    if (!onboardingActive || !isChecklistComplete) return;
+
+    if (!user?.needsOnboarding) {
       completeOnboarding();
       setChecklistHidden(true);
       setOnboardingActive(false);
+      return;
     }
-  }, [onboardingActive, isChecklistComplete]);
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiClient.post('/auth/onboarding/dismiss');
+        if (cancelled) return;
+        const updated = res.data?.user;
+        const current = useAuthStore.getState().user;
+        if (updated && current) {
+          setUser({ ...current, ...updated, needsOnboarding: false });
+        } else if (current) {
+          setUser({ ...current, needsOnboarding: false });
+        }
+        completeOnboarding();
+        setChecklistHidden(true);
+        setOnboardingActive(false);
+      } catch (err) {
+        console.error('[Dashboard] checklist complete: failed to clear onboarding flag', err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [onboardingActive, isChecklistComplete, user?.needsOnboarding, setUser]);
 
   // ── Helpers ──────────────────────────────────────────────────────────
   const TINTS = ['#4493f8', '#3fb950', '#bc8cff', '#d29922', '#f85149', '#2ea043', '#1f6feb', '#8957e5'];

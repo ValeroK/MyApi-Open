@@ -76,6 +76,18 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
+- **2026-04-30** — **Dashboard onboarding modal:** `users.needs_onboarding`
+  was never cleared after signup; `App.jsx` also called `restartOnboarding()`
+  on every load, wiping local dismiss keys. Added `POST /api/v1/auth/onboarding/dismiss`
+  (same auth resolution as `/auth/me`, `clearUserOnboarding` in DB), wired
+  `OnboardingModal` skip/close/finish to call it and patch `needsOnboarding` in
+  the auth store; stopped calling `restartOnboarding()` on automatic open
+  (still used from Settings). Tests: `src/tests/auth-onboarding-dismiss.test.js`
+  (+2); snapshots updated for new route + `RATE_LIMIT_EXEMPT_PATHS` line shift.
+  Full gate: **70 / 75 suites passed** (5 skipped), **894 passed**, exit 0.
+  **Follow-up:** `Dashboard.jsx` checklist auto-complete now calls the same
+  dismiss endpoint when `needsOnboarding` is still true (plan optional), and
+  only clears local checklist state after a successful POST.
 - **2026-04-30 (latest)** — **F3 Pass 4 (ADR-0022): persist + display
   the connected provider account on each service grant.** Same review
   cycle as Pass 3, separate concern: the dashboard had no way to show

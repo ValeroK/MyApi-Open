@@ -17,6 +17,7 @@ const {
   getUserByUsername,
   getOrEnsureUserWorkspace,
   createAuditLog,
+  clearUserOnboarding,
 } = require('../database');
 const emailService = require('../services/emailService');
 const alerting = require('../lib/alerting');
@@ -822,6 +823,110 @@ router.post('/logout', requireCsrfForSession, (req, res) => {
 });
 
 /**
+ * Resolve authenticated user id using the same rules as GET /auth/me
+ * (session, tokenMeta, req.user, Bearer + device approval).
+ */
+async function resolveMeStyleAuth(req) {
+  const bcrypt = require('bcrypt');
+  let userId = null;
+  let authViaSession = false;
+
+  if (req.session && req.session.user && req.session.user.id) {
+    userId = String(req.session.user.id);
+    authViaSession = true;
+    logger.info(`[Auth/Me] Authenticated via session: ${userId}`);
+  }
+
+  if (!userId && req.tokenMeta?.ownerId) {
+    userId = String(req.tokenMeta.ownerId);
+    logger.info(`[Auth/Me] Authenticated via req.tokenMeta: ${userId}`);
+  }
+
+  if (!userId && req.user?.id) {
+    userId = String(req.user.id);
+    logger.info(`[Auth/Me] Authenticated via req.user: ${userId}`);
+  }
+
+  if (!userId) {
+    const authHeader = req.headers.authorization || '';
+    const parts = authHeader.split(' ');
+    if (parts.length === 2 && parts[0] === 'Bearer') {
+      const rawToken = parts[1];
+      const tokens = getAccessTokens() || [];
+      let matchedToken = null;
+      for (const tokenRecord of tokens) {
+        if (
+          !tokenRecord.revokedAt &&
+          tokenRecord.hash &&
+          await bcrypt.compare(rawToken, tokenRecord.hash).catch(() => false)
+        ) {
+          if (tokenRecord.expiresAt && new Date(tokenRecord.expiresAt) <= new Date()) {
+            continue; // skip expired tokens
+          }
+          userId = String(tokenRecord.ownerId);
+          matchedToken = tokenRecord;
+          break;
+        }
+      }
+      if (matchedToken) {
+        try {
+          const { db: dbInstance, getPendingApprovals, createPendingApproval } = require('../database');
+          const DeviceFingerprint = require('../utils/deviceFingerprint');
+          const tokenRow = dbInstance.prepare(
+            'SELECT label, requires_approval, token_type, scope FROM access_tokens WHERE id = ?'
+          ).get(matchedToken.tokenId);
+          const isMasterToken = tokenRow?.token_type === 'master' || tokenRow?.scope === 'full';
+          const isOAuthToken = tokenRow?.label && tokenRow.label.endsWith('(OAuth)');
+          // Gate if: master token, OAuth-labeled token, OR guest token with requires_approval=1.
+          // Guest token without approval requirement still passes (existing policy).
+          const gateEnabled = isMasterToken || isOAuthToken || !!tokenRow?.requires_approval;
+
+          if (gateEnabled) {
+            const fingerprint = DeviceFingerprint.fromRequest(req);
+            const approvedForToken = dbInstance.prepare(
+              'SELECT id FROM approved_devices WHERE token_id = ? AND user_id = ? AND device_fingerprint_hash = ? AND revoked_at IS NULL LIMIT 1'
+            ).get(matchedToken.tokenId, userId, fingerprint.fingerprintHash);
+
+            if (!approvedForToken) {
+              const pendingApprovals = getPendingApprovals(userId, matchedToken.tokenId);
+              const existingPending = pendingApprovals.find(p => p.device_fingerprint_hash === fingerprint.fingerprintHash);
+              if (!existingPending) {
+                createPendingApproval(matchedToken.tokenId, userId, fingerprint.fingerprintHash, fingerprint.summary, fingerprint.fingerprint.ipAddress);
+              }
+              return {
+                type: 'forbidden',
+                body: {
+                  error: 'device_not_approved',
+                  code: 'DEVICE_APPROVAL_REQUIRED',
+                  message: 'Access denied — waiting for the user to approve you in the dashboard.',
+                },
+              };
+            }
+          }
+        } catch (err) {
+          logger.error('[Auth/Me] Device approval check failed, failing closed', { err: err.message });
+          return {
+            type: 'forbidden',
+            body: {
+              error: 'device_approval_error',
+              code: 'DEVICE_APPROVAL_FAILED',
+              message: 'Access denied — device check temporarily unavailable.',
+            },
+          };
+        }
+      }
+    }
+  }
+
+  if (!userId) {
+    logger.info('[Auth/Me] No authentication found (no session, no valid Bearer token)');
+    return { type: 'unauthorized' };
+  }
+
+  return { type: 'ok', userId, authViaSession };
+}
+
+/**
  * GET /api/v1/auth/me
  * Get current authenticated user info
  * IMPORTANT: This endpoint is NOT wrapped in authenticate() middleware,
@@ -830,109 +935,17 @@ router.post('/logout', requireCsrfForSession, (req, res) => {
  */
 router.get('/me', async (req, res) => {
   try {
-    const { getAccessTokens } = require('../database');
-    const bcrypt = require('bcrypt');
-    
-    // Check session auth FIRST (OAuth login via browser)
-    // Track auth method so we know whether bootstrap is safe to return.
-    let userId = null;
-    let authViaSession = false;
-    if (req.session && req.session.user && req.session.user.id) {
-      userId = String(req.session.user.id);
-      authViaSession = true;
-      logger.info(`[Auth/Me] Authenticated via session: ${userId}`);
+    const auth = await resolveMeStyleAuth(req);
+    if (auth.type === 'forbidden') {
+      return res.status(403).json(auth.body);
     }
-
-    // Fallback to tokenMeta (set by authenticate middleware if this route is wrapped)
-    if (!userId && req.tokenMeta?.ownerId) {
-      userId = String(req.tokenMeta.ownerId);
-      logger.info(`[Auth/Me] Authenticated via req.tokenMeta: ${userId}`);
-    }
-
-    // Fallback to req.user (in case this route is later wrapped in authenticate())
-    if (!userId && req.user?.id) {
-      userId = String(req.user.id);
-      logger.info(`[Auth/Me] Authenticated via req.user: ${userId}`);
-    }
-
-    // Fallback: directly validate Bearer token from Authorization header.
-    // This route is excluded from the global authenticate() middleware so we must
-    // validate Bearer tokens here to support master-token re-authentication.
-    if (!userId) {
-      const authHeader = req.headers.authorization || '';
-      const parts = authHeader.split(' ');
-      if (parts.length === 2 && parts[0] === 'Bearer') {
-        const rawToken = parts[1];
-        const tokens = getAccessTokens() || [];
-        let matchedToken = null;
-        for (const tokenRecord of tokens) {
-          if (
-            !tokenRecord.revokedAt &&
-            tokenRecord.hash &&
-            await bcrypt.compare(rawToken, tokenRecord.hash).catch(() => false)
-          ) {
-            if (tokenRecord.expiresAt && new Date(tokenRecord.expiresAt) <= new Date()) {
-              continue; // skip expired tokens
-            }
-            userId = String(tokenRecord.ownerId);
-            matchedToken = tokenRecord;
-            break;
-          }
-        }
-        // Bearer tokens reaching /auth/me MUST honor requires_approval and per-token
-        // device approval. Do NOT trust caller-controlled Referer/Origin — those are spoofable.
-        // Session-authed dashboard hits the session branch above; this path only runs for
-        // external Bearer callers (agents, AI), which must be gated.
-        if (matchedToken) {
-          try {
-            const { db: dbInstance, getPendingApprovals, createPendingApproval } = require('../database');
-            const DeviceFingerprint = require('../utils/deviceFingerprint');
-            const tokenRow = dbInstance.prepare(
-              'SELECT label, requires_approval, token_type, scope FROM access_tokens WHERE id = ?'
-            ).get(matchedToken.tokenId);
-            const isMasterToken = tokenRow?.token_type === 'master' || tokenRow?.scope === 'full';
-            const isOAuthToken = tokenRow?.label && tokenRow.label.endsWith('(OAuth)');
-            // Gate if: master token, OAuth-labeled token, OR guest token with requires_approval=1.
-            // Guest token without approval requirement still passes (existing policy).
-            const gateEnabled = isMasterToken || isOAuthToken || !!tokenRow?.requires_approval;
-
-            if (gateEnabled) {
-              const fingerprint = DeviceFingerprint.fromRequest(req);
-              // Per-token lookup: master approval must NOT auto-authorize guest tokens.
-              const approvedForToken = dbInstance.prepare(
-                'SELECT id FROM approved_devices WHERE token_id = ? AND user_id = ? AND device_fingerprint_hash = ? AND revoked_at IS NULL LIMIT 1'
-              ).get(matchedToken.tokenId, userId, fingerprint.fingerprintHash);
-
-              if (!approvedForToken) {
-                const pendingApprovals = getPendingApprovals(userId, matchedToken.tokenId);
-                const existingPending = pendingApprovals.find(p => p.device_fingerprint_hash === fingerprint.fingerprintHash);
-                if (!existingPending) {
-                  createPendingApproval(matchedToken.tokenId, userId, fingerprint.fingerprintHash, fingerprint.summary, fingerprint.fingerprint.ipAddress);
-                }
-                return res.status(403).json({
-                  error: 'device_not_approved',
-                  code: 'DEVICE_APPROVAL_REQUIRED',
-                  message: 'Access denied — waiting for the user to approve you in the dashboard.',
-                });
-              }
-            }
-          } catch (err) {
-            logger.error('[Auth/Me] Device approval check failed, failing closed', { err: err.message });
-            return res.status(403).json({
-              error: 'device_approval_error',
-              code: 'DEVICE_APPROVAL_FAILED',
-              message: 'Access denied — device check temporarily unavailable.',
-            });
-          }
-        }
-      }
-    }
-
-    if (!userId) {
-      logger.info(`[Auth/Me] No authentication found (no session, no valid Bearer token)`);
+    if (auth.type === 'unauthorized') {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    const { userId, authViaSession } = auth;
+
+    const bcrypt = require('bcrypt');
     const { getUserById } = require('../database');
     let user = getUserById(userId);
 
@@ -1038,6 +1051,48 @@ router.get('/me', async (req, res) => {
   } catch (error) {
     logger.error('Get user error:', error);
     res.status(500).json({ error: 'Failed to get user' });
+  }
+});
+
+/**
+ * POST /api/v1/auth/onboarding/dismiss
+ * Clears users.needs_onboarding so the dashboard wizard does not reopen on refresh.
+ */
+router.post('/onboarding/dismiss', authRateLimit, requireCsrfForSession, express.json(), async (req, res) => {
+  try {
+    const auth = await resolveMeStyleAuth(req);
+    if (auth.type === 'forbidden') {
+      return res.status(403).json(auth.body);
+    }
+    if (auth.type === 'unauthorized') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    clearUserOnboarding(auth.userId);
+    const { getUserById } = require('../database');
+    const user = getUserById(auth.userId);
+    if (!user) {
+      return res.json({ success: true, user: { id: auth.userId, needsOnboarding: false } });
+    }
+
+    const _pwrEmail = String(process.env.POWER_USER_EMAIL || process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    return res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        username: user.username,
+        displayName: user.displayName,
+        avatarUrl: user.avatarUrl,
+        timezone: user.timezone,
+        plan: user.plan,
+        isPowerUser: !!(_pwrEmail && String(user.email || '').toLowerCase() === _pwrEmail),
+        needsOnboarding: false,
+      },
+    });
+  } catch (error) {
+    logger.error('[Auth/OnboardingDismiss] error', { error: error?.message });
+    return res.status(500).json({ error: 'Failed to update onboarding state' });
   }
 });
 
