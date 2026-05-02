@@ -76,6 +76,24 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
+- **2026-05-02** — **Settings UX fixes:** Audit Logs tab rendered every row
+  as `unknown` because the frontend read `log.status` but the backend
+  (`/api/v1/audit/logs` in `src/routes/auditSecurity.js`) returns
+  `statusCode`, and for inline lifecycle events (`oauth_authorize_start`,
+  `oauth_status_persisted`, `oauth_callback_success`, `oauth_disconnect`,
+  `db_integrity_warning`, …) `createAuditLog` in `src/database.js`
+  persists `status_code = null` because no HTTP response is involved.
+  `Settings.jsx` now owns a `deriveAuditBadge(log)` helper that renders
+  HTTP-coded events as green `success (2xx/3xx)` / red `failed (4xx/5xx)`,
+  falls back to `log.status`, and for status-less events infers the tone
+  from the action name (`*_success/completed/connected/…` → green,
+  `*_error/failed/denied/revoked/…` → red, `*_warning/suspicious/…` →
+  amber, everything else → neutral `info`). Timezone dropdowns on Profile
+  (Settings.jsx) and Identity used a hardcoded ~17-zone list; both pages
+  now import a shared `src/public/dashboard-app/src/utils/timezones.js`
+  which calls `Intl.supportedValuesOf('timeZone')` (full IANA list, ~400
+  zones) with a curated ~50-zone fallback for older runtimes. Frontend
+  `npm run build` green; backend suite unchanged at **70 / 75 passed**.
 - **2026-04-30** — **Dashboard onboarding modal:** `users.needs_onboarding`
   was never cleared after signup; `App.jsx` also called `restartOnboarding()`
   on every load, wiping local dismiss keys. Added `POST /api/v1/auth/onboarding/dismiss`

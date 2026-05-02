@@ -8,6 +8,7 @@ import NotificationSettings from '../components/NotificationSettings';
 import ImportExport from '../components/ImportExport';
 import { restartOnboarding, requestOnboardingModal } from '../utils/onboardingUtils';
 import { fetchPublicConfig } from '../utils/publicConfig';
+import { TIMEZONES } from '../utils/timezones';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared UI helpers
@@ -58,13 +59,6 @@ function ErrorBanner({ message, onClose }) {
     </div>
   );
 }
-
-const TIMEZONES = [
-  'UTC', 'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
-  'America/Sao_Paulo', 'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
-  'Asia/Dubai', 'Asia/Kolkata', 'Asia/Bangkok', 'Asia/Shanghai', 'Asia/Tokyo',
-  'Australia/Sydney', 'Pacific/Auckland',
-];
 
 const LANGUAGES = [
   { value: 'en', label: 'English' },
@@ -1262,6 +1256,56 @@ function AIAgentTrackingSection() {
   );
 }
 
+// Audit log rows arrive from `/api/v1/audit/logs` with either an HTTP
+// `statusCode` (request-scoped events) or neither status nor code (inline
+// lifecycle events like `oauth_authorize_start`). Map both shapes — plus
+// action-name hints — onto a success / failed / warning / info badge so
+// the table never defaults to a red `unknown` pill.
+const AUDIT_BADGE_STYLES = {
+  green: { background: 'var(--green-bg)', color: 'var(--green)', border: '1px solid var(--green)' },
+  red: { background: 'var(--red-bg)', color: 'var(--red)', border: '1px solid var(--red)' },
+  amber: {
+    background: 'var(--amber-bg, rgba(210,153,34,0.1))',
+    color: 'var(--amber)',
+    border: '1px solid var(--amber)',
+  },
+  neutral: {
+    background: 'var(--bg-sunk, rgba(255,255,255,0.04))',
+    color: 'var(--ink-3)',
+    border: '1px solid var(--line)',
+  },
+};
+
+function deriveAuditBadge(log) {
+  const rawCode = typeof log.statusCode === 'number' ? log.statusCode : Number(log.statusCode);
+  if (Number.isFinite(rawCode) && rawCode > 0) {
+    const ok = rawCode >= 200 && rawCode < 400;
+    return {
+      tone: ok ? 'green' : 'red',
+      label: ok ? `success (${rawCode})` : `failed (${rawCode})`,
+    };
+  }
+
+  if (typeof log.status === 'string' && log.status) {
+    if (log.status === 'success') return { tone: 'green', label: 'success' };
+    if (log.status === 'failed' || log.status === 'error') return { tone: 'red', label: log.status };
+    if (log.status === 'warning') return { tone: 'amber', label: 'warning' };
+    return { tone: 'neutral', label: log.status };
+  }
+
+  const action = String(log.action || '').toLowerCase();
+  if (/(?:^|_)(success|persisted|completed|created|updated|granted|accepted|connected|disconnect|logout|login)(?:$|_)/.test(action)) {
+    return { tone: 'green', label: 'success' };
+  }
+  if (/(?:^|_)(error|failed|failure|denied|rejected|revoked|blocked|forbidden|invalid)(?:$|_)/.test(action)) {
+    return { tone: 'red', label: 'failed' };
+  }
+  if (/(?:^|_)(warning|warn|suspicious|throttled|rate[_-]?limit)(?:$|_)/.test(action)) {
+    return { tone: 'amber', label: 'warning' };
+  }
+  return { tone: 'neutral', label: 'info' };
+}
+
 function AuditLogsSection() {
   const masterToken = useAuthStore((state) => state.masterToken);
   const [logs, setLogs] = useState([]);
@@ -1339,30 +1383,29 @@ function AuditLogsSection() {
                 </tr>
               </thead>
               <tbody>
-                {logs.map((log, idx) => (
-                  <tr key={idx} className="row row-cell">
-                    <td className="px-4 py-2 ink-3 text-xs">
-                      {new Date(log.created_at * 1000 || log.timestamp).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-2 mono text-xs ink-2">{log.action}</td>
-                    <td className="px-4 py-2 ink-2 text-xs">{log.resource || '-'}</td>
-                    <td className="px-4 py-2">
-                      <span
-                        className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
-                        style={{
-                          background: log.status === 'success' ? 'var(--green-bg)' : 'var(--red-bg)',
-                          color: log.status === 'success' ? 'var(--green)' : 'var(--red)',
-                          border: `1px solid ${log.status === 'success' ? 'var(--green)' : 'var(--red)'}`,
-                        }}
-                      >
-                        {log.status || 'unknown'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 ink-4 text-xs max-w-xs truncate">
-                      {typeof log.details === 'object' && log.details !== null ? JSON.stringify(log.details) : (log.details || '-')}
-                    </td>
-                  </tr>
-                ))}
+                {logs.map((log, idx) => {
+                  const badge = deriveAuditBadge(log);
+                  return (
+                    <tr key={log.id ?? idx} className="row row-cell">
+                      <td className="px-4 py-2 ink-3 text-xs">
+                        {new Date(log.timestamp || log.created_at * 1000).toLocaleString()}
+                      </td>
+                      <td className="px-4 py-2 mono text-xs ink-2">{log.action}</td>
+                      <td className="px-4 py-2 ink-2 text-xs">{log.resource || '-'}</td>
+                      <td className="px-4 py-2">
+                        <span
+                          className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
+                          style={AUDIT_BADGE_STYLES[badge.tone] || AUDIT_BADGE_STYLES.neutral}
+                        >
+                          {badge.label}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 ink-4 text-xs max-w-xs truncate">
+                        {typeof log.details === 'object' && log.details !== null ? JSON.stringify(log.details) : (log.details || '-')}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
