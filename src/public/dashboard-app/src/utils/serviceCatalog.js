@@ -282,6 +282,12 @@ export function normalizeService(rawService, oauthMeta) {
     category_label: categoryLabel,
     status: normalizeStatus(oauthMeta?.status),
     lastApiCall: oauthMeta?.lastApiCall || oauthMeta?.last_sync || null,
+    // F3 Pass 4 (ADR-0022): provider-account email of the grant. Carried
+    // from /api/v1/oauth/status into the card so InlineServiceCard can
+    // render "Connected as <email>" beneath connected services. Omitting
+    // this from the allow-list silently dropped the field and broke the
+    // UI even when the API surfaced it correctly.
+    connectedEmail: oauthMeta?.connectedEmail || null,
     enabled: oauthMeta?.enabled !== false,
     // Instagram/Dropbox should behave like other OAuth cards (show Connect), even if optional env vars are missing.
     notConfigured: oauthMeta?.enabled === false && !['instagram', 'dropbox'].includes(String(serviceName).toLowerCase()),

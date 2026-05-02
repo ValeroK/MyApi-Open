@@ -265,11 +265,19 @@ function ServiceConnectors() {
                 different account on the provider's account picker). */}
             {isConnected && service.connectedEmail && (
               <div
-                className="text-[11.5px] ink-3 mt-0.5 truncate"
+                className="text-[11.5px] ink-3 mt-0.5 truncate group relative cursor-default"
                 title={`Connected as ${service.connectedEmail}`}
                 data-testid={`connected-email-${service.name}`}
               >
                 Connected as <span className="ink-2 font-mono">{service.connectedEmail}</span>
+                <span
+                  role="tooltip"
+                  className="pointer-events-none absolute left-0 top-full mt-1 z-20 whitespace-nowrap rounded-md border hairline px-2 py-1 text-[11.5px] ink-2 font-mono shadow-lg opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity duration-150"
+                  style={{ background: 'var(--surface-2, #111)' }}
+                  data-testid={`connected-email-tooltip-${service.name}`}
+                >
+                  {service.connectedEmail}
+                </span>
               </div>
             )}
           </div>

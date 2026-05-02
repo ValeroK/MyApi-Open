@@ -758,6 +758,29 @@ describe('[F3 Pass 2] REAUTH_REQUIRED envelope + status surface tripwires', () =
     // includes a `connectedEmail` key sourced from `token?.connectedEmail`.
     expect(stripped).toMatch(/connectedEmail:\s*token\?\.connectedEmail/);
   });
+
+  test('SPA normalizeService allow-list propagates connectedEmail to the card (F3 Pass 4)', () => {
+    // The dashboard's `serviceCatalog.normalizeService(rawService, oauthMeta)`
+    // builds an explicit allow-list of fields before handing the service
+    // object to InlineServiceCard. If `connectedEmail` is missing from
+    // that allow-list, the API can return the field correctly and the UI
+    // will silently drop it — exactly the bug we shipped on 2026-04-30
+    // and had to hot-patch. This tripwire keeps the field on the
+    // allow-list.
+    const fs = require('fs');
+    const path = require('path');
+    const catalogPath = path.resolve(
+      __dirname,
+      '..',
+      'public',
+      'dashboard-app',
+      'src',
+      'utils',
+      'serviceCatalog.js'
+    );
+    const catalogSrc = fs.readFileSync(catalogPath, 'utf8');
+    expect(catalogSrc).toMatch(/connectedEmail:\s*oauthMeta\?\.connectedEmail/);
+  });
 });
 
 /**
