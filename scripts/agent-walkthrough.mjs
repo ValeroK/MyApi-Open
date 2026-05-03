@@ -71,12 +71,30 @@ if (!SMOKE_URL || !SMOKE_BEARER) {
 }
 
 const BASE = SMOKE_URL.replace(/\/+$/, '');
+
+// Pin the device-approval fingerprint deterministically across HTTP
+// clients. `src/middleware/agent-approval.js#generateAgentFingerprint`
+// hashes (User-Agent, IP, x-agent-id) — undici (Node's `fetch`) sends a
+// different default UA than `node:http`, so without `x-agent-id` the
+// walkthrough is treated as a NEW agent every time the upstream HTTP
+// client changes (Node version bump, switch to axios, etc.). Setting
+// `x-agent-id` collapses every run to a single fingerprint that the
+// operator only has to approve ONCE. See `.context/capability-gaps.md`
+// GAP-012.
+const AGENT_ID = 'f6-walkthrough/agent';
+const MASTER_AGENT_ID = 'f6-walkthrough/master';
+
 const AGENT_HEADERS = {
   Authorization: `Bearer ${SMOKE_BEARER}`,
   'Content-Type': 'application/json',
+  'x-agent-id': AGENT_ID,
 };
 const MASTER_HEADERS = SMOKE_MASTER
-  ? { Authorization: `Bearer ${SMOKE_MASTER}`, 'Content-Type': 'application/json' }
+  ? {
+      Authorization: `Bearer ${SMOKE_MASTER}`,
+      'Content-Type': 'application/json',
+      'x-agent-id': MASTER_AGENT_ID,
+    }
   : null;
 
 let failures = 0;
@@ -252,7 +270,16 @@ async function phase4Use() {
       method: 'GET',
       path: '/gmail/v1/users/me/profile',
     });
-    if (r.status === 200 && r.body?.emailAddress) {
+    // The proxy wraps upstream responses in
+    //   { ok, service, statusCode, data: <upstream-json> }
+    // so the gmail body lives at r.body.data, not r.body. Accept either
+    // shape for forward-compat with a future un-wrapped envelope.
+    const profile = r.body?.data?.emailAddress
+      ? r.body.data
+      : r.body?.emailAddress
+        ? r.body
+        : null;
+    if (r.status === 200 && profile?.emailAddress) {
       const leak = bodyDoesNotContain(r.body, r.raw, CREDENTIAL_LEAK_MARKERS);
       if (leak) {
         logFail(
@@ -262,7 +289,7 @@ async function phase4Use() {
           `P0: response body contains credential marker "${leak}"`
         );
       } else {
-        logOK('§4.a  Google Gmail profile', r.status, r.ms, `(${r.body.emailAddress})`);
+        logOK('§4.a  Google Gmail profile', r.status, r.ms, `(${profile.emailAddress})`);
       }
     } else if (r.status === 403 && /not connected/i.test(r.raw || '')) {
       logFail(
@@ -432,10 +459,20 @@ async function phase7Handshake() {
 async function phase8Skills() {
   process.stdout.write(`\n# Phase 8 — skills metadata (read-only)\n`);
   const r = await call('GET', '/api/v1/skills', AGENT_HEADERS);
-  if (r.status === 200 && Array.isArray(r.body)) {
-    logOK('§8.a  GET /skills', r.status, r.ms, `(${r.body.length} skills)`);
-  } else if (r.status === 200 && Array.isArray(r.body?.data)) {
-    logOK('§8.a  GET /skills', r.status, r.ms, `(${r.body.data.length} skills)`);
+  // Accept all three shapes the gateway has historically used:
+  //   raw array          (legacy);
+  //   { data: array }    (unified envelope);
+  //   { skills: array }  (current — `src/routes/skills.js:271`, with
+  //                       optional `_discovery` hint when empty).
+  const skillsList = Array.isArray(r.body)
+    ? r.body
+    : Array.isArray(r.body?.data)
+      ? r.body.data
+      : Array.isArray(r.body?.skills)
+        ? r.body.skills
+        : null;
+  if (r.status === 200 && skillsList) {
+    logOK('§8.a  GET /skills', r.status, r.ms, `(${skillsList.length} skills)`);
   } else if (r.status === 403) {
     process.stdout.write(
       `SKIP §8.a  GET /skills           agent token lacks skills:read; mint with broader scope\n`

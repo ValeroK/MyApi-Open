@@ -4,7 +4,7 @@
 > starting any session. Longer context lives in [`plan.md`](plan.md). Tactical
 > tracker is [`TASKS.md`](TASKS.md).
 >
-> - Last updated: **2026-04-30** (Tactical fix: TOTP verify window widened from `window: 2` (±60 s) → `window: 4` (±120 s) at every verify call site in `src/index.js` and `src/routes/auth.js`; `TOTP_CODE_TTL_MS` raised 90 s → 270 s in `src/lib/authHardening.js` to cover the wider validity span. Real-incident driver: `mailer.kv@gmail.com` enrolment failed against a freshly-wiped DB and freshly-scanned QR; live `verifyDelta` against the running container proved the user's phone was running exactly +120 s ahead of server (Android NTP drift), outside the old ±60 s window. New source-pin test `src/tests/totp-window-tolerance.test.js` (6 tests: 3 behavioural ±90 s / +150 s assertions on `/auth/login` totpCode + 3 source-pins on every verify block + the replay TTL constant). Test baseline 66 / 71 / 870 → **67 / 72 / 876** (+1 suite, +6 tests, no regressions, 28/28 snapshots stable, exit 0, 61 s on Windows). Decision recorded in ADR-0022. Earlier 2026-04-29: 2FA challenge per-IP rate-limit cap raised from 3/min → 10/min in `src/index.js` (`twoFactorRateLimit`). Original BUG-15 cap of 3/min locked legitimate users out after a single double-submit + one mistyped TOTP code; 10/min keeps brute-force protection intact (≈14 days for 50% probability against the 1M-code TOTP space, and the 30s code rotation is the binding control anyway) while giving real users headroom for honest typos. Source-pinned to band [10, 30] in `src/tests/2fa-rate-limit-cap.test.js` (4 tests). G4.1 + G0.3 snapshots regenerated for the +7-line comment-block drift (content-stable, line-only). Test baseline 64 / 69 / 855 → **66 / 71 / 870** (+1 suite, +4 tests; 5 skipped suites unchanged, 28 / 28 snapshots stable, exit 0). 2026-04-28: F6 — Agent capability verification — ✅ Complete. All 8 tasks (F6.0–F6.7) landed in one session: gap-ledger bootstrap, 8 L1 supertest suites, L3 walkthrough script, 4 L2 live-smoke suites, connector spike (ADR-0020 Option C — `src/lib/schemas/connector-spec.js` + handler wiring), gap-ledger triage with follow-up briefs F8 / F9 / F10. Closed GAP-002 P0 in the same change as the test that surfaced it. Test baseline 55 / 56 / 767 → **64 / 69 / 855** (+9 suites, +88 tests, 5 L2 suites correctly skip when env unset, 28 / 28 snapshots stable, exit 0). Earlier 2026-04-27: M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md §6.3.)
+> - Last updated: **2026-05-03** (L3 walkthrough green — `scripts/agent-walkthrough.mjs` driven against docker-smoke after the user signed into the dashboard, approved devices, and connected Google. Result: **21 OK / 0 FAIL** — Phase 0 sanity, Phase 3 discovery (`/openapi.json`, `/capabilities`, `/tokens/me/capabilities`, master-only `/gateway/context` correctly 403), **Phase 4 — agent token with `services:read` made a real Gmail profile call via `/api/v1/services/google/proxy` and got `mailer.kv@gmail.com` back with NO credential markers in the response body — the cardinal MVP property is now proven from a scoped token, not just the master**, Phase 5 (4/4 master-only writes denied to the agent), Phase 6 (5/5 SSRF probes rejected: 127.0.0.1, 169.254.169.254 [AWS-metadata canary], localhost, 0177.0.0.1 [octal], 2130706433 [decimal-encoded loopback]), Phase 7 (handshake POST → public poll/pending → master approve → public poll/approved, no token leak in either public response), Phase 8 (`/skills` returns documented shape). Two probe-script bugs fixed in `scripts/agent-walkthrough.mjs` along the way: §4.a now reads the `{ok, service, statusCode, data}` proxy envelope correctly, §8.a now accepts the `{skills:[], _discovery:{...}}` shape from `src/routes/skills.js:271`. **GAP-012 filed** (P1, target F11): the device-approval fingerprint is `sha256(User-Agent + IP + x-agent-id)`, and Node 20+ `fetch`/undici sends a different default UA than `node:http` — every Node-version bump or HTTP-library swap surfaces as a brand-new "approve this device" prompt with `OS: Unknown / Browser: Unknown`. Workaround landed: every authenticated request in the walkthrough now sends a stable `x-agent-id` header (`f6-walkthrough/agent` or `f6-walkthrough/master`) so fingerprints are deterministic; the operator approves once and the walkthrough is repeatable forever. F11 ADR options: (a) stop hashing UA, gate on `(userId, tokenId)`; (b) document `x-agent-id` as the canonical fingerprint anchor and have the dashboard prompt show the bearer label so operators can recognize what they're approving. Earlier 2026-04-30: Tactical fix: TOTP verify window widened from `window: 2` (±60 s) → `window: 4` (±120 s) at every verify call site in `src/index.js` and `src/routes/auth.js`; `TOTP_CODE_TTL_MS` raised 90 s → 270 s in `src/lib/authHardening.js` to cover the wider validity span. Real-incident driver: `mailer.kv@gmail.com` enrolment failed against a freshly-wiped DB and freshly-scanned QR; live `verifyDelta` against the running container proved the user's phone was running exactly +120 s ahead of server (Android NTP drift), outside the old ±60 s window. New source-pin test `src/tests/totp-window-tolerance.test.js` (6 tests: 3 behavioural ±90 s / +150 s assertions on `/auth/login` totpCode + 3 source-pins on every verify block + the replay TTL constant). Test baseline 66 / 71 / 870 → **67 / 72 / 876** (+1 suite, +6 tests, no regressions, 28/28 snapshots stable, exit 0, 61 s on Windows). Decision recorded in ADR-0022. Earlier 2026-04-29: 2FA challenge per-IP rate-limit cap raised from 3/min → 10/min in `src/index.js` (`twoFactorRateLimit`). Original BUG-15 cap of 3/min locked legitimate users out after a single double-submit + one mistyped TOTP code; 10/min keeps brute-force protection intact (≈14 days for 50% probability against the 1M-code TOTP space, and the 30s code rotation is the binding control anyway) while giving real users headroom for honest typos. Source-pinned to band [10, 30] in `src/tests/2fa-rate-limit-cap.test.js` (4 tests). G4.1 + G0.3 snapshots regenerated for the +7-line comment-block drift (content-stable, line-only). Test baseline 64 / 69 / 855 → **66 / 71 / 870** (+1 suite, +4 tests; 5 skipped suites unchanged, 28 / 28 snapshots stable, exit 0). 2026-04-28: F6 — Agent capability verification — ✅ Complete. All 8 tasks (F6.0–F6.7) landed in one session: gap-ledger bootstrap, 8 L1 supertest suites, L3 walkthrough script, 4 L2 live-smoke suites, connector spike (ADR-0020 Option C — `src/lib/schemas/connector-spec.js` + handler wiring), gap-ledger triage with follow-up briefs F8 / F9 / F10. Closed GAP-002 P0 in the same change as the test that surfaced it. Test baseline 55 / 56 / 767 → **64 / 69 / 855** (+9 suites, +88 tests, 5 L2 suites correctly skip when env unset, 28 / 28 snapshots stable, exit 0). Earlier 2026-04-27: M4-T4.8 landed — `app.set('trust proxy', 1)` replaced with `app.set('trust proxy', parseTrustedProxies(process.env.TRUSTED_PROXIES))`; closes H5 from plan.md §6.3.)
 > - Maintainer: repo owners + AI pairing sessions
 > - Status: **pre-production.** Not yet deployed to real users; clean-rewrite
 >   latitude granted per ADR-0007.
@@ -76,6 +76,44 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
+- **2026-05-02 (later)** — **F6.3 — agent Gmail-week live smoke
+  added.** New live-smoke suite
+  `src/tests/agent-google-gmail-week-fetch-live-smoke.test.js`
+  walks the full credential-custody trajectory an external agent
+  (Hermes / OpenClaude / etc.) takes when asked to "read every
+  Gmail message from the last 7 days" against the SHIPPED binary
+  with a real Google connection — discover (`/openapi.json`),
+  optional mint (if `SMOKE_MASTER` is provided, mints a fresh
+  `services:read` agent token via `POST /api/v1/tokens`),
+  capabilities introspection (no raw bearer echoed), list
+  past-week messages via `POST /services/google/proxy` with
+  `q: 'newer_than:Nd'`, fetch each message body, assert every
+  `internalDate` falls within the requested window (proves
+  Google honored the filter), boundary checks (read-scoped
+  agent gets 403 on `messages/send`; agent bearer gets 403
+  master-only on token mint). 7 tests; 6 + optional cleanup.
+  Gated on `SMOKE_URL` + `SMOKE_GOOGLE=1` + at least one of
+  `SMOKE_BEARER` / `SMOKE_MASTER`; skips silently otherwise so
+  plain `npm test` is unaffected (verified: 6 / 6 skipped, exit
+  0). Env knobs `SMOKE_GMAIL_WINDOW_DAYS` (default 7) and
+  `SMOKE_GMAIL_DETAIL_LIMIT` (default 3) keep the smoke fast on
+  large mailboxes. New `npm run smoke:gmail-week` script. This
+  complements the in-process F6 suites
+  (`services-proxy-behavioral`, `agent-capabilities-end-to-end`)
+  that stop at the connection gate, and the existing
+  `services-proxy-google-live-smoke` (which only fetches the
+  Gmail profile). Why live, not in-process: the in-process
+  suites can't catch stale Docker images, missing
+  `GOOGLE_CLIENT_ID/SECRET`, encryption-key drift that makes
+  `getOAuthToken` silently null, or Gmail API changes
+  (deprecated `q` syntax, scope tightening). Backend test
+  baseline unchanged at **70 / 75 suites passing** in the
+  default no-env run; the new suite contributes the 5th skipped
+  L2 smoke alongside `oauth-authorize-url-live-smoke`,
+  `services-proxy-google-live-smoke`,
+  `services-proxy-github-live-smoke`,
+  `agent-discovery-live-smoke`,
+  `skills-and-handshakes-live-smoke`.
 - **2026-05-02** — **Settings UX fixes:** Audit Logs tab rendered every row
   as `unknown` because the frontend read `log.status` but the backend
   (`/api/v1/audit/logs` in `src/routes/auditSecurity.js`) returns

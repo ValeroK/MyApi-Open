@@ -34,6 +34,7 @@ authoritative map; details remain in §3.
 | GAP-009 | P1 | open | **F9** (same) | `validateScope` ↔ `grantScopes` self-contradiction |
 | GAP-010 | P1 | open | **F10** (new) | service catalog seed dead at boot; smallest open delta |
 | GAP-011 | P2 | open | **M6** | duplicate `/handshakes/:id/status` handler removed during monolith extraction |
+| GAP-012 | P1 | open | **F11** (new) | device-approval fingerprint depends on HTTP-client default UA — pin via `x-agent-id` or stop hashing UA |
 
 **Disposition stamps** (also in each row's `Disposition` field below):
 - `fix-now`: 1 (GAP-002).
@@ -466,6 +467,87 @@ test lands they all carry `evidence` pointing at the static read of
 - **Status.** `open`
 - **Notes.** No data-model fix needed; pure code cleanup.
 
-> _The next entry will be `GAP-012`. Each F6 work step (per the
+### GAP-012 — Device-approval fingerprint depends on the agent's HTTP client choice
+
+- **Discovered.** 2026-05-03
+- **Layer.** L3 manual walkthrough — `scripts/agent-walkthrough.mjs`
+  driven against the docker `smoke` instance on
+  `http://127.0.0.1:4500`.
+- **Endpoint / area.** Every authenticated `/api/v1/**` call goes
+  through `src/middleware/deviceApproval.js` (and the older
+  `src/middleware/agent-approval.js`), both of which derive the
+  device identity from
+  `sha256(User-Agent + IP + ...)` via
+  `src/utils/deviceFingerprint.js#fromRequest` (or the simpler
+  `agent-approval.js#generateAgentFingerprint`).
+- **Severity.** **P1** (real friction for any agent that doesn't
+  pin its own client identity — the operator gets pestered with a
+  fresh "approve this device" prompt every time the agent
+  upgrades Node, switches HTTP libraries, or runs from a different
+  binary). Not a security issue — the gate is doing its job.
+- **Description.** Two different Node clients calling the same
+  gateway from the same container with the same bearer token
+  produce two different fingerprints because their default
+  `User-Agent` headers differ:
+  - `node:http` (used by `src/scripts/mint-agent-token.js`) sends
+    **no** `User-Agent` by default.
+  - Node 20+ `fetch` / undici (used by
+    `scripts/agent-walkthrough.mjs`) sends `User-Agent: node`.
+  The L3 walkthrough therefore hit `device_not_approved` on Phase
+  7's master-only `/handshakes/:id/approve` even though the master
+  bearer was previously used (and approved) for an end-to-end
+  Gmail proxy call from the same container. Each fresh fingerprint
+  surfaces in `/dashboard/connectors` as a separate "Approve"
+  prompt with `OS: Unknown`, `Browser: Unknown` — the heuristics
+  in `extractAgentName` and the deviceFingerprint summary don't
+  recognize undici / `node:http` so the operator can't even tell
+  what they're approving.
+- **Evidence.**
+  - `src/middleware/agent-approval.js:38-49`
+    (`generateAgentFingerprint = sha256(UA, IP, x-agent-id)`).
+  - `src/utils/deviceFingerprint.js:84-100` (`fromRequest` reads
+    `req.headers['user-agent']` and `accept-language`; both empty
+    for `node:http`, both populated by undici).
+  - L3 walkthrough run on 2026-05-03: 18 / 19 OK before fix; the
+    one FAIL (`§7.c  approve (master)`) emitted
+    `{"error":"device_not_approved","code":"DEVICE_APPROVAL_REQUIRED",
+      "device":{"os":"Unknown","browser":"Unknown",...}}`.
+  - After pinning `x-agent-id: f6-walkthrough/master` and
+    `x-agent-id: f6-walkthrough/agent` in the script
+    (`scripts/agent-walkthrough.mjs:71-95`) AND having the
+    operator approve the two new pinned fingerprints once via the
+    dashboard, the walkthrough returned **21 OK / 0 FAIL**.
+- **Disposition.** `file-task` — fingerprint fragility is a real
+  papercut for the "drop a token into your agent and it just
+  works" promise. Two reasonable options that should be debated
+  in an ADR:
+  (a) **Stop hashing the User-Agent.** Treat every authenticated
+      bearer as belonging to a single logical "agent" and gate on
+      `(userId, tokenId)` (or `userId, x-agent-id` when the agent
+      provides one). Simpler; loses some defense-in-depth against
+      a stolen token being replayed from a different host.
+  (b) **Keep UA hashing but expose `x-agent-id` as the documented
+      fingerprint anchor.** Update `agent-real-life.md` Phase 0
+      to require every agent to send a stable `x-agent-id`
+      header, and have the dashboard show a clearer prompt
+      ("Approve agent `f6-walkthrough/master` for token
+      `myapi_2fe…`?") instead of `OS: Unknown / Browser:
+      Unknown`. Cheaper to ship; keeps the existing security
+      story.
+  Either way, the dashboard prompt for unrecognized
+  `User-Agent: node` strings should at minimum include the bearer
+  token's label (`"f6-walkthrough-agent"` here) so the operator
+  has SOMETHING to recognize when approving.
+- **Status.** `open`
+- **Notes.** Workaround in `scripts/agent-walkthrough.mjs` is the
+  template — every future scripted agent in this repo should set
+  a stable `x-agent-id` header so fingerprints are deterministic
+  across Node-version bumps and HTTP-library swaps. A dedicated
+  follow-up could land a small "Recognize a known
+  `x-agent-id` even when the UA is empty" enrichment in
+  `extractAgentName` so the dashboard stops showing "Unknown AI
+  Agent" for our own scripts.
+
+> _The next entry will be `GAP-013`. Each F6 work step (per the
 > plan §5) appends below this line as it surfaces things._
 
