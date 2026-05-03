@@ -45,6 +45,7 @@
     "smoke:oauth": "jest --forceExit src/tests/oauth-authorize-url-live-smoke.test.js",
     "smoke:agent": "jest --forceExit src/tests/agent-discovery-live-smoke.test.js src/tests/skills-and-handshakes-live-smoke.test.js",
     "smoke:google": "jest --forceExit src/tests/services-proxy-google-live-smoke.test.js",
+    "smoke:gmail-week": "jest --forceExit src/tests/agent-google-gmail-week-fetch-live-smoke.test.js",
     "smoke:github": "jest --forceExit src/tests/services-proxy-github-live-smoke.test.js",
     "smoke:walkthrough": "node scripts/agent-walkthrough.mjs",
     "db:init": "node src/scripts/init-db.js",
