@@ -1852,22 +1852,24 @@ function createAccessToken(hash, ownerId, scope, label, expiresAt = null, allowe
 function getExistingMasterToken(ownerId) {
   if (!ownerId) return null;
   try {
-    // Look for active full-scope tokens with an encrypted_token, trying owner-specific first, then legacy 'owner'
-    const ownerIds = [String(ownerId)];
-    if (ownerId !== 'owner') ownerIds.push('owner');
-
-    for (const oid of ownerIds) {
-      const rows = db.prepare(
-        "SELECT id, encrypted_token, hash FROM access_tokens WHERE owner_id = ? AND scope = 'full' AND token_type = 'master' AND revoked_at IS NULL AND encrypted_token IS NOT NULL ORDER BY created_at DESC LIMIT 10"
-      ).all(oid);
-      for (const row of rows) {
-        // Skip tokens with non-bcrypt hashes (e.g. SHA-256 hashes created by oauth-server flow)
-        if (!row.hash || !row.hash.startsWith('$2')) continue;
-        if (!row.encrypted_token) continue;
-        const rawToken = decryptRawToken(row.encrypted_token);
-        if (rawToken) {
-          return { tokenId: row.id, rawToken };
-        }
+    // Per-user lookup ONLY. The pre-2026-05-02 implementation appended the
+    // legacy `'owner'` identity as a fallback whenever the caller asked
+    // about a different user; that silently exposed the install-time seed
+    // master token to any real user who signed up after install, breaking
+    // multi-user attribution end-to-end (see
+    // `src/tests/master-token-per-user-isolation.test.js` for the full
+    // bug write-up). Each user's bootstrap call must look ONLY for their
+    // own master token; the bootstrap handler creates one if none exists.
+    const rows = db.prepare(
+      "SELECT id, encrypted_token, hash FROM access_tokens WHERE owner_id = ? AND scope = 'full' AND token_type = 'master' AND revoked_at IS NULL AND encrypted_token IS NOT NULL ORDER BY created_at DESC LIMIT 10"
+    ).all(String(ownerId));
+    for (const row of rows) {
+      // Skip tokens with non-bcrypt hashes (e.g. SHA-256 hashes created by oauth-server flow)
+      if (!row.hash || !row.hash.startsWith('$2')) continue;
+      if (!row.encrypted_token) continue;
+      const rawToken = decryptRawToken(row.encrypted_token);
+      if (rawToken) {
+        return { tokenId: row.id, rawToken };
       }
     }
     return null;
