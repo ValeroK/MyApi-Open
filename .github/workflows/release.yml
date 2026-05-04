@@ -1,0 +1,229 @@
+# =============================================================================
+# MyApi Release Pipeline
+#
+# Triggers on `v*` tag push. Runs the full test gate, then builds the root
+# Dockerfile multi-arch (linux/amd64 + linux/arm64) and pushes to
+# ghcr.io/valerok/myapi-open with two tags: the immutable semver (e.g.
+# v0.6.0) and the movable :latest. Creates a GitHub Release with the
+# matching CHANGELOG.md section as the body and attaches
+# docker-compose.release.yml as a release asset.
+#
+# Hardening owners: .context/decisions/ADR-0023-release-versioning-and-publishing.md
+# Locked test baseline (2026-05-04): 71 / 77 suites passed,
+#   898 / 946 tests passed (48 skipped), 28 / 28 snapshots, exit 0.
+# A red test gate fails the release; no image is pushed.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build and publish (e.g. v0.6.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write       # softprops/action-gh-release needs write to publish releases
+  packages: write       # docker/login-action -> GHCR push needs write
+  id-token: write       # reserved for cosign keyless signing in a later release
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/myapi-open
+
+jobs:
+  # ===========================================================================
+  # Test gate. Same secrets shape as ci.yml so behaviour matches main.
+  # ===========================================================================
+  test:
+    name: Test gate (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        working-directory: src/public/dashboard-app
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --silent
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test-jwt-secret-ci
+          ENCRYPTION_KEY: test-encryption-key-32chars!!
+          SESSION_SECRET: test-session-secret-ci
+          VAULT_KEY: test-vault-key-ci-32characters!
+          DB_PATH: ':memory:'
+
+  # ===========================================================================
+  # Build + push the release image (multi-arch).
+  # ===========================================================================
+  build-and-push:
+    name: Build + push image (linux/amd64 + linux/arm64)
+    needs: [test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tag history needed for release notes
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # IS_PRERELEASE is true for tags like v0.7.0-rc.1, alpha.2, beta.3
+          if echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved tag: $TAG"
+
+      - name: Verify tag matches package.json version
+        shell: bash
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          SRC_PKG_VERSION=$(node -p "require('./src/package.json').version")
+          TAG_VERSION="${{ steps.tag.outputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          # Strip pre-release suffix for the comparison
+          TAG_BASE="${TAG_VERSION%%-*}"
+          echo "package.json: $PKG_VERSION  src/package.json: $SRC_PKG_VERSION  tag: $TAG_VERSION (base $TAG_BASE)"
+          if [ "$PKG_VERSION" != "$TAG_BASE" ] || [ "$SRC_PKG_VERSION" != "$TAG_BASE" ]; then
+            echo "::error::Tag version ($TAG_BASE) does not match package.json ($PKG_VERSION) and/or src/package.json ($SRC_PKG_VERSION). Bump versions before tagging."
+            exit 1
+          fi
+
+      - name: Extract CHANGELOG section for this version
+        id: changelog
+        shell: bash
+        run: |
+          TAG_VERSION="${{ steps.tag.outputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          # Awk extracts content between this version's heading and the next ## heading
+          BODY=$(awk -v v="$TAG_VERSION" '
+            $0 ~ "^## \\[" v "\\]" {flag=1; print; next}
+            flag && /^## \[/ {exit}
+            flag {print}
+          ' CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            echo "::warning::No CHANGELOG section found for [$TAG_VERSION]; release body will be a placeholder."
+            BODY="No CHANGELOG entry found for [$TAG_VERSION]. See git log for details."
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker tags
+        id: docker_tags
+        shell: bash
+        run: |
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          TAGS="${IMAGE_REF}:${TAG}"
+          if [ "${{ steps.tag.outputs.is_prerelease }}" = "false" ]; then
+            TAGS="${TAGS},${IMAGE_REF}:latest"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Tags: ${TAGS}"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.docker_tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=MyApi
+            org.opencontainers.image.description=Self-hosted Personal API for AI Agents
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/README.md
+
+      # Image scanning is report-only at release time. We DO publish the image
+      # even if vulnerabilities are found, but the SARIF goes to the Security
+      # tab so they're triaged. Hard-blocking would couple release cadence to
+      # upstream advisory response time, which we don't want for v0.6.x.
+      - name: Trivy image scan (report-only)
+        uses: aquasecurity/trivy-action@0.28.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy SARIF
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            ## Container image
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ```
+
+            Multi-arch (`linux/amd64` + `linux/arm64`). See
+            [`docker-compose.release.yml`](https://github.com/${{ github.repository }}/blob/${{ steps.tag.outputs.tag }}/docker-compose.release.yml)
+            for the recommended one-line spin-up.
+
+            ## What changed
+
+            ${{ steps.changelog.outputs.body }}
+          prerelease: ${{ steps.tag.outputs.is_prerelease == 'true' }}
+          files: |
+            docker-compose.release.yml
+          fail_on_unmatched_files: true

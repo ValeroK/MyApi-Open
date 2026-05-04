@@ -1,6 +1,6 @@
 {
   "name": "myapi-platform",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Personal API platform with Vault, Gateway, and Brain",
   "main": "index.js",
   "scripts": {

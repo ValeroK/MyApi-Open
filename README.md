@@ -119,11 +119,57 @@ For an agent request to an external service (the hot path), this expands to:
 
 ## Quick Start
 
-### Option A: Docker (Recommended)
+### Option Zero: Pull the published release (fastest)
+
+A pre-built, multi-arch (`linux/amd64` + `linux/arm64`) image is published
+to GHCR on every `v*` tag. No source build, no `npm install`. See
+[CHANGELOG.md](CHANGELOG.md) for the version history and
+[ADR-0023](.context/decisions/ADR-0023-release-versioning-and-publishing.md)
+for the publishing policy.
+
+```bash
+# 1. Generate the four required secrets (each a 32-byte hex string):
+openssl rand -hex 32   # SESSION_SECRET
+openssl rand -hex 32   # JWT_SECRET
+openssl rand -hex 32   # ENCRYPTION_KEY
+openssl rand -hex 32   # VAULT_KEY
+
+# 2. Grab the release Compose file + env template (no clone needed):
+curl -O https://raw.githubusercontent.com/ValeroK/MyApi-Open/v0.6.0/docker-compose.release.yml
+curl -O https://raw.githubusercontent.com/ValeroK/MyApi-Open/v0.6.0/.env.release.example
+cp .env.release.example .env.release
+# Open .env.release and paste in the four secrets above.
+
+# 3. Pull and start:
+docker compose --env-file .env.release -f docker-compose.release.yml pull
+docker compose --env-file .env.release -f docker-compose.release.yml up -d
+
+# 4. Verify:
+curl -s http://localhost:4500/health
+# Then open http://localhost:4500/dashboard/
+
+# Rollback to a previous release if needed:
+#   IMAGE_TAG=v0.5.x docker compose --env-file .env.release -f docker-compose.release.yml up -d --force-recreate
+```
+
+The container exits 1 on boot in any `NODE_ENV` if any of `SESSION_SECRET`,
+`JWT_SECRET`, `ENCRYPTION_KEY`, or `VAULT_KEY` is missing, whitespace, or
+set to a banned placeholder (per
+[`src/lib/validate-secrets.js`](src/lib/validate-secrets.js)). This is
+intentional — never run with default secrets.
+
+> **Note on first pull.** The package
+> `ghcr.io/valerok/myapi-open` is created on the first push of the
+> release workflow and may be private until the repo owner flips it to
+> public visibility (one-time, in
+> `https://github.com/users/ValeroK/packages/container/myapi-open/settings`).
+> If `docker pull` returns a `denied` error, that's the cause.
+
+### Option A: Docker from source (development)
 
 ```bash
 # 1. Clone
-git clone https://github.com/omribenami/MyApi-Open.git
+git clone https://github.com/ValeroK/MyApi-Open.git
 cd MyApi-Open
 
 # 2. Configure

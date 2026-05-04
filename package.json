@@ -1,6 +1,6 @@
 {
   "name": "MyApi",
-  "version": "1.0.0",
+  "version": "0.6.0",
   "description": "Self-hosted Personal API for AI Agents",
   "repository": {
     "type": "git",

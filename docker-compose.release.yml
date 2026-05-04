@@ -1,0 +1,113 @@
+# =============================================================================
+# MyApi — release Compose file
+#
+# Pulls the published release image from GHCR. No local build context.
+# Pinned to v0.6.0 by default; flip the IMAGE_TAG env var (or edit the line
+# below) to track :latest if you want the rolling tag.
+#
+# Usage:
+#
+#   # 1. Generate the four required secrets (run once, save the output):
+#   #
+#   #    openssl rand -hex 32   # SESSION_SECRET
+#   #    openssl rand -hex 32   # JWT_SECRET
+#   #    openssl rand -hex 32   # ENCRYPTION_KEY
+#   #    openssl rand -hex 32   # VAULT_KEY
+#   #
+#   # 2. Copy `.env.release.example` to `.env.release` (next to this file)
+#   #    and fill in the four secrets + any OAuth provider creds you want.
+#   #
+#   # 3. Pull and start:
+#   #
+#   #    docker compose -f docker-compose.release.yml pull
+#   #    docker compose -f docker-compose.release.yml up -d
+#   #
+#   # 4. Hit http://localhost:4500/health to verify the container is alive,
+#   #    then http://localhost:4500/dashboard/ to log in.
+#
+# Locked test baseline for v0.6.0 image:
+#   71 / 77 suites passing, 898 / 946 tests, 28 / 28 snapshots, exit 0.
+#
+# See ADR-0023 for the versioning + publishing policy.
+# =============================================================================
+
+services:
+  myapi:
+    image: ghcr.io/${GHCR_OWNER:-valerok}/myapi-open:${IMAGE_TAG:-v0.6.0}
+    container_name: myapi
+    restart: unless-stopped
+    ports:
+      - "${PORT_BIND:-4500}:4500"
+    environment:
+      # ─────── Required: process exits 1 in any NODE_ENV if any of these is
+      #         missing, whitespace, or set to a banned value ───────
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required (openssl rand -hex 32)}
+      JWT_SECRET:     ${JWT_SECRET:?JWT_SECRET is required (openssl rand -hex 32)}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required (openssl rand -hex 32)}
+      VAULT_KEY:      ${VAULT_KEY:?VAULT_KEY is required (openssl rand -hex 32)}
+
+      # ─────── Core ───────
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 4500
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+      # ─────── Database (SQLite by default; mount the volume below) ───────
+      DB_PATH: /app/src/data/myapi.db
+      SESSION_DB_PATH: /app/src/data/sessions.sqlite
+
+      # ─────── Networking / proxy trust ───────
+      # See src/lib/trust-proxy.js for the full validator. Default is
+      # `loopback` — secure for direct-connection topology and host port
+      # mapping. Override only if you put a real reverse-proxy in front.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-loopback}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:4500}
+
+      # ─────── Session cookie (set SECURE=true behind HTTPS) ───────
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      # SESSION_COOKIE_DOMAIN: .your-domain.com   # set in .env.release for prod
+
+      # ─────── OAuth state pruning (M3) ───────
+      OAUTH_PRUNE_INTERVAL_MS: ${OAUTH_PRUNE_INTERVAL_MS:-600000}
+      OAUTH_PRUNE_GRACE_SEC:   ${OAUTH_PRUNE_GRACE_SEC:-3600}
+
+      # ─────── OAuth providers (only what you enable; full list in src/.env.example) ───────
+      ENABLE_OAUTH_GOOGLE:   ${ENABLE_OAUTH_GOOGLE:-false}
+      GOOGLE_CLIENT_ID:      ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET:  ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI:   ${GOOGLE_REDIRECT_URI:-http://localhost:4500/api/v1/oauth/callback/google}
+
+      ENABLE_OAUTH_GITHUB:   ${ENABLE_OAUTH_GITHUB:-false}
+      GITHUB_CLIENT_ID:      ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET:  ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI:   ${GITHUB_REDIRECT_URI:-http://localhost:4500/api/v1/oauth/callback/github}
+
+      # Add other providers as needed — see src/.env.example for the
+      # full ENABLE_OAUTH_* / *_CLIENT_ID / *_CLIENT_SECRET set.
+
+      # ─────── Public URLs (used in OAuth redirects + emails) ───────
+      BASE_URL:   ${BASE_URL:-http://localhost:4500}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:4500}
+
+      # ─────── Email (optional; only needed if you want notifications) ───────
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-}
+      EMAIL_FROM:      ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-MyApi}
+      RESEND_API_KEY:  ${RESEND_API_KEY:-}
+
+      # ─────── Owner identity ───────
+      POWER_USER_EMAIL: ${POWER_USER_EMAIL:-}
+    volumes:
+      - myapi-data:/app/src/data
+      - myapi-logs:/app/src/logs
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4500/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  myapi-data:
+    name: myapi-data
+  myapi-logs:
+    name: myapi-logs
