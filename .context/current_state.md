@@ -76,6 +76,62 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 5. What changed recently
 
+- **2026-05-04 — F12 / M-import bootstrap landed (Phase B.1).** Per
+  ADR-0024 (`upstream-import-policy`), the rolling-backport workflow
+  is now in place: 8-section mini-plan template + ADR-0023..0029
+  reservations + stop conditions. Bootstrap delivers (a) ADR-0024
+  itself, (b) F12 parent task brief at
+  `.context/tasks/backlog/F12-upstream-import-2026-05.md` covering
+  22 candidate sub-rows, (c) new `M-import` milestone heading in
+  `TASKS.md` (empty until first mini-plan accepts), (d) read-only
+  audit script `scripts/upstream-audit.mjs` (no new deps; supports
+  `--json`, `--status`, `--write-status`, `--since`, `--remote`,
+  `--help`), (e) verify-pass record at
+  `.context/imports/.verify-pass-2026-05-04.md` with per-row verdicts
+  for the 10 Group B "looks-already-present" candidates (4
+  already-present, 2 partial, 2 not-present, 2 deferred), (f)
+  `.context/imports/README.md` index, and (g) **18 per-candidate
+  mini-plans** under `.context/imports/`: 8 strong (b8a074b
+  Dependabot, 1d8cadd bundle-token auto-scopes, c9cc8cb LAN-IP
+  callback, ebdd006 master-token localStorage→sessionStorage,
+  99f864d new-device email, d84fd51 gateway connected_services,
+  3b517de skills AI-first, 5921232 Discord per-user bot token), 6
+  verify-promoted (244624b reject, 669d30f narrow-2-hunks, 735ae9a
+  defer, e500414 setInterval-unref, d302595 token-eye removal,
+  9cd414a red-card deferred-pending-e0707c5), 2 architectural
+  deferred (52dd343 Gmail write→ADR-0025, e0707c5 token anomaly
+  →ADR-0026), 5 capability (2c6aca8 onboarding wizard, 6ab11cb
+  admin broadcast→ADR-0027, a6da498 tickets→ADR-0028, f5297d5 BETA
+  mode→ADR-0029, 2eb8439 service connect/disconnect emails). NO
+  cherry-picks landed; every mini-plan at `Status: proposed` or
+  `deferred`. Test gate sanity check: **71 / 77 suites, 898 / 946
+  tests, 28 / 28 snapshots, exit 0** — exactly the v0.6.0 baseline
+  (no runtime code touched). Global progress total bumped 137 → 159
+  (+22 F12 sub-rows). Direct-to-main commit per ADR-0024 §3 default
+  delivery mode. Next: per-mini-plan triage decisions from user
+  (accept/defer/reject), then Phase B.2 rolling cherry-picks toward
+  v0.7.0 release rollover (ADR-0023 cadence: ~10 entries or 2 weeks
+  in `[Unreleased]`).
+- **2026-05-04 (earlier)** — **v0.6.0 cut as first public Docker
+  release to GHCR.** ADR-0023 (`release-versioning-and-publishing`)
+  ratifies milestone-aligned semver (M0..M5 done = v0.6.0; v1.0.0
+  reserved for SOC2/M7-finish), GHCR public registry
+  (`ghcr.io/valerok/myapi-open`), root `Dockerfile` as the release
+  image (multi-arch `linux/amd64` + `linux/arm64`), additive to
+  existing `deploy.yml`. New `.github/workflows/release.yml`
+  (tag-triggered, runs the test gate, multi-arch buildx,
+  version-vs-tag verification, Trivy scan, GitHub Release with
+  CHANGELOG body), `docker-compose.release.yml` +
+  `.env.release.example` (one-line user spin-up; container exits 1
+  if any of the four required secrets is missing/banned),
+  `CHANGELOG.md` v0.6.0 section. Bumped both `package.json` files
+  1.0.0/0.1.0 → 0.6.0. README "Option Zero: Pull the published
+  release" section added. Tag `v0.6.0` pushed (commit `dc25fe5`);
+  release workflow run 25304034880 triggered. NOTE: first GHCR push
+  creates the package as private — one-time manual UI step at
+  `https://github.com/users/ValeroK/packages/container/myapi-open/settings`
+  to flip visibility to public so anonymous `docker pull` works
+  (per ADR-0023 § "Operational changes required").
 - **2026-05-02 (later)** — **F6.3 — agent Gmail-week live smoke
   added.** New live-smoke suite
   `src/tests/agent-google-gmail-week-fetch-live-smoke.test.js`
@@ -1803,14 +1859,55 @@ High/Medium/Low risks are enumerated in `plan.md` §6.3.
 
 ## 6. Active focus
 
-- **Now:** **F6 ✅ Complete — Agent capability verification.**
+- **Now:** **F12 / M-import bootstrap ✅ Complete (Phase B.1, 2026-05-04).**
+  Per-import workflow is in place per ADR-0024; 18 mini-plans
+  written under `.context/imports/` covering all 22 candidate
+  rows; v0.6.0 test baseline (71/77 / 898 / 28 / exit 0)
+  preserved. **Awaiting user triage** of the per-mini-plan
+  accept/defer/reject decisions, in this order:
+  1. **Strong + low-risk first** (recommend accept verbatim):
+     b8a074b (Dependabot), e500414 (setInterval-unref),
+     d302595 (token-eye removal), 1d8cadd (bundle-token
+     auto-scopes).
+  2. **Strong + verify-before-merge** (recommend accept with
+     small test add): ebdd006-narrow (master-token
+     localStorage→sessionStorage), 99f864d (new-device email),
+     d84fd51 (gateway connected_services — closes F8),
+     3b517de (skills AI-first).
+  3. **Strong + security-sensitive** (recommend accept after
+     PKCE verification): c9cc8cb (LAN-IP callback), 5921232
+     (Discord per-user bot token).
+  4. **Verify-narrow** (recommend accept the 2 hunks only):
+     669d30f (csrf length-guard + scope-validator workspace_id).
+  5. **UX wizard** (recommend accept; closes F2): 2c6aca8
+     (onboarding full-page wizard) — strip landing-page hunks.
+  6. **Service connect/disconnect emails** (recommend accept
+     trigger-only hunks): 2eb8439 — skip the existing-template
+     redesign hunks.
+  7. **Architectural — needs ADR FIRST** (defer until user
+     decides): 52dd343 → ADR-0025 (Gmail write), e0707c5 →
+     ADR-0026 (token anomaly detection), 6ab11cb → ADR-0027
+     (admin broadcast), a6da498+5 → ADR-0028 (tickets).
+  8. **Hosted-product axis — strategy decision** (defer until
+     user decides yes/no): f5297d5 → ADR-0029 (BETA mode +
+     waitlist).
+- **Phase B.2 plan (after user triage):** rolling
+  cherry-picks per-accepted-mini-plan, direct-to-main commits
+  with `cherry-pick -x` provenance, conventional-commit form,
+  CHANGELOG `[Unreleased]` updated per import. When
+  `[Unreleased]` reaches ~10 entries or 2 weeks: cut v0.7.0
+  per ADR-0023.
+- **Stop conditions** (per ADR-0024 §5): if 3 consecutive
+  imports require >30% rewrite, pause and write a summary ADR
+  forcing a re-baseline decision.
+- **Recently closed:** **F6 ✅ Complete — Agent capability verification.**
   All 8 tasks landed 2026-04-28; the gateway has full L1 +
   partial L2 + L3 (manual + scripted) coverage of every agent-
   facing capability. The "is MyApi ready for OpenClaude /
   Hermes?" question now has a documented answer: **yes for the
   read path, with three known gaps (F8 / F9 / F10) the operator
   must accept or close before going live.**
-- **Next, in priority order (operator pick):**
+- **Original next-up (still applicable; will resume after F12 triage):**
   1. **Run `npm run docker:smoke` once + the L2 smoke trio**
      (`smoke:agent` / `smoke:google` / `smoke:github`) against
      real OAuth apps. Captures whatever the L1 layer can't see
